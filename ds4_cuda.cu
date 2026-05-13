@@ -3308,23 +3308,6 @@ __global__ static void attention_pack_group_heads_f16_kernel(
     dst[gid] = __float2half(heads[((uint64_t)t * n_groups + g) * group_dim + d]);
 }
 
-__global__ static void attention_unpack_group_low_kernel(
-        float *low,
-        const float *tmp,
-        uint32_t n_tokens,
-        uint32_t n_groups,
-        uint32_t rank) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_groups * n_tokens * rank;
-    if (gid >= n) return;
-    uint32_t r = gid % rank;
-    uint64_t q = gid / rank;
-    uint32_t t = q % n_tokens;
-    uint32_t g = q / n_tokens;
-    uint32_t low_dim = n_groups * rank;
-    low[(uint64_t)t * low_dim + (uint64_t)g * rank + r] = tmp[gid];
-}
-
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -7915,14 +7898,11 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     }
     if (out_a_f16) {
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
-        const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
-        const uint64_t low_tmp_offset = (heads_h_bytes + 255u) & ~255ull;
-        const uint64_t tmp_bytes = low_tmp_offset + low_tmp_count * sizeof(float);
+        const uint64_t tmp_bytes = heads_h_bytes;
         void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
         __half *heads_h = (__half *)tmp;
-        float *low_packed = (float *)((char *)tmp + low_tmp_offset);
         attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
                 heads_h,
                 (const float *)heads->ptr,
@@ -7948,21 +7928,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                        (int)group_dim,
                                                        (long long)n_tokens * group_dim,
                                                        &beta,
-                                                       low_packed,
+                                                       low->ptr,
                                                        CUDA_R_32F,
-                                                       (int)rank,
-                                                       (long long)rank * n_tokens,
+                                                       (int)low_dim,
+                                                       (long long)rank,
                                                        (int)n_groups,
                                                        CUDA_R_32F,
                                                        CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "attention output a gemm")) return 0;
-        attention_unpack_group_low_kernel<<<(low_tmp_count + 255) / 256, 256>>>(
-                (float *)low->ptr,
-                low_packed,
-                n_tokens,
-                n_groups,
-                rank);
-        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
     } else {
         const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
