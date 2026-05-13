@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Smoke-test ds4_proof.py weight-server lifecycle validation.
+
+This test is intentionally CUDA-free. It exercises the proof harness contract
+with fake model files, a fake engine, and a fake ds4_weight_server process that
+writes a structurally valid manifest and lifecycle logs.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DS4_PROOF = ROOT / "tests" / "ds4_proof.py"
+
+
+def write_executable(path: Path, text: str) -> None:
+    path.write_text(textwrap.dedent(text).lstrip(), encoding="utf-8")
+    path.chmod(0o755)
+
+
+def write_fake_tools(tmp: Path) -> tuple[Path, Path, Path, Path]:
+    base = tmp / "base.gguf"
+    mtp = tmp / "mtp.gguf"
+    base.write_bytes(b"B")
+    mtp.write_bytes(b"M")
+
+    fake_engine = tmp / "fake_engine.py"
+    write_executable(
+        fake_engine,
+        """
+        #!/usr/bin/env python3
+        print("fake engine output")
+        """,
+    )
+
+    fake_weight_server = tmp / "fake_weight_server.py"
+    write_executable(
+        fake_weight_server,
+        """
+        #!/usr/bin/env python3
+        import argparse
+        import os
+        import signal
+        import sys
+        import time
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--base")
+        ap.add_argument("--mtp")
+        ap.add_argument("--manifest")
+        ap.add_argument("--scope", default="both")
+        ap.add_argument("--dry-run", action="store_true")
+        ap.add_argument("--exit-on-parent-pid")
+        ap.add_argument("--reserve-gb")
+        ap.add_argument("--span-mb")
+        ap.add_argument("--copy-chunk-mb")
+        args, _extra = ap.parse_known_args()
+
+        models = [args.scope] if args.scope != "both" else ["base", "mtp"]
+        for model in models:
+            print(
+                f"ds4_weight_server: {model} plan model=0.00 GiB "
+                "raw_tensor_ranges=0.00 GiB ranges=1",
+                flush=True,
+            )
+        print(
+            "ds4_weight_server: memory preflight full upload plan need=0.00 GiB "
+            "reserve=32.00 GiB free=128.00 GiB total=128.00 GiB",
+            flush=True,
+        )
+        if args.dry_run:
+            print(
+                "ds4_weight_server: dry-run complete; no allocations or manifest were created",
+                flush=True,
+            )
+            sys.exit(0)
+
+        print("ds4_weight_server: acquired lock /tmp/ds4_weight_server_cuda0.lock", flush=True)
+        with open(args.manifest, "w", encoding="utf-8") as f:
+            f.write("DS4_WEIGHT_SERVER_IPC_V1\\n")
+            f.write(f"owner {os.getpid()} 0 {args.scope} /tmp/ds4_weight_server_cuda0.lock\\n")
+            if args.scope in ("both", "base"):
+                f.write("range base 1 0 1 " + "0" * 128 + "\\n")
+            if args.scope in ("both", "mtp"):
+                f.write("range mtp 1 0 1 " + "1" * 128 + "\\n")
+
+        for model in models:
+            print(f"ds4_weight_server: {model} uploaded 0.00 GiB across 1 ranges", flush=True)
+        print(f"ds4_weight_server: ready manifest={args.manifest} ranges={len(models)}", flush=True)
+
+        stopping = False
+
+        def stop(_signum, _frame):
+            global stopping
+            stopping = True
+
+        signal.signal(signal.SIGTERM, stop)
+        while not stopping:
+            time.sleep(0.05)
+        print("ds4_weight_server: shutting down", flush=True)
+        """,
+    )
+    return base, mtp, fake_engine, fake_weight_server
+
+
+def run_proof(cmd: list[str]) -> dict[str, Any]:
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    if proc.returncode != 0:
+        print(proc.stdout)
+        raise AssertionError(f"proof command failed rc={proc.returncode}")
+    report_path = Path(cmd[cmd.index("--json-report") + 1])
+    return json.loads(report_path.read_text(encoding="utf-8"))
+
+
+def assert_true(report: dict[str, Any], path: str) -> None:
+    cur: Any = report
+    for part in path.split("."):
+        cur = cur[part]
+    if cur is not True:
+        raise AssertionError(f"{path} is not true: {cur!r}")
+
+
+def run_owned_lifecycle(tmp: Path, base: Path, mtp: Path, fake_engine: Path, fake_weight_server: Path) -> None:
+    work = tmp / "owned-work"
+    report = run_proof(
+        [
+            sys.executable,
+            str(DS4_PROOF),
+            "--bin",
+            str(fake_engine),
+            "--base",
+            str(base),
+            "--mtp",
+            str(mtp),
+            "--tokens",
+            "1",
+            "--prompt",
+            "local",
+            "--only",
+            "mtp-fast",
+            "--start-weight-server",
+            "--weight-server-scope",
+            "mtp",
+            "--weight-server-bin",
+            str(fake_weight_server),
+            "--work-dir",
+            str(work),
+            "--json-report",
+            str(tmp / "owned-report.json"),
+        ]
+    )
+    if report["failures"] != 0:
+        raise AssertionError(f"owned proof failures={report['failures']}")
+    assert_true(report, "weight_server_validation.passed")
+    for check in [
+        "ready",
+        "scope_matches",
+        "preflight_rc_zero",
+        "preflight_not_refused",
+        "cleanup_terminated",
+        "shutdown_observed",
+        "ready_telemetry",
+        "parent_guard",
+        "lock_not_busy",
+        "lock_recorded",
+        "uploaded_mtp",
+    ]:
+        assert_true(report, f"weight_server_validation.checks.{check}")
+
+
+def run_external_manifest(tmp: Path, base: Path, mtp: Path, fake_engine: Path) -> None:
+    manifest = tmp / "external.ipc"
+    manifest.write_text(
+        "\n".join(
+            [
+                "DS4_WEIGHT_SERVER_IPC_V1",
+                f"owner {os.getpid()} 0 mtp /tmp/ds4_weight_server_cuda0.lock",
+                "range mtp 1 0 1 " + "1" * 128,
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    report = run_proof(
+        [
+            sys.executable,
+            str(DS4_PROOF),
+            "--bin",
+            str(fake_engine),
+            "--base",
+            str(base),
+            "--mtp",
+            str(mtp),
+            "--tokens",
+            "1",
+            "--prompt",
+            "local",
+            "--only",
+            "mtp-fast",
+            "--weight-ipc-manifest",
+            str(manifest),
+            "--weight-server-scope",
+            "mtp",
+            "--work-dir",
+            str(tmp / "external-work"),
+            "--json-report",
+            str(tmp / "external-report.json"),
+        ]
+    )
+    if report["failures"] != 0:
+        raise AssertionError(f"external proof failures={report['failures']}")
+    assert_true(report, "weight_server_validation.passed")
+    assert_true(report, "weight_server_validation.checks.external_manifest")
+    assert_true(report, "weight_server_validation.checks.external_owner")
+    assert_true(report, "weight_server_validation.checks.manifest_ranges_mtp")
+
+
+def main() -> int:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    with tempfile.TemporaryDirectory(prefix="ds4-weight-harness-smoke.") as raw_tmp:
+        tmp = Path(raw_tmp)
+        base, mtp, fake_engine, fake_weight_server = write_fake_tools(tmp)
+        run_owned_lifecycle(tmp, base, mtp, fake_engine, fake_weight_server)
+        run_external_manifest(tmp, base, mtp, fake_engine)
+    print("ds4_weight_server_harness_smoke: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

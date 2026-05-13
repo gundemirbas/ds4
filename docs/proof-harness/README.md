@@ -131,6 +131,20 @@ By default the server refuses to start unless the CUDA allocator reports enough
 free memory for the full raw-span upload plus a 32 GiB reserve. Use
 `--reserve-gb N` to adjust that reserve explicitly for controlled runs.
 
+## Smoke Tests
+
+Run the CUDA-free lifecycle smoke test after changing proof-runner or
+weight-server manifest behavior:
+
+```sh
+tests/ds4_weight_server_harness_smoke.py
+```
+
+The smoke test creates fake one-byte model files, a fake engine, and a fake
+`ds4_weight_server`. It verifies owned-server startup, preflight parsing,
+manifest validation, lifecycle telemetry, clean shutdown, and external-manifest
+validation without requiring Spark or CUDA.
+
 ## JSON Plans
 
 For broader work, use a plan file:
