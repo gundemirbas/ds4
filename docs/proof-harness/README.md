@@ -76,6 +76,11 @@ tests/ds4_proof.py \
   --json-report /tmp/ds4_proof/report.json
 ```
 
+Use `--weight-server-scope mtp` to share only the small MTP GGUF first. That is
+the safest IPC-lifecycle validation path on Spark because it avoids the 80+ GiB
+base raw-weight owner while still exercising the owner, manifest, CUDA import,
+and cleanup machinery.
+
 The JSON report includes `weight_server` with the command, manifest path, log
 path, dry-run preflight result, startup time, readiness, and cleanup result.
 The runner performs a short-lived `ds4_weight_server --dry-run` before launching

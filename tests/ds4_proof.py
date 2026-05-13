@@ -101,6 +101,7 @@ class WeightServerState:
     enabled: bool = False
     owned: bool = False
     bin_path: str = ""
+    scope: str = "both"
     manifest_path: str = ""
     log_path: str = ""
     cmd: list[str] = field(default_factory=list)
@@ -130,6 +131,7 @@ class WeightServer:
         copy_chunk_mb: int | None,
         extra_args: list[str],
         preflight_timeout_s: float,
+        scope: str,
     ) -> None:
         self.bin_path = bin_path
         self.base_model = base_model
@@ -142,12 +144,14 @@ class WeightServer:
         self.copy_chunk_mb = copy_chunk_mb
         self.extra_args = extra_args
         self.preflight_timeout_s = preflight_timeout_s
+        self.scope = scope
         self.proc: subprocess.Popen[bytes] | None = None
         self.log_f: Any = None
         self.state = WeightServerState(
             enabled=True,
             owned=True,
             bin_path=bin_path,
+            scope=scope,
             manifest_path=str(manifest_path),
             log_path=str(log_path),
             preflight_log_path=str(log_path.with_suffix(".preflight.log")),
@@ -160,6 +164,8 @@ class WeightServer:
             self.base_model,
             "--manifest",
             str(self.manifest_path),
+            "--scope",
+            self.scope,
             "--reserve-gb",
             str(self.reserve_gb),
         ]
@@ -222,7 +228,7 @@ class WeightServer:
                 self.state.error = f"ds4_weight_server exited before ready rc={rc}: {self.log_tail()}"
                 raise RuntimeError(self.state.error)
             if self.manifest_path.exists():
-                validate_weight_manifest(self.manifest_path, self.base_model, self.mtp_model)
+                validate_weight_manifest(self.manifest_path, self.base_model, self.mtp_model, self.scope)
                 self.state.start_wall_ms = (time.monotonic() - t0) * 1000.0
                 self.state.ready = True
                 self.state.cleanup = "pending"
@@ -510,6 +516,7 @@ def run_profile(
     profile: EngineProfile,
     work_dir: Path,
     weight_ipc_manifest: str | None,
+    weight_ipc_scope: str,
 ) -> RunResult:
     safe_prompt = re.sub(r"[^A-Za-z0-9_.-]+", "_", prompt_case.id)
     safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile.name)
@@ -529,6 +536,7 @@ def run_profile(
     env.update(profile.env)
     if weight_ipc_manifest and profile.backend == "cuda":
         env.setdefault("DS4_CUDA_WEIGHT_IPC_MANIFEST", weight_ipc_manifest)
+        env.setdefault("DS4_CUDA_WEIGHT_IPC_SCOPE", weight_ipc_scope)
     t0 = time.monotonic()
     with out_path.open("wb") as out_f, log_path.open("wb") as log_f:
         proc = subprocess.run(cmd, env=env, stdout=out_f, stderr=log_f)
@@ -622,10 +630,14 @@ def dataclass_dict(obj: Any) -> Any:
     return obj
 
 
-def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None) -> None:
-    expected = {"base": os.path.getsize(base_model)}
-    if mtp_model:
+def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None, scope: str = "both") -> None:
+    expected: dict[str, int] = {}
+    if scope in {"both", "base"}:
+        expected["base"] = os.path.getsize(base_model)
+    if scope in {"both", "mtp"} and mtp_model:
         expected["mtp"] = os.path.getsize(mtp_model)
+    if not expected:
+        raise ValueError(f"weight manifest scope {scope!r} has no expected models")
     seen: dict[str, list[tuple[int, int]]] = {k: [] for k in expected}
     saw_header = False
     for lineno, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
@@ -713,6 +725,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json-report", type=Path)
     ap.add_argument("--weight-ipc-manifest",
                     help="CUDA shared weight manifest from ds4_weight_server.")
+    ap.add_argument("--weight-server-scope", choices=["both", "base", "mtp"], default="both",
+                    help="Shared weight scope for validation, server startup, and CUDA import.")
     ap.add_argument("--start-weight-server", action="store_true",
                     help="Start ds4_weight_server for this proof run and clean it up on exit.")
     ap.add_argument("--weight-server-bin", default=os.environ.get("DS4_WEIGHT_SERVER_BIN", "./ds4_weight_server"))
@@ -807,10 +821,11 @@ def main(argv: list[str] | None = None) -> int:
     weight_server_state = WeightServerState(
         enabled=bool(args.weight_ipc_manifest or args.start_weight_server),
         owned=False,
+        scope=args.weight_server_scope,
         manifest_path=args.weight_ipc_manifest or "",
     )
     if args.weight_ipc_manifest:
-        validate_weight_manifest(Path(args.weight_ipc_manifest), args.base, args.mtp)
+        validate_weight_manifest(Path(args.weight_ipc_manifest), args.base, args.mtp, args.weight_server_scope)
         weight_server_state.ready = True
         weight_server_state.cleanup = "external"
     elif args.start_weight_server:
@@ -828,6 +843,7 @@ def main(argv: list[str] | None = None) -> int:
             copy_chunk_mb=args.weight_server_copy_chunk_mb,
             extra_args=args.weight_server_arg,
             preflight_timeout_s=args.weight_server_preflight_timeout,
+            scope=args.weight_server_scope,
         )
         if not args.no_weight_server_preflight:
             print(f"preflighting ds4_weight_server log={weight_server.state.preflight_log_path}")
@@ -871,6 +887,7 @@ def main(argv: list[str] | None = None) -> int:
                         profile=profile,
                         work_dir=work_dir,
                         weight_ipc_manifest=weight_ipc_manifest,
+                        weight_ipc_scope=args.weight_server_scope,
                     )
                 except ValueError as e:
                     print(f"{profile.name:28s} FAILED {e}")
@@ -908,6 +925,7 @@ def main(argv: list[str] | None = None) -> int:
         "temperature": args.temperature,
         "work_dir": str(work_dir),
         "weight_ipc_manifest": weight_ipc_manifest,
+        "weight_ipc_scope": args.weight_server_scope,
         "weight_server": dataclass_dict(weight_server_state),
         "profiles": [dataclass_dict(p) for p in profiles],
         "prompts": [dataclass_dict(p) for p in prompts],
