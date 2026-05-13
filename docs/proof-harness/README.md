@@ -46,8 +46,10 @@ That command now delegates to the generalized runner with
 ## CUDA Weight Server
 
 `ds4_weight_server` is an opt-in CUDA weight owner for proof runs. It uploads raw
-GGUF tensor spans once, exports CUDA IPC handles, writes a manifest, and stays
-alive while proof workers import those shared allocations.
+GGUF tensor spans once, writes a manifest, and stays alive while proof workers
+import those shared allocations. The default backend exports legacy CUDA IPC
+handles. The VMM backend uses CUDA Driver VMM allocations and transfers POSIX
+FDs to workers through a Unix-domain socket broker.
 
 This path is experimental. On unified-memory systems, do not start it while
 other large DS4 processes are resident. The owner keeps its CUDA allocations
@@ -73,22 +75,26 @@ tests/ds4_proof.py \
   --suite mtp_speculative \
   --tokens 512 \
   --start-weight-server \
+  --weight-server-backend vmm \
+  --weight-server-scope mtp \
   --json-report /tmp/ds4_proof/report.json
 ```
 
 Use `--weight-server-scope mtp` to share only the small MTP GGUF first. That is
-the safest IPC-lifecycle validation path on Spark because it avoids the 80+ GiB
+the safest lifecycle validation path on Spark because it avoids the 80+ GiB
 base raw-weight owner while still exercising the owner, manifest, CUDA import,
-and cleanup machinery.
+broker, and cleanup machinery.
 For non-MTP proof runs, the default `--weight-server-scope both` resolves to
 `base` because there is no MTP model to share.
 
 The JSON report includes `weight_server` with the command, manifest path, log
 path, dry-run preflight result, startup time, readiness, and cleanup result.
 It also includes `weight_server_validation`, a top-level pass/fail verdict for
-automation. The verdict checks ready state, scope, preflight success when
-enabled, upload telemetry for the requested model scope, parent PID guarding,
-lock acquisition, shutdown observation, and clean termination for owned runs.
+automation. The verdict checks ready state, backend, scope, preflight success
+when enabled, upload telemetry for the requested model scope, parent PID
+guarding, lock acquisition, shutdown observation, and clean termination for
+owned runs. VMM runs additionally check VMM support telemetry, VMM plans, broker
+startup, and broker request activity.
 For external manifests, it checks the live owner record and manifest ranges.
 Owned-server cleanup is a proof condition: if the owner exits during a profile
 or the runner cannot terminate it cleanly, the proof fails. The report also
@@ -107,6 +113,8 @@ one owner. Start it only after the dry-run plan and memory preflight look sane:
 ./ds4_weight_server \
   --base "$BASE" \
   --mtp "$MTP" \
+  --backend vmm \
+  --scope mtp \
   --manifest /tmp/ds4_weight_server.ipc
 ```
 
@@ -119,15 +127,18 @@ tests/ds4_proof.py \
   --suite mtp_speculative \
   --tokens 512 \
   --weight-ipc-manifest /tmp/ds4_weight_server.ipc \
+  --weight-server-backend vmm \
+  --weight-server-scope mtp \
   --json-report /tmp/ds4_proof/report.json
 ```
 
 The owner process must remain alive while workers run. If it exits, imported
-CUDA IPC mappings are no longer a valid basis for proof. Manifests therefore
-include an owner PID record, and the proof runner rejects external manifests
-whose owner is gone or whose owner scope differs from `--weight-server-scope`.
-This first implementation shares raw tensor spans only; derived Q8 F16/F32
-cache sharing is intentionally deferred.
+CUDA mappings are no longer a valid basis for proof. Manifests therefore include
+an owner PID record, and the proof runner rejects external manifests whose owner
+is gone or whose owner scope differs from `--weight-server-scope`. VMM manifests
+also include a broker socket record and per-allocation logical/allocated byte
+records. This first implementation shares raw tensor spans only; derived Q8
+F16/F32 cache sharing is intentionally deferred.
 
 By default the server refuses to start unless the CUDA allocator reports enough
 free memory for the full raw-span upload plus a 32 GiB reserve. Use
