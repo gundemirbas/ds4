@@ -3,6 +3,7 @@
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cuda.h>
 
 #include <stdint.h>
 #include <errno.h>
@@ -13,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -99,6 +102,10 @@ struct cuda_model_range {
     int host_registered;
     int arena_allocated;
     int imported_ipc;
+    int imported_vmm;
+    CUmemGenericAllocationHandle vmm_handle;
+    CUdeviceptr vmm_va;
+    uint64_t vmm_alloc_bytes;
 };
 
 struct cuda_model_arena {
@@ -250,7 +257,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0, 0});
+                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0, 0, 0, 0, 0, 0});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
@@ -294,7 +301,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return NULL;
         }
     }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0});
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1082,7 +1089,7 @@ static const char *cuda_model_range_ptr_from_fd(
         return NULL;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0});
+    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0, 0, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -1186,6 +1193,14 @@ static void cuda_model_range_release_all(void) {
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
+        } else if (r.imported_vmm) {
+            if (r.vmm_va && r.vmm_alloc_bytes) {
+                (void)cuMemUnmap(r.vmm_va, (size_t)r.vmm_alloc_bytes);
+                (void)cuMemAddressFree(r.vmm_va, (size_t)r.vmm_alloc_bytes);
+            }
+            if (r.vmm_handle) {
+                (void)cuMemRelease(r.vmm_handle);
+            }
         } else if (r.imported_ipc && r.device_ptr) {
             (void)cudaIpcCloseMemHandle(r.device_ptr);
         } else if (r.device_ptr && !r.arena_allocated) {
@@ -1514,6 +1529,192 @@ static int cuda_hex_decode(const char *hex, void *out, size_t out_bytes) {
     return 1;
 }
 
+static int driver_ok(CUresult result, const char *what) {
+    if (result == CUDA_SUCCESS) return 1;
+    const char *name = NULL;
+    const char *text = NULL;
+    (void)cuGetErrorName(result, &name);
+    (void)cuGetErrorString(result, &text);
+    fprintf(stderr, "ds4: CUDA driver %s failed: %s%s%s\n",
+            what,
+            name ? name : "unknown",
+            text ? ": " : "",
+            text ? text : "");
+    return 0;
+}
+
+static int recv_vmm_fd(const char *socket_path, unsigned long long alloc_id, unsigned long long *alloc_bytes_out) {
+    if (!socket_path || !socket_path[0]) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: CUDA VMM broker socket failed: %s\n", strerror(errno));
+        return -1;
+    }
+    sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(socket_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "ds4: CUDA VMM broker socket path too long: %s\n", socket_path);
+        close(fd);
+        return -1;
+    }
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1u);
+    if (connect(fd, (sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "ds4: CUDA VMM broker connect failed %s: %s\n", socket_path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    char req[64];
+    snprintf(req, sizeof(req), "GET %llu\n", alloc_id);
+    if (write(fd, req, strlen(req)) != (ssize_t)strlen(req)) {
+        fprintf(stderr, "ds4: CUDA VMM broker request failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    char buf[128];
+    char control[CMSG_SPACE(sizeof(int))];
+    memset(buf, 0, sizeof(buf));
+    memset(control, 0, sizeof(control));
+    struct iovec iov;
+    iov.iov_base = buf;
+    iov.iov_len = sizeof(buf) - 1u;
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    ssize_t n = recvmsg(fd, &msg, 0);
+    close(fd);
+    if (n <= 0) {
+        fprintf(stderr, "ds4: CUDA VMM broker response failed\n");
+        return -1;
+    }
+    buf[n] = '\0';
+    unsigned long long got_id = 0;
+    unsigned long long got_bytes = 0;
+    if (sscanf(buf, "OK %llu %llu", &got_id, &got_bytes) != 2 || got_id != alloc_id) {
+        fprintf(stderr, "ds4: CUDA VMM broker rejected alloc %llu: %s\n", alloc_id, buf);
+        return -1;
+    }
+    int recv_fd = -1;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            memcpy(&recv_fd, CMSG_DATA(cmsg), sizeof(int));
+            break;
+        }
+    }
+    if (recv_fd < 0) {
+        fprintf(stderr, "ds4: CUDA VMM broker did not send an FD for alloc %llu\n", alloc_id);
+        return -1;
+    }
+    if (alloc_bytes_out) *alloc_bytes_out = got_bytes;
+    return recv_fd;
+}
+
+static int import_vmm_allocation(
+        const void *model_map,
+        uint64_t model_size,
+        const char *model_id,
+        const char *broker_path,
+        unsigned long long alloc_id,
+        unsigned long long file_size,
+        unsigned long long off,
+        unsigned long long bytes,
+        unsigned long long alloc_bytes,
+        uint64_t *imported_bytes,
+        uint64_t *imported_ranges) {
+    if ((uint64_t)file_size != model_size ||
+        (uint64_t)off > model_size ||
+        (uint64_t)bytes > model_size - (uint64_t)off ||
+        bytes == 0 ||
+        alloc_bytes < bytes) {
+        fprintf(stderr,
+                "ds4: CUDA shared VMM allocation rejected for %s "
+                "(manifest size=%llu local size=%llu off=%llu bytes=%llu alloc=%llu)\n",
+                model_id,
+                file_size,
+                (unsigned long long)model_size,
+                off,
+                bytes,
+                alloc_bytes);
+        return 0;
+    }
+
+    unsigned long long broker_alloc_bytes = 0;
+    int fd = recv_vmm_fd(broker_path, alloc_id, &broker_alloc_bytes);
+    if (fd < 0) return 0;
+    if (broker_alloc_bytes != alloc_bytes) {
+        fprintf(stderr,
+                "ds4: CUDA VMM broker alloc size mismatch for %s alloc=%llu broker=%llu manifest=%llu\n",
+                model_id,
+                alloc_id,
+                broker_alloc_bytes,
+                alloc_bytes);
+        close(fd);
+        return 0;
+    }
+
+    CUmemGenericAllocationHandle handle;
+    memset(&handle, 0, sizeof(handle));
+    if (!driver_ok(cuMemImportFromShareableHandle(&handle,
+                                                  (void *)(uintptr_t)fd,
+                                                  CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+                   "VMM import POSIX FD")) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+
+    CUdeviceptr va = 0;
+    if (!driver_ok(cuMemAddressReserve(&va, (size_t)alloc_bytes, 0, 0, 0), "VMM import address reserve")) {
+        (void)cuMemRelease(handle);
+        return 0;
+    }
+    if (!driver_ok(cuMemMap(va, (size_t)alloc_bytes, 0, handle, 0), "VMM import map")) {
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
+    CUmemAccessDesc access;
+    memset(&access, 0, sizeof(access));
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    int dev_id = 0;
+    (void)cudaGetDevice(&dev_id);
+    access.location.id = dev_id;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READ;
+    if (!driver_ok(cuMemSetAccess(va, (size_t)alloc_bytes, &access, 1), "VMM import set access")) {
+        (void)cuMemUnmap(va, (size_t)alloc_bytes);
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
+
+    g_model_ranges.push_back({
+        model_map,
+        (uint64_t)off,
+        (uint64_t)bytes,
+        (char *)va,
+        NULL,
+        NULL,
+        0,
+        0,
+        0,
+        0,
+        1,
+        handle,
+        va,
+        (uint64_t)alloc_bytes,
+    });
+    g_model_range_by_offset[(uint64_t)off] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += (uint64_t)bytes;
+    *imported_bytes += (uint64_t)bytes;
+    *imported_ranges += 1;
+    return 1;
+}
+
 extern "C" int ds4_gpu_import_model_ipc_manifest(
         const void *model_map,
         uint64_t model_size,
@@ -1531,9 +1732,11 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
     }
 
     char line[4096];
+    char broker_path[512] = {0};
     uint64_t imported_bytes = 0;
     uint64_t imported_ranges = 0;
     int saw_header = 0;
+    int vmm_manifest = 0;
     int ok = 1;
     while (fgets(line, sizeof(line), fp)) {
         char *p = line;
@@ -1542,6 +1745,12 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         if (!strncmp(p, "DS4_WEIGHT_SERVER_IPC_V1", 24) ||
             !strncmp(p, "DS4_WEIGHTD_IPC_V1", 18)) {
             saw_header = 1;
+            vmm_manifest = 0;
+            continue;
+        }
+        if (!strncmp(p, "DS4_WEIGHT_SERVER_VMM_V1", 24)) {
+            saw_header = 1;
+            vmm_manifest = 1;
             continue;
         }
 
@@ -1551,6 +1760,47 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         unsigned long long file_size = 0;
         unsigned long long off = 0;
         unsigned long long bytes = 0;
+        if (vmm_manifest) {
+            char broker_candidate[512] = {0};
+            if (sscanf(p, "%31s %511s", rec, broker_candidate) == 2) {
+                if (strcmp(rec, "broker") == 0) {
+                    strncpy(broker_path, broker_candidate, sizeof(broker_path) - 1u);
+                    broker_path[sizeof(broker_path) - 1u] = '\0';
+                    continue;
+                }
+            }
+            unsigned long long alloc_id = 0;
+            unsigned long long alloc_bytes = 0;
+            if (sscanf(p, "%31s %llu %63s %llu %llu %llu %llu",
+                       rec, &alloc_id, id, &file_size, &off, &bytes, &alloc_bytes) != 7) {
+                continue;
+            }
+            if (strcmp(rec, "alloc") != 0 || strcmp(id, model_id) != 0) continue;
+            if (!broker_path[0]) {
+                fprintf(stderr, "ds4: CUDA shared VMM manifest missing broker before alloc record\n");
+                ok = 0;
+                break;
+            }
+            if (!driver_ok(cuInit(0), "init")) {
+                ok = 0;
+                break;
+            }
+            if (!import_vmm_allocation(model_map,
+                                       model_size,
+                                       model_id,
+                                       broker_path,
+                                       alloc_id,
+                                       file_size,
+                                       off,
+                                       bytes,
+                                       alloc_bytes,
+                                       &imported_bytes,
+                                       &imported_ranges)) {
+                ok = 0;
+                break;
+            }
+            continue;
+        }
         if (sscanf(p, "%31s %63s %llu %llu %llu %255s",
                    rec, id, &file_size, &off, &bytes, hex) != 6) {
             continue;
@@ -1603,6 +1853,10 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
             0,
             0,
             1,
+            0,
+            0,
+            0,
+            0,
         });
         g_model_range_by_offset[(uint64_t)off] = g_model_ranges.size() - 1u;
         g_model_range_bytes += (uint64_t)bytes;
@@ -1621,7 +1875,8 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         return 0;
     }
     fprintf(stderr,
-            "ds4: CUDA imported shared weight cache for %s: %.2f GiB across %llu ranges\n",
+            "ds4: CUDA imported shared %s weight cache for %s: %.2f GiB across %llu ranges\n",
+            vmm_manifest ? "VMM" : "IPC",
             model_id,
             (double)imported_bytes / 1073741824.0,
             (unsigned long long)imported_ranges);
