@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -39,6 +40,19 @@ struct owned_range {
     cudaIpcMemHandle_t handle{};
 };
 
+enum weight_backend {
+    WEIGHT_BACKEND_IPC = 0,
+    WEIGHT_BACKEND_VMM = 1,
+};
+
+struct vmm_support {
+    int vmm = 0;
+    int posix_fd = 0;
+    int uva = 0;
+    size_t granularity_min = 0;
+    size_t granularity_recommended = 0;
+};
+
 static volatile sig_atomic_t g_stop;
 
 static void on_signal(int) {
@@ -64,10 +78,90 @@ static bool parse_scope(const char *scope, bool &want_base, bool &want_mtp) {
     return false;
 }
 
+static bool parse_backend(const char *backend, weight_backend &out) {
+    if (!backend || !backend[0] || !strcmp(backend, "ipc")) {
+        out = WEIGHT_BACKEND_IPC;
+        return true;
+    }
+    if (!strcmp(backend, "vmm")) {
+        out = WEIGHT_BACKEND_VMM;
+        return true;
+    }
+    return false;
+}
+
+static const char *backend_name(weight_backend backend) {
+    return backend == WEIGHT_BACKEND_VMM ? "vmm" : "ipc";
+}
+
 static bool parent_pid_alive(pid_t pid) {
     if (pid <= 0) return true;
     if (kill(pid, 0) == 0) return true;
     return errno != ESRCH;
+}
+
+static void driver_error_name(CUresult result, const char **name, const char **text) {
+    *name = nullptr;
+    *text = nullptr;
+    (void)cuGetErrorName(result, name);
+    (void)cuGetErrorString(result, text);
+}
+
+static bool driver_ok(CUresult result, const char *what) {
+    if (result == CUDA_SUCCESS) return true;
+    const char *name = nullptr;
+    const char *text = nullptr;
+    driver_error_name(result, &name, &text);
+    fprintf(stderr, "ds4_weight_server: CUDA driver %s failed: %s%s%s\n",
+            what,
+            name ? name : "unknown",
+            text ? ": " : "",
+            text ? text : "");
+    return false;
+}
+
+static CUmemAllocationProp vmm_allocation_prop(int device) {
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof(prop));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    return prop;
+}
+
+static bool query_vmm_support(int device, vmm_support &support) {
+    CUdevice cu_device;
+    if (!driver_ok(cuDeviceGet(&cu_device, device), "device get")) return false;
+    if (!driver_ok(cuDeviceGetAttribute(&support.vmm,
+                                        CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                                        cu_device),
+                   "query VMM support")) return false;
+    if (!driver_ok(cuDeviceGetAttribute(&support.posix_fd,
+                                        CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED,
+                                        cu_device),
+                   "query POSIX FD handle support")) return false;
+    if (!driver_ok(cuDeviceGetAttribute(&support.uva,
+                                        CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
+                                        cu_device),
+                   "query UVA support")) return false;
+    CUmemAllocationProp prop = vmm_allocation_prop(device);
+    if (!driver_ok(cuMemGetAllocationGranularity(&support.granularity_min,
+                                                 &prop,
+                                                 CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                   "query minimum VMM granularity")) return false;
+    if (!driver_ok(cuMemGetAllocationGranularity(&support.granularity_recommended,
+                                                 &prop,
+                                                 CU_MEM_ALLOC_GRANULARITY_RECOMMENDED),
+                   "query recommended VMM granularity")) return false;
+    fprintf(stderr,
+            "ds4_weight_server: vmm support vmm=%d posix_fd=%d uva=%d gran_min=%zu gran_rec=%zu\n",
+            support.vmm,
+            support.posix_fd,
+            support.uva,
+            support.granularity_min,
+            support.granularity_recommended);
+    return support.vmm && support.posix_fd && support.uva && support.granularity_min != 0;
 }
 
 static int acquire_owner_lock(const char *path) {
@@ -135,6 +229,18 @@ static uint64_t align_up(uint64_t v, uint64_t a) {
     if (a <= 1) return v;
     const uint64_t r = v % a;
     return r ? v + (a - r) : v;
+}
+
+static uint64_t sum_rounded_ranges(const std::vector<tensor_span> &ranges, uint64_t granularity) {
+    uint64_t total = 0;
+    for (const tensor_span &r : ranges) {
+        if (r.end < r.off) continue;
+        const uint64_t logical = r.end - r.off;
+        const uint64_t rounded = align_up(logical, granularity);
+        if (UINT64_MAX - total < rounded) return UINT64_MAX;
+        total += rounded;
+    }
+    return total;
 }
 
 static uint64_t gguf_scalar_size(uint32_t type) {
@@ -368,7 +474,8 @@ static uint64_t range_plan_bytes(const std::vector<tensor_span> &ranges) {
 
 static bool inspect_model_plan(const char *id, const char *path, uint64_t span_bytes,
                                uint64_t *model_size_out, uint64_t *bytes_out,
-                               uint64_t *ranges_out) {
+                               uint64_t *ranges_out, uint64_t vmm_granularity,
+                               uint64_t *vmm_alloc_bytes_out) {
     mapped_file m;
     if (!map_file(path, m)) return false;
     std::vector<tensor_span> spans;
@@ -379,15 +486,25 @@ static bool inspect_model_plan(const char *id, const char *path, uint64_t span_b
     std::vector<tensor_span> ranges;
     build_range_plan(spans, span_bytes, ranges);
     const uint64_t planned = range_plan_bytes(ranges);
+    const uint64_t vmm_alloc = vmm_granularity ? sum_rounded_ranges(ranges, vmm_granularity) : 0;
     fprintf(stderr,
             "ds4_weight_server: %s plan model=%.2f GiB raw_tensor_ranges=%.2f GiB ranges=%zu\n",
             id,
             (double)m.size / 1073741824.0,
             (double)planned / 1073741824.0,
             ranges.size());
+    if (vmm_granularity) {
+        fprintf(stderr,
+                "ds4_weight_server: %s vmm plan logical=%.2f GiB allocated=%.2f GiB granularity=%llu\n",
+                id,
+                (double)planned / 1073741824.0,
+                (double)vmm_alloc / 1073741824.0,
+                (unsigned long long)vmm_granularity);
+    }
     if (model_size_out) *model_size_out = m.size;
     if (bytes_out) *bytes_out = planned;
     if (ranges_out) *ranges_out = (uint64_t)ranges.size();
+    if (vmm_alloc_bytes_out) *vmm_alloc_bytes_out = vmm_alloc;
     unmap_file(m);
     return true;
 }
@@ -642,6 +759,7 @@ static void usage(FILE *fp) {
             "\n"
             "Options:\n"
             "  --device N        CUDA device ordinal. Default: 0\n"
+            "  --backend B       Weight sharing backend: ipc or vmm. Default: ipc\n"
             "  --scope S         Models to upload: both, base, or mtp. Default: both\n"
             "  --exit-on-parent-pid N Exit if parent/orchestrator PID disappears\n"
             "  --lock-file FILE  Single-owner lock file. Default: /tmp/ds4_weight_server_cudaN.lock\n"
@@ -657,6 +775,7 @@ int main(int argc, char **argv) {
     const char *mtp = nullptr;
     const char *manifest = nullptr;
     const char *scope = "both";
+    const char *backend_s = "ipc";
     const char *lock_file = nullptr;
     pid_t exit_on_parent_pid = 0;
     int device = 0;
@@ -669,6 +788,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--mtp") && i + 1 < argc) mtp = argv[++i];
         else if (!strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];
         else if (!strcmp(argv[i], "--scope") && i + 1 < argc) scope = argv[++i];
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend_s = argv[++i];
         else if (!strcmp(argv[i], "--exit-on-parent-pid") && i + 1 < argc) exit_on_parent_pid = (pid_t)strtol(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--lock-file") && i + 1 < argc) lock_file = argv[++i];
         else if (!strcmp(argv[i], "--no-lock")) lock_file = "";
@@ -688,8 +808,13 @@ int main(int argc, char **argv) {
     }
     bool want_base = true;
     bool want_mtp = true;
+    weight_backend backend = WEIGHT_BACKEND_IPC;
     if (!parse_scope(scope, want_base, want_mtp)) {
         fprintf(stderr, "ds4_weight_server: invalid --scope %s; expected both, base, or mtp\n", scope);
+        return 2;
+    }
+    if (!parse_backend(backend_s, backend)) {
+        fprintf(stderr, "ds4_weight_server: invalid --backend %s; expected ipc or vmm\n", backend_s);
         return 2;
     }
     if ((want_base && !base) || (want_mtp && !mtp) || (!manifest && !dry_run)) {
@@ -706,6 +831,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ds4_weight_server: cudaSetDevice failed: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    if (!driver_ok(cuInit(0), "init")) return 1;
+
+    vmm_support support;
+    uint64_t vmm_granularity = 0;
+    if (backend == WEIGHT_BACKEND_VMM) {
+        if (!query_vmm_support(device, support)) {
+            fprintf(stderr, "ds4_weight_server: VMM backend is not supported on CUDA device %d\n", device);
+            return 1;
+        }
+        vmm_granularity = (uint64_t)support.granularity_recommended;
+    }
 
     char default_lock[128];
     int lock_fd = -1;
@@ -721,24 +857,44 @@ int main(int argc, char **argv) {
     }
 
     uint64_t total_upload_bytes = 0;
+    uint64_t total_alloc_bytes = 0;
     uint64_t base_bytes = 0;
     if (want_base) {
-        if (!inspect_model_plan("base", base, span_bytes, nullptr, &base_bytes, nullptr)) return 1;
+        uint64_t base_alloc_bytes = 0;
+        if (!inspect_model_plan("base", base, span_bytes, nullptr, &base_bytes, nullptr,
+                                vmm_granularity, &base_alloc_bytes)) return 1;
         total_upload_bytes += base_bytes;
+        total_alloc_bytes += backend == WEIGHT_BACKEND_VMM ? base_alloc_bytes : base_bytes;
     }
     if (want_mtp) {
         uint64_t mtp_bytes = 0;
-        if (!inspect_model_plan("mtp", mtp, span_bytes, nullptr, &mtp_bytes, nullptr)) return 1;
+        uint64_t mtp_alloc_bytes = 0;
+        if (!inspect_model_plan("mtp", mtp, span_bytes, nullptr, &mtp_bytes, nullptr,
+                                vmm_granularity, &mtp_alloc_bytes)) return 1;
         if (UINT64_MAX - total_upload_bytes < mtp_bytes) {
             fprintf(stderr, "ds4_weight_server: upload plan size overflow\n");
             return 1;
         }
+        if (UINT64_MAX - total_alloc_bytes < (backend == WEIGHT_BACKEND_VMM ? mtp_alloc_bytes : mtp_bytes)) {
+            fprintf(stderr, "ds4_weight_server: allocation plan size overflow\n");
+            return 1;
+        }
         total_upload_bytes += mtp_bytes;
+        total_alloc_bytes += backend == WEIGHT_BACKEND_VMM ? mtp_alloc_bytes : mtp_bytes;
     }
-    if (!cuda_memory_preflight("full upload plan", total_upload_bytes, reserve_bytes)) return 1;
+    fprintf(stderr,
+            "ds4_weight_server: backend=%s logical_upload=%.2f GiB allocation_plan=%.2f GiB\n",
+            backend_name(backend),
+            (double)total_upload_bytes / 1073741824.0,
+            (double)total_alloc_bytes / 1073741824.0);
+    if (!cuda_memory_preflight("full upload plan", total_alloc_bytes, reserve_bytes)) return 1;
     if (dry_run) {
         fprintf(stderr, "ds4_weight_server: dry-run complete; no allocations or manifest were created\n");
         return 0;
+    }
+    if (backend == WEIGHT_BACKEND_VMM) {
+        fprintf(stderr, "ds4_weight_server: VMM backend allocation is not implemented yet; use --dry-run\n");
+        return 1;
     }
 
     std::vector<owned_range> ranges;
