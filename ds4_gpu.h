@@ -15,6 +15,13 @@
  */
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
+typedef struct ds4_gpu_top2_result {
+    uint32_t id0;
+    uint32_t id1;
+    float    value0;
+    float    value1;
+} ds4_gpu_top2_result;
+
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
@@ -139,6 +146,15 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+int ds4_gpu_matmul_q8_0_top2_tensor(
+        ds4_gpu_tensor       *top2,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,

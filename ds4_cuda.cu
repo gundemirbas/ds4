@@ -45,6 +45,13 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+typedef struct ds4_gpu_top2_result {
+    uint32_t id0;
+    uint32_t id1;
+    float    value0;
+    float    value1;
+} ds4_gpu_top2_result;
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];
@@ -2137,6 +2144,121 @@ __device__ static float warp_sum_f32(float v) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
     }
     return v;
+}
+
+__device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const int8_t *b, uint64_t n, int use_dp4a);
+
+__device__ __forceinline__ static bool top2_value_better(float av, uint32_t ai, float bv, uint32_t bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+__device__ __forceinline__ static void top2_insert_value(
+        float v,
+        uint32_t id,
+        float &v0,
+        uint32_t &id0,
+        float &v1,
+        uint32_t &id1) {
+    if (id == id0 || id == id1) return;
+    if (top2_value_better(v, id, v0, id0)) {
+        v1 = v0;
+        id1 = id0;
+        v0 = v;
+        id0 = id;
+    } else if (top2_value_better(v, id, v1, id1)) {
+        v1 = v;
+        id1 = id;
+    }
+}
+
+__global__ static void matmul_q8_0_top2_warp8_kernel(
+        ds4_gpu_top2_result *candidates,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
+
+    float acc = -INFINITY;
+    if (row < out_dim) {
+        const unsigned char *wr = w + row * blocks * 34;
+        acc = 0.0f;
+        for (uint64_t b = lane; b < blocks; b += 32u) {
+            uint64_t i0 = b * 32;
+            uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+            const __half *scale_h = (const __half *)(wr + b * 34);
+            const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+            const int8_t *xqb = xq + b * 32;
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        }
+        acc = warp_sum_f32(acc);
+    }
+
+    __shared__ float vals[8];
+    __shared__ uint32_t ids[8];
+    if (lane == 0) {
+        vals[warp] = acc;
+        ids[warp] = row < out_dim ? (uint32_t)row : UINT32_MAX;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float v0 = -INFINITY;
+        float v1 = -INFINITY;
+        uint32_t id0 = UINT32_MAX;
+        uint32_t id1 = UINT32_MAX;
+        for (uint32_t i = 0; i < 8u; i++) {
+            if (ids[i] != UINT32_MAX) top2_insert_value(vals[i], ids[i], v0, id0, v1, id1);
+        }
+        candidates[blockIdx.x] = {id0, id1, v0, v1};
+    }
+}
+
+__global__ static void q8_0_top2_merge_kernel(
+        ds4_gpu_top2_result *out,
+        const ds4_gpu_top2_result *candidates,
+        uint32_t n_candidates) {
+    const uint32_t tid = threadIdx.x;
+    float v0 = -INFINITY;
+    float v1 = -INFINITY;
+    uint32_t id0 = UINT32_MAX;
+    uint32_t id1 = UINT32_MAX;
+
+    for (uint32_t i = tid; i < n_candidates; i += blockDim.x) {
+        ds4_gpu_top2_result c = candidates[i];
+        if (c.id0 != UINT32_MAX) top2_insert_value(c.value0, c.id0, v0, id0, v1, id1);
+        if (c.id1 != UINT32_MAX) top2_insert_value(c.value1, c.id1, v0, id0, v1, id1);
+    }
+
+    __shared__ float sv0[1024];
+    __shared__ float sv1[1024];
+    __shared__ uint32_t sid0[1024];
+    __shared__ uint32_t sid1[1024];
+    sv0[tid] = v0;
+    sv1[tid] = v1;
+    sid0[tid] = id0;
+    sid1[tid] = id1;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            top2_insert_value(sv0[tid + stride], sid0[tid + stride],
+                              sv0[tid], sid0[tid], sv1[tid], sid1[tid]);
+            top2_insert_value(sv1[tid + stride], sid1[tid + stride],
+                              sv0[tid], sid0[tid], sv1[tid], sid1[tid]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[0] = {sid0[0], sid1[0], sv0[0], sv1[0]};
+    }
 }
 
 __device__ static float warp_max_f32(float v) {
@@ -6242,6 +6364,49 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_top2_tensor(ds4_gpu_tensor *top2, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    if (!top2 || !x || !model_map || in_dim == 0 || out_dim == 0) return 0;
+    if (top2->bytes < sizeof(ds4_gpu_top2_result) ||
+        x->bytes < in_dim * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0_top2");
+    if (!wptr) return 0;
+
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t candidate_count = (out_dim + 7u) / 8u;
+    const uint64_t candidate_offset = (scale_offset + blocks * sizeof(float) + 15u) & ~15ull;
+    if (candidate_count > UINT64_MAX / sizeof(ds4_gpu_top2_result)) return 0;
+    const uint64_t tmp_bytes = candidate_offset + candidate_count * sizeof(ds4_gpu_top2_result);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 top2");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    ds4_gpu_top2_result *candidates = (ds4_gpu_top2_result *)((char *)tmp + candidate_offset);
+
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8_0 top2 quantize launch")) return 0;
+    matmul_q8_0_top2_warp8_kernel<<<(unsigned)candidate_count, 256>>>(
+            candidates,
+            reinterpret_cast<const unsigned char *>(wptr),
+            xq,
+            xscale,
+            in_dim,
+            out_dim,
+            blocks,
+            cuda_q8_use_dp4a());
+    if (!cuda_ok(cudaGetLastError(), "q8_0 top2 matmul launch")) return 0;
+    q8_0_top2_merge_kernel<<<1, 1024>>>((ds4_gpu_top2_result *)top2->ptr,
+                                        candidates,
+                                        (uint32_t)candidate_count);
+    return cuda_ok(cudaGetLastError(), "q8_0 top2 merge launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
