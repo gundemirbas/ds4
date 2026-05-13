@@ -900,7 +900,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--weight-ipc-manifest",
                     help="CUDA shared weight manifest from ds4_weight_server.")
     ap.add_argument("--weight-server-scope", choices=["both", "base", "mtp"], default="both",
-                    help="Shared weight scope for validation, server startup, and CUDA import.")
+                    help="Shared weight scope for validation, server startup, and CUDA import. "
+                    "Defaults to base when no MTP model is configured.")
     ap.add_argument("--start-weight-server", action="store_true",
                     help="Start ds4_weight_server for this proof run and clean it up on exit.")
     ap.add_argument("--weight-server-bin", default=os.environ.get("DS4_WEIGHT_SERVER_BIN", "./ds4_weight_server"))
@@ -948,6 +949,12 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("suite mtp_speculative requires --mtp or DS4_PROOF_MTP")
     if args.weight_ipc_manifest and args.start_weight_server:
         ap.error("use either --weight-ipc-manifest or --start-weight-server, not both")
+    weight_server_scope = args.weight_server_scope
+    if (args.weight_ipc_manifest or args.start_weight_server) and not args.mtp:
+        if args.weight_server_scope == "mtp":
+            ap.error("--weight-server-scope mtp requires --mtp or DS4_PROOF_MTP")
+        if args.weight_server_scope == "both":
+            weight_server_scope = "base"
 
     profiles = plan_profiles or (
         default_mtp_profiles() if args.suite == "mtp_speculative" else default_engine_profiles()
@@ -995,11 +1002,11 @@ def main(argv: list[str] | None = None) -> int:
     weight_server_state = WeightServerState(
         enabled=bool(args.weight_ipc_manifest or args.start_weight_server),
         owned=False,
-        scope=args.weight_server_scope,
+        scope=weight_server_scope,
         manifest_path=args.weight_ipc_manifest or "",
     )
     if args.weight_ipc_manifest:
-        manifest_info = validate_weight_manifest(Path(args.weight_ipc_manifest), args.base, args.mtp, args.weight_server_scope)
+        manifest_info = validate_weight_manifest(Path(args.weight_ipc_manifest), args.base, args.mtp, weight_server_scope)
         weight_server_state.ready = True
         weight_server_state.cleanup = "external"
         weight_server_state.telemetry = {"manifest": manifest_info}
@@ -1018,7 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
             copy_chunk_mb=args.weight_server_copy_chunk_mb,
             extra_args=args.weight_server_arg,
             preflight_timeout_s=args.weight_server_preflight_timeout,
-            scope=args.weight_server_scope,
+            scope=weight_server_scope,
         )
         if not args.no_weight_server_preflight:
             print(f"preflighting ds4_weight_server log={weight_server.state.preflight_log_path}")
@@ -1066,7 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
                         profile=profile,
                         work_dir=work_dir,
                         weight_ipc_manifest=weight_ipc_manifest,
-                        weight_ipc_scope=args.weight_server_scope,
+                        weight_ipc_scope=weight_server_scope,
                     )
                 except ValueError as e:
                     print(f"{profile.name:28s} FAILED {e}")
@@ -1102,7 +1109,7 @@ def main(argv: list[str] | None = None) -> int:
 
     weight_server_verdict = weight_server_validation(
         weight_server_state,
-        scope=args.weight_server_scope,
+        scope=weight_server_scope,
         preflight_required=args.start_weight_server and not args.no_weight_server_preflight,
     )
     if weight_server_verdict["enabled"] and not weight_server_verdict["passed"]:
@@ -1119,7 +1126,7 @@ def main(argv: list[str] | None = None) -> int:
         "temperature": args.temperature,
         "work_dir": str(work_dir),
         "weight_ipc_manifest": weight_ipc_manifest,
-        "weight_ipc_scope": args.weight_server_scope,
+        "weight_ipc_scope": weight_server_scope,
         "weight_server": dataclass_dict(weight_server_state),
         "weight_server_validation": weight_server_verdict,
         "profiles": [dataclass_dict(p) for p in profiles],

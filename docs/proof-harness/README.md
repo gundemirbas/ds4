@@ -80,6 +80,8 @@ Use `--weight-server-scope mtp` to share only the small MTP GGUF first. That is
 the safest IPC-lifecycle validation path on Spark because it avoids the 80+ GiB
 base raw-weight owner while still exercising the owner, manifest, CUDA import,
 and cleanup machinery.
+For non-MTP proof runs, the default `--weight-server-scope both` resolves to
+`base` because there is no MTP model to share.
 
 The JSON report includes `weight_server` with the command, manifest path, log
 path, dry-run preflight result, startup time, readiness, and cleanup result.
@@ -142,8 +144,9 @@ tests/ds4_weight_server_harness_smoke.py
 
 The smoke test creates fake one-byte model files, a fake engine, and a fake
 `ds4_weight_server`. It verifies owned-server startup, preflight parsing,
-manifest validation, lifecycle telemetry, clean shutdown, and external-manifest
-validation without requiring Spark or CUDA.
+manifest validation, lifecycle telemetry, clean shutdown, external-manifest
+validation, and the base-only default-scope path without requiring Spark or
+CUDA.
 
 ## JSON Plans
 

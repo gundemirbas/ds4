@@ -226,6 +226,41 @@ def run_external_manifest(tmp: Path, base: Path, mtp: Path, fake_engine: Path) -
     assert_true(report, "weight_server_validation.checks.manifest_ranges_mtp")
 
 
+def run_base_only_default_scope(tmp: Path, base: Path, fake_engine: Path, fake_weight_server: Path) -> None:
+    work = tmp / "base-only-work"
+    report = run_proof(
+        [
+            sys.executable,
+            str(DS4_PROOF),
+            "--bin",
+            str(fake_engine),
+            "--suite",
+            "argmax_generation",
+            "--base",
+            str(base),
+            "--tokens",
+            "1",
+            "--prompt",
+            "local",
+            "--start-weight-server",
+            "--weight-server-bin",
+            str(fake_weight_server),
+            "--work-dir",
+            str(work),
+            "--json-report",
+            str(tmp / "base-only-report.json"),
+        ]
+    )
+    if report["failures"] != 0:
+        raise AssertionError(f"base-only proof failures={report['failures']}")
+    if report["weight_ipc_scope"] != "base":
+        raise AssertionError(f"expected effective base scope, got {report['weight_ipc_scope']!r}")
+    assert_true(report, "weight_server_validation.passed")
+    assert_true(report, "weight_server_validation.checks.uploaded_base")
+    if "uploaded_mtp" in report["weight_server_validation"]["checks"]:
+        raise AssertionError("base-only validation unexpectedly required uploaded_mtp")
+
+
 def main() -> int:
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     with tempfile.TemporaryDirectory(prefix="ds4-weight-harness-smoke.") as raw_tmp:
@@ -233,6 +268,7 @@ def main() -> int:
         base, mtp, fake_engine, fake_weight_server = write_fake_tools(tmp)
         run_owned_lifecycle(tmp, base, mtp, fake_engine, fake_weight_server)
         run_external_manifest(tmp, base, mtp, fake_engine)
+        run_base_only_default_scope(tmp, base, fake_engine, fake_weight_server)
     print("ds4_weight_server_harness_smoke: OK")
     return 0
 
