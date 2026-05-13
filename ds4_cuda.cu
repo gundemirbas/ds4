@@ -9671,6 +9671,38 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+__global__ static void moe_down_sum6_n2_qwarp32_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= 2u) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        int32_t expert_i = selected[(uint64_t)tok * 6u + slot];
+        if (expert_i < 0) expert_i = 0;
+        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + ((uint64_t)tok * 6u + slot) * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[(uint64_t)tok * out_dim + row] = total;
+}
+
+// Q4_K fused 6-expert down + experts-sum (n_expert=6, n_tokens=1).  Mirrors
+// moe_down_sum6_qwarp32_kernel for IQ2+Q2K.  Eliminates the per-expert scratch
+// buffer plus the separate moe_sum_kernel pass; writes one F32 per output row
+// after summing six experts' down contributions in registers.
 __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         float *out,
         const char *down_base,
@@ -10412,8 +10444,12 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW256") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
+        const uint32_t use_direct_down_sum6_n2 =
+            n_tokens == 2u && n_expert == 6u &&
+            getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6_N2") == NULL &&
+            getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         const uint32_t use_direct_down_sum6 =
-            n_tokens == 1u && n_expert == 6u &&
+            ((n_tokens == 1u && n_expert == 6u) || use_direct_down_sum6_n2) &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
@@ -10670,8 +10706,8 @@ static int routed_moe_launch(
                 down_tile_capacity = tile16_capacity;
             }
             if (use_direct_down_sum6) {
-                dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (q4k_path) {
+                    dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                     moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
@@ -10681,7 +10717,19 @@ static int routed_moe_launch(
                         down_row_bytes,
                         midq_blocks,
                         out_dim);
+                } else if (use_direct_down_sum6_n2) {
+                    dim3 sgrid((out_dim + 31u) / 32u, 2, 1);
+                    moe_down_sum6_n2_qwarp32_kernel<<<sgrid, 256>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim);
                 } else {
+                    dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
                         down_w,
