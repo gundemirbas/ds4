@@ -96,7 +96,9 @@ The currently useful CUDA MTP flags are:
 
 The structural CUDA optimizations are default-on after this work:
 
-- Batched Q8 pair projections for two-token verifier passes.
+- Batched Q8 pair projections for two-token verifier passes. Long ordinary
+  prefill chunks stay on the normal Q8/cuBLAS path because the pair kernel is
+  tuned for `n_tokens <= 2`, not thousands-token prefill batches.
 - Fused six-expert MoE down+sum for the two-token verifier.
 - Paired decode Q/KV projections.
 - Startup pre-cache of both the base model and MTP model tensor spans.

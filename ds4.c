@@ -11064,7 +11064,8 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     const bool q_stage_profile = getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
-    const bool batch_q8_pair = getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
+    const bool batch_q8_pair =
+        n_tokens <= 2 && getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
     double q_stage_t0 = q_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_ATTN_STAGE(name) do { \
@@ -12396,7 +12397,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
-    const bool batch_q8_pair = getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
+    const bool batch_q8_pair =
+        n_tokens <= 2 && getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_FFN_STAGE(name) do { \
         if (ok && layer_stage_profile) { \
