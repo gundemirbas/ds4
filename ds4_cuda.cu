@@ -7071,23 +7071,39 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
 }
-/* DS4_CUDA_USE_MMQ env var: opt-in to the vendored llama.cpp mul_mat_q
- * fused dequant+matmul kernels (cuda/mmq/) instead of the legacy
- * cuda_q8_f16_ptr + cublasGemmEx pipeline.  Cached on first use.  Phase
- * 5/6 wiring; default off until Phase 7 benchmark confirms the win and
- * Phase 8 retires the legacy paths. */
+/* mmq quantized-matmul path is the default on CUDA: routes Q8_0 dense
+ * matmuls (attention, shared expert, lm_head) and the IQ2_XXS/Q2_K
+ * routed-MoE block through the vendored llama.cpp mul_mat_q kernels in
+ * cuda/mmq/.  Validated 2.80x sustained prefill speedup on PRO 6000
+ * Blackwell against V4 Flash IQ2XXS GGUF, gen neutral; see
+ * cuda/mmq/VENDOR.md for the bench table and AGENT.md for env-var
+ * semantics.
+ *
+ * DS4_CUDA_USE_MMQ env var kill switch: set to "0" (or "off" / "false" /
+ * "no") to disable and revert to the legacy cuda_q8_f16_ptr +
+ * cublasGemmEx pipeline.  Any other value, or unset, leaves mmq on.
+ * Cached on first use. */
 static int g_ds4_use_mmq_init = 0;
 static int g_ds4_use_mmq = 0;
 static int ds4_cuda_use_mmq() {
     if (!g_ds4_use_mmq_init) {
         g_ds4_use_mmq_init = 1;
-        if (getenv("DS4_CUDA_USE_MMQ") != NULL) {
+        const char *e = getenv("DS4_CUDA_USE_MMQ");
+        int want_off = 0;
+        if (e && *e) {
+            if (e[0] == '0' && e[1] == '\0') want_off = 1;
+            else if (!strcmp(e, "off")   || !strcmp(e, "OFF"))   want_off = 1;
+            else if (!strcmp(e, "no")    || !strcmp(e, "NO"))    want_off = 1;
+            else if (!strcmp(e, "false") || !strcmp(e, "FALSE")) want_off = 1;
+        }
+        if (want_off) {
+            fprintf(stderr, "ds4: DS4_CUDA_USE_MMQ=%s - cuda/mmq disabled, using legacy quantized matmul path\n", e);
+        } else {
             int rc = ds4_mmq_init(0);
             if (rc == 0) {
                 g_ds4_use_mmq = 1;
-                fprintf(stderr, "ds4: DS4_CUDA_USE_MMQ=1 - routing quantized matmuls through cuda/mmq\n");
             } else {
-                fprintf(stderr, "ds4: DS4_CUDA_USE_MMQ requested but ds4_mmq_init failed (%d); falling back\n", rc);
+                fprintf(stderr, "ds4: ds4_mmq_init failed (%d); falling back to legacy quantized matmul path\n", rc);
             }
         }
     }

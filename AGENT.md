@@ -64,14 +64,17 @@ The CUDA backend has a few opt-in switches that affect the inner matmul
 dispatch.  Defaults preserve the historical behavior; set the variables
 to opt in to the newer paths.
 
-- `DS4_CUDA_USE_MMQ=1`: route quantized matmuls through the vendored
-  llama.cpp `mul_mat_q` kernels (`cuda/mmq/`).  Covers Q8_0 dense
-  (attention projections, shared expert, lm_head) and the routed-MoE
-  block when the GGUF uses IQ2_XXS for gate/up and Q2_K for down (the
-  V4 Flash configuration).  Other quant combinations fall through to
-  the existing kernels.  Validated on RTX PRO 6000 Blackwell (sm_120,
-  CUDA 13.0) against V4 Flash: prefill 357-1041 tok/s vs 357-373
-  baseline (sustained ~2.80x), gen within run-to-run variance.
+- `DS4_CUDA_USE_MMQ` (default on): the vendored llama.cpp `mul_mat_q`
+  kernels in `cuda/mmq/` are the default CUDA path for quantized
+  matmuls - Q8_0 dense (attention projections, shared expert, lm_head)
+  and the routed-MoE block when the GGUF uses IQ2_XXS for gate/up and
+  Q2_K for down (the V4 Flash configuration).  Other quant
+  combinations fall through to the existing kernels.  Set
+  `DS4_CUDA_USE_MMQ=0` (or `off` / `no` / `false`) to disable and
+  revert to the legacy `cuda_q8_f16_ptr` + `cublasGemmEx` pipeline.
+  Validated on RTX PRO 6000 Blackwell (sm_120, CUDA 13.0) against V4
+  Flash: prefill 357-1041 tok/s vs 357-373 baseline (sustained
+  ~2.80x), gen within run-to-run variance.
 - `DS4_CUDA_MMQ_MOE_MIN_TOKENS=N`: minimum `n_tokens` at which the
   routed-MoE mmq path activates.  Default 2.  The legacy decode kernel
   (`moe_gate_up_mid_decode_lut_qwarp32_kernel`) wins at `n_tokens=1`
@@ -81,8 +84,8 @@ to opt in to the newer paths.
   lifted later).
 - `DS4_CUDA_NO_Q8_F16_CACHE`, `DS4_CUDA_Q8_F16_CACHE_BYTES`, and the
   family of `DS4_CUDA_MOE_*` tuning vars all date to the legacy
-  cuda_q8_f16_ptr + cublasGemmEx pipeline and remain functional when
-  `DS4_CUDA_USE_MMQ` is unset.
+  `cuda_q8_f16_ptr` + `cublasGemmEx` pipeline.  They take effect only
+  when `DS4_CUDA_USE_MMQ=0` puts ds4 back on the legacy path.
 
 ## Testing
 
