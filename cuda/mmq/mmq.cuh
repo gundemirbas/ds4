@@ -107,13 +107,32 @@ struct tile_x_sizes {
 };
 
 static int get_mmq_x_max_host(const int cc) {
-    return (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
+    int base = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
             128                     : 64;
 #else
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
+    // ds4: optional Step-4 experiment hook. DS4_CUDA_MMQ_X_MAX=N clips the
+    // tile-width selector to N when sweeping for an sm_120-specific
+    // optimum.  Value rounded down to a multiple of 8 (the iteration step
+    // of the mmq_x picker) and capped at base.  Cached on first call.
+    static int g_override_init = 0;
+    static int g_override      = 0;
+    if (!g_override_init) {
+        g_override_init = 1;
+        const char * env = getenv("DS4_CUDA_MMQ_X_MAX");
+        if (env && env[0]) {
+            char * end = nullptr;
+            long v = strtol(env, &end, 10);
+            if (end != env && v >= 8) {
+                g_override = (int)((v / 8) * 8);
+            }
+        }
+    }
+    if (g_override > 0 && g_override < base) base = g_override;
+    return base;
 }
 
 static constexpr __device__ int get_mmq_x_max_device() {

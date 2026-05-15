@@ -87,6 +87,13 @@ to opt in to the newer paths.
   cost than the legacy fused decode kernel.  Override to 1 to force
   mmq even at decode (slower today; may flip if mmvq kernels are
   lifted later).
+- `DS4_CUDA_MMQ_X_MAX=N`: clip `get_mmq_x_max_host` to N (rounded down
+  to a multiple of 8) when sweeping tile widths.  Diagnostic only; the
+  vanilla 128 wins on sm_120 (RTX PRO 6000 Blackwell) so the default
+  is unchanged.  Step 4 of the optimization plan ran a {32, 64, 96,
+  128} sweep against V4 Flash: X=32 lost ~20%, X=64 lost ~6%, X=96
+  was within +/-1% of default but mixed across ctx points.  May be
+  useful on other arches.
 
 ## Testing
 
