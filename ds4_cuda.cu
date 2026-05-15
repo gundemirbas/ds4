@@ -7052,7 +7052,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         cuda_q8_label_is_attention_output_b(label) &&
         n_tok == 2 &&
         g_attention_output_b_n2_q8_override;
-    if (g_cublas_ready && n_tok > 1 && !force_native_attention_output_b) {
+    const int force_n2_warp8 =
+        n_tok == 2 &&
+        getenv("DS4_CUDA_Q8_N2_WARP8") != NULL;
+    if (g_cublas_ready && n_tok > 1 && !force_native_attention_output_b && !force_n2_warp8) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f32) {
             const float alpha = 1.0f;
@@ -7132,6 +7135,18 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks,
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
+    }
+    if (n_tok == 2 && force_n2_warp8) {
+        matmul_q8_0_preq_n2_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                xq,
+                xscale,
+                in_dim,
+                out_dim,
+                blocks,
+                use_dp4a);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 n2 warp launch");
     }
     if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);

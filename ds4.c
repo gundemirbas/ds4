@@ -10918,6 +10918,24 @@ static bool metal_graph_decode2_finish_ffn_shared_post_from_batch_row(
     return ok;
 }
 
+static bool metal_graph_decode2_copy_batch_next_rows(
+        ds4_gpu_graph  *g,
+        ds4_gpu_tensor *next0,
+        ds4_gpu_tensor *next1) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *row0 = metal_graph_tensor_row_view(g->batch_next_hc, 0, hc_dim);
+    ds4_gpu_tensor *row1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
+    bool ok = row0 && row1 && next0 && next1;
+    if (ok) {
+        const uint64_t bytes = hc_dim * sizeof(float);
+        ok = ds4_gpu_tensor_copy(next0, 0, row0, 0, bytes) != 0 &&
+             ds4_gpu_tensor_copy(next1, 0, row1, 0, bytes) != 0;
+    }
+    ds4_gpu_tensor_free(row1);
+    ds4_gpu_tensor_free(row0);
+    return ok;
+}
+
 static bool metal_graph_encode_decode2_pair_attention_output_exact(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -10999,6 +11017,7 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     const bool routed_batch_diff = metal_graph_decode2_routed_batch_diff_layer(il);
     const bool batch_ffn_body_diff = metal_graph_decode2_batch_ffn_body_diff_layer(il);
     const bool capture_ffn_body = routed_batch_diff || batch_ffn_body_diff;
+    const bool batch_ffn_body = getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY") != NULL;
     const bool batch_routed_body = getenv("DS4_MTP_DECODE2_BATCH_ROUTED_BODY") != NULL;
     const double total_t0 = profile ? now_sec() : 0.0;
     double stage_t0 = total_t0;
@@ -11099,7 +11118,7 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                     after0,
                                                     after1);
         }
-    } else if (ok && batch_routed_body) {
+    } else if (ok && (batch_ffn_body || batch_routed_body)) {
         g->cur_hc = cur0;
         g->after_attn_hc = after0;
         g->after_ffn_hc = next0;
@@ -11126,12 +11145,21 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
         if (ok) {
             ok = metal_graph_decode2_capture_ffn_prefix_scalar_row(g, 1);
         }
-        if (ok) {
+        if (ok && batch_ffn_body) {
+            ok = metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(g,
+                                                                           model,
+                                                                           &weights->layer[il],
+                                                                           il);
+        }
+        if (ok && batch_ffn_body) {
+            ok = metal_graph_decode2_copy_batch_next_rows(g, next0, next1);
+        }
+        if (ok && !batch_ffn_body) {
             ok = metal_graph_decode2_run_batch_routed_from_scalar_prefix(g,
                                                                          model,
                                                                          &weights->layer[il]);
         }
-        if (ok) {
+        if (ok && !batch_ffn_body) {
             ok = metal_graph_decode2_finish_ffn_shared_post_from_batch_row(g,
                                                                            model,
                                                                            &weights->layer[il],
@@ -11141,7 +11169,7 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                                            after0,
                                                                            next0);
         }
-        if (ok) {
+        if (ok && !batch_ffn_body) {
             ok = metal_graph_decode2_finish_ffn_shared_post_from_batch_row(g,
                                                                            model,
                                                                            &weights->layer[il],
@@ -11152,7 +11180,13 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                                            next1);
         }
         if (ok && profile) {
-            ok = metal_graph_decode2_layer_profile_boundary("batch_routed_body_ffn", il, pos0, total_t0, &stage_t0);
+            ok = metal_graph_decode2_layer_profile_boundary(batch_ffn_body
+                                                            ? "batch_ffn_body"
+                                                            : "batch_routed_body_ffn",
+                                                            il,
+                                                            pos0,
+                                                            total_t0,
+                                                            &stage_t0);
         }
     } else if (ok) {
         g->cur_hc = cur0;
