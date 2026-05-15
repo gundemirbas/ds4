@@ -10376,6 +10376,97 @@ static bool metal_graph_decode2_batch_ffn_diff(
     return ok;
 }
 
+static bool metal_graph_decode2_routed_batch_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_ROUTED_BATCH_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_ROUTED_BATCH_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_capture_routed_scalar_row(
+        ds4_gpu_graph *g,
+        uint32_t       row) {
+    ds4_gpu_tensor *norm_row = metal_graph_tensor_row_view(g->batch_ffn_norm, row, DS4_N_EMBD);
+    ds4_gpu_tensor *selected_row = metal_graph_tensor_row_view(g->batch_router_selected, row, DS4_N_EXPERT_USED);
+    ds4_gpu_tensor *weights_row = metal_graph_tensor_row_view(g->batch_router_weights, row, DS4_N_EXPERT_USED);
+    ds4_gpu_tensor *routed_row = metal_graph_tensor_row_view(g->batch_shared_out, row, DS4_N_EMBD);
+    bool ok = norm_row && selected_row && weights_row && routed_row;
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(norm_row, 0, g->ffn_norm, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(selected_row, 0, g->router_selected, 0,
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) != 0 &&
+             ds4_gpu_tensor_copy(weights_row, 0, g->router_weights, 0,
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_copy(routed_row, 0, g->routed_out, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    ds4_gpu_tensor_free(routed_row);
+    ds4_gpu_tensor_free(weights_row);
+    ds4_gpu_tensor_free(selected_row);
+    ds4_gpu_tensor_free(norm_row);
+    return ok;
+}
+
+static bool metal_graph_decode2_routed_batch_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0) {
+    if (!g || !model || !layer) return false;
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+    bool ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                               g->batch_routed_gate,
+                                               g->batch_routed_up,
+                                               g->batch_routed_mid,
+                                               g->batch_routed_down,
+                                               model->map,
+                                               model->size,
+                                               layer->ffn_gate_exps->abs_offset,
+                                               layer->ffn_up_exps->abs_offset,
+                                               layer->ffn_down_exps->abs_offset,
+                                               layer->ffn_gate_exps->type,
+                                               layer->ffn_down_exps->type,
+                                               gate_expert_bytes,
+                                               gate_row_bytes,
+                                               down_expert_bytes,
+                                               down_row_bytes,
+                                               (uint32_t)expert_in_dim,
+                                               (uint32_t)down_in_dim,
+                                               (uint32_t)routed_out_dim,
+                                               g->batch_router_selected,
+                                               g->batch_router_weights,
+                                               DS4_N_EXPERT_USED,
+                                               DS4_SWIGLU_CLAMP_EXP,
+                                               g->batch_ffn_norm,
+                                               2,
+                                               &g->batch_routed_mid_is_f16) != 0;
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        ds4_gpu_tensor *scalar_row = metal_graph_tensor_row_view(g->batch_shared_out, row, DS4_N_EMBD);
+        ok = scalar_row != NULL;
+        if (!ok) break;
+        ok = metal_graph_decode2_compare_batch_row("routed_batch_from_scalar_inputs",
+                                                   il,
+                                                   pos0,
+                                                   row,
+                                                   g->batch_routed_out,
+                                                   DS4_N_EMBD,
+                                                   scalar_row);
+        ds4_gpu_tensor_free(scalar_row);
+    }
+    return ok;
+}
+
 static bool metal_graph_encode_decode2_pair_attention_output_exact(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -10454,6 +10545,7 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
               (!pair_attn_out || (heads0 && heads1 && split0 && split1));
 
     const bool profile = getenv("DS4_MTP_EXACT_DECODE2_LAYER_PROFILE") != NULL;
+    const bool routed_batch_diff = metal_graph_decode2_routed_batch_diff_layer(il);
     const double total_t0 = profile ? now_sec() : 0.0;
     double stage_t0 = total_t0;
 
@@ -10563,6 +10655,9 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                        il,
                                                        pos0,
                                                        token0);
+        if (ok && routed_batch_diff) {
+            ok = metal_graph_decode2_capture_routed_scalar_row(g, 0);
+        }
         if (ok && profile) {
             ok = metal_graph_decode2_layer_profile_boundary("row0_ffn", il, pos0, total_t0, &stage_t0);
         }
@@ -10576,6 +10671,16 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                           il,
                                                           pos1,
                                                           token1);
+            if (ok && routed_batch_diff) {
+                ok = metal_graph_decode2_capture_routed_scalar_row(g, 1);
+            }
+        }
+        if (ok && routed_batch_diff) {
+            ok = metal_graph_decode2_routed_batch_diff(g,
+                                                       model,
+                                                       &weights->layer[il],
+                                                       il,
+                                                       pos0);
         }
     }
     if (ok && profile && batch_ffn) {
