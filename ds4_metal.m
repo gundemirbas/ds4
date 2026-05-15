@@ -14597,6 +14597,45 @@ int ds4_gpu_hc_expand_add_split_tensor(
     return 1;
 }
 
+int ds4_gpu_hc_expand_add_split_n2_rows_tensor(
+        ds4_gpu_tensor       *out0_hc,
+        ds4_gpu_tensor       *out1_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!out0_hc || !out1_hc || !block_out || !block_add || !residual_hc || !split ||
+        n_embd == 0 || n_hc == 0) return 0;
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    const uint64_t split_row_bytes = mix_hc * sizeof(float);
+    ds4_gpu_tensor *block0 = ds4_gpu_tensor_view(block_out, 0, row_bytes);
+    ds4_gpu_tensor *block1 = ds4_gpu_tensor_view(block_out, row_bytes, row_bytes);
+    ds4_gpu_tensor *add0 = ds4_gpu_tensor_view(block_add, 0, row_bytes);
+    ds4_gpu_tensor *add1 = ds4_gpu_tensor_view(block_add, row_bytes, row_bytes);
+    ds4_gpu_tensor *res0 = ds4_gpu_tensor_view(residual_hc, 0, hc_bytes);
+    ds4_gpu_tensor *res1 = ds4_gpu_tensor_view(residual_hc, hc_bytes, hc_bytes);
+    ds4_gpu_tensor *split0 = ds4_gpu_tensor_view(split, 0, split_row_bytes);
+    ds4_gpu_tensor *split1 = ds4_gpu_tensor_view(split, split_row_bytes, split_row_bytes);
+    bool ok = block0 && block1 && add0 && add1 && res0 && res1 && split0 && split1;
+    if (ok) {
+        ok = ds4_gpu_hc_expand_add_split_tensor(out0_hc, block0, add0, res0, split0, n_embd, n_hc) &&
+             ds4_gpu_hc_expand_add_split_tensor(out1_hc, block1, add1, res1, split1, n_embd, n_hc);
+    }
+    ds4_gpu_tensor_free(split1);
+    ds4_gpu_tensor_free(split0);
+    ds4_gpu_tensor_free(res1);
+    ds4_gpu_tensor_free(res0);
+    ds4_gpu_tensor_free(add1);
+    ds4_gpu_tensor_free(add0);
+    ds4_gpu_tensor_free(block1);
+    ds4_gpu_tensor_free(block0);
+    return ok ? 1 : 0;
+}
+
 int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,

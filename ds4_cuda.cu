@@ -5125,6 +5125,37 @@ __global__ static void hc_expand_kernel(
     out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
 }
 
+__global__ static void hc_expand_add_split_n2_rows_kernel(
+        float *out0_hc,
+        float *out1_hc,
+        const float *block_out,
+        const float *block_add,
+        const float *residual_hc,
+        const float *post,
+        const float *comb,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t mix_hc) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n_elem = 2ull * n_hc * n_embd;
+    if (gid >= n_elem) return;
+    uint32_t d = gid % n_embd;
+    uint64_t tmp = gid / n_embd;
+    uint32_t dst_hc = tmp % n_hc;
+    uint32_t t = tmp / n_hc;
+
+    float block_v = block_out[(uint64_t)t * n_embd + d] +
+                    block_add[(uint64_t)t * n_embd + d];
+    float acc = block_v * post[(uint64_t)t * mix_hc + dst_hc];
+    for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+        float comb_v = comb[(uint64_t)t * mix_hc + dst_hc + (uint64_t)src_hc * n_hc];
+        float res_v = residual_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d];
+        acc += comb_v * res_v;
+    }
+    float *out_hc = t == 0 ? out0_hc : out1_hc;
+    out_hc[(uint64_t)dst_hc * n_embd + d] = acc;
+}
+
 __global__ static void hc_split_weighted_sum_fused_kernel(
         float *out,
         float *split,
@@ -12414,6 +12445,34 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                     n_embd, n_hc, n_tokens,
                                                     mix_hc, mix_hc, 1);
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
+}
+extern "C" int ds4_gpu_hc_expand_add_split_n2_rows_tensor(ds4_gpu_tensor *out0_hc, ds4_gpu_tensor *out1_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    if (!out0_hc || !out1_hc || !block_out || !block_add || !residual_hc || !split ||
+        n_embd == 0 || n_hc == 0) return 0;
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
+    if (out0_hc->bytes < hc_bytes || out1_hc->bytes < hc_bytes ||
+        block_out->bytes < 2ull * row_bytes ||
+        block_add->bytes < 2ull * row_bytes ||
+        residual_hc->bytes < 2ull * hc_bytes ||
+        split->bytes < 2ull * mix_hc * sizeof(float)) {
+        return 0;
+    }
+    uint64_t n_elem = 2ull * n_hc * n_embd;
+    const float *base = (const float *)split->ptr;
+    hc_expand_add_split_n2_rows_kernel<<<(n_elem + 255) / 256, 256>>>(
+            (float *)out0_hc->ptr,
+            (float *)out1_hc->ptr,
+            (const float *)block_out->ptr,
+            (const float *)block_add->ptr,
+            (const float *)residual_hc->ptr,
+            base + n_hc,
+            base + 2u * n_hc,
+            n_embd,
+            n_hc,
+            mix_hc);
+    return cuda_ok(cudaGetLastError(), "hc_expand_add_split_n2_rows launch");
 }
 extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,

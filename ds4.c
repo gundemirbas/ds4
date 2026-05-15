@@ -10647,7 +10647,9 @@ static bool metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
-        uint32_t                il) {
+        uint32_t                il,
+        ds4_gpu_tensor        *next0,
+        ds4_gpu_tensor        *next1) {
     if (!g || !model || !layer) return false;
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
@@ -10663,11 +10665,11 @@ static bool metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(
     const bool batch_q8_pair =
         getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY_NO_Q8_PAIR") == NULL &&
         getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
-    ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
+    ds4_gpu_tensor *next_hc_view = next0 || next1 ? NULL : ds4_gpu_tensor_view(
             g->batch_next_hc, 0, 2ull * hc_dim * sizeof(float));
     ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
             g->batch_hc_split, 0, 2ull * mix_hc * sizeof(float));
-    bool ok = next_hc_view && hc_split_view;
+    bool ok = hc_split_view && ((next0 && next1) || next_hc_view);
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                              g->batch_routed_gate,
@@ -10750,13 +10752,24 @@ static bool metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->batch_ffn_out, il, 2);
     }
-    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+    if (ok && metal_graph_directional_steering_ffn_enabled(g) && next_hc_view) {
         ok = ds4_gpu_hc_expand_split_tensor(next_hc_view,
                                               g->batch_ffn_out,
                                               g->batch_after_attn_hc,
                                               hc_split_view,
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
+    } else if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = false;
+    } else if (ok && next0 && next1) {
+        ok = ds4_gpu_hc_expand_add_split_n2_rows_tensor(next0,
+                                                         next1,
+                                                         g->batch_routed_out,
+                                                         g->batch_shared_out,
+                                                         g->batch_after_attn_hc,
+                                                         hc_split_view,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC) != 0;
     } else if (ok) {
         ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
                                                   g->batch_routed_out,
@@ -10849,7 +10862,9 @@ static bool metal_graph_decode2_batch_ffn_body_diff(
     bool ok = metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(g,
                                                                         model,
                                                                         layer,
-                                                                        il);
+                                                                        il,
+                                                                        NULL,
+                                                                        NULL);
     for (uint32_t row = 0; ok && row < 2; row++) {
         ds4_gpu_tensor *scalar_shared = metal_graph_tensor_row_view(g->batch_ffn_cur, row, DS4_N_EMBD);
         ok = scalar_shared != NULL;
@@ -10915,24 +10930,6 @@ static bool metal_graph_decode2_finish_ffn_shared_post_from_batch_row(
     ds4_gpu_tensor_free(routed_row);
     ds4_gpu_tensor_free(split_row);
     ds4_gpu_tensor_free(norm_row);
-    return ok;
-}
-
-static bool metal_graph_decode2_copy_batch_next_rows(
-        ds4_gpu_graph  *g,
-        ds4_gpu_tensor *next0,
-        ds4_gpu_tensor *next1) {
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    ds4_gpu_tensor *row0 = metal_graph_tensor_row_view(g->batch_next_hc, 0, hc_dim);
-    ds4_gpu_tensor *row1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
-    bool ok = row0 && row1 && next0 && next1;
-    if (ok) {
-        const uint64_t bytes = hc_dim * sizeof(float);
-        ok = ds4_gpu_tensor_copy(next0, 0, row0, 0, bytes) != 0 &&
-             ds4_gpu_tensor_copy(next1, 0, row1, 0, bytes) != 0;
-    }
-    ds4_gpu_tensor_free(row1);
-    ds4_gpu_tensor_free(row0);
     return ok;
 }
 
@@ -11149,10 +11146,9 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
             ok = metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(g,
                                                                            model,
                                                                            &weights->layer[il],
-                                                                           il);
-        }
-        if (ok && batch_ffn_body) {
-            ok = metal_graph_decode2_copy_batch_next_rows(g, next0, next1);
+                                                                           il,
+                                                                           next0,
+                                                                           next1);
         }
         if (ok && !batch_ffn_body) {
             ok = metal_graph_decode2_run_batch_routed_from_scalar_prefix(g,
