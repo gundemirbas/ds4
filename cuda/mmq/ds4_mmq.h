@@ -43,20 +43,44 @@ int ds4_mmq_init(int device);
 //   n_experts: 0 for dense matmul, >0 for MoE (e.g. 256 for V4 Flash).
 int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts);
 
-// Dense Q8_0 matmul (Phase 2 will validate correctness).
-//   out[i, j] = sum_k W[i, k] * X[k, j]
+// Dense matmul entry points. Per-type wrappers that all share the same
+// underlying mul_mat_q template, parameterised by the weight quant type.
 //
-// Shapes:
-//   W_q8_0:  device pointer, [M rows, K cols] in Q8_0 row-major block layout
-//            (M * K / 32 * sizeof(block_q8_0) bytes total). K must be
-//            divisible by 256.
-//   X_f32:   device pointer, [K rows, N cols] F32 row-major.
-//   out_f32: device pointer, [M rows, N cols] F32 row-major (caller-allocated).
-//   stream:  CUDA stream to launch on.
+// All three variants compute:
 //
-// Returns 0 on success, non-zero on launch failure.
+//   out[col, row] = sum_k W[row, k] * X[k, col]      0 <= row < M, 0 <= col < N
+//
+// Layouts (matching ggml + llama.cpp mmq conventions, all on device):
+//   W:       [M rows, K cols], row-major, packed in the type-specific block
+//            format. K must be a multiple of 256.
+//   X_f32:   [N rows, K cols] F32 row-major (logical [K, N] with K
+//            innermost - i.e. for each "column" col of the logical [K, N]
+//            matrix, K contiguous floats live at X[col*K .. col*K + K]).
+//   out_f32: caller-allocated, M*N floats. mmq writes in column-major:
+//            out[col*M + row]. Callers expecting row-major must transpose.
+//
+// Returns 0 on success, non-zero on validation or launch failure.
+
 int ds4_mmq_q8_0_dense(
     const void  * W_q8_0,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q2_K_dense(
+    const void  * W_q2_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq2_xxs_dense(
+    const void  * W_iq2_xxs,
     const float * X_f32,
     float       * out_f32,
     int           M,

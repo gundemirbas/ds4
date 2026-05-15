@@ -137,12 +137,11 @@ extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 }
 
 // ----------------------------------------------------------------------------
-// Dense Q8_0 entry.
+// Dense matmul implementation, shared across all three quant types.
 //
-// Computes  out[M, N] = (W [M, K]).T @ X [K, N]  with W stored as Q8_0 row-
-// major blocks and X / out as F32.  ggml convention: K is the innermost dim
-// of every tensor.  Output layout matches what mmq writes internally -
-// column-major dst[col*M + row].
+// Computes  out[col, row] = sum_k W[row, k] * X[k, col]   with W in the
+// type-specific block layout and X / out in F32 (X K-innermost row-major,
+// out column-major out[col*M + row]).
 //
 // Mirrors upstream mmq.cu:154-159 (the no-ids branch) but builds mmq_args
 // from plain pointers + shape ints instead of ggml_tensor introspection.
@@ -162,10 +161,10 @@ ggml_backend_cuda_context * get_ctx_for_device(int device) {
     return cached[device];
 }
 
-} // anonymous namespace
-
-extern "C" int ds4_mmq_q8_0_dense(
-        const void  * W_q8_0,
+template <ggml_type type>
+int ds4_mmq_dense_impl(
+        const char  * tag,
+        const void  * W,
         const float * X_f32,
         float       * out_f32,
         int           M,
@@ -173,18 +172,18 @@ extern "C" int ds4_mmq_q8_0_dense(
         int           K,
         cudaStream_t  stream) {
 
-    if (!W_q8_0 || !X_f32 || !out_f32) {
-        fprintf(stderr, "ds4_mmq_q8_0_dense: null pointer\n");
+    if (!W || !X_f32 || !out_f32) {
+        fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
     if (K <= 0 || M <= 0 || N <= 0) {
-        fprintf(stderr, "ds4_mmq_q8_0_dense: bad shape M=%d N=%d K=%d\n", M, N, K);
+        fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
         return -1;
     }
     if (K % 256 != 0) {
-        // mmq wants K a multiple of QK_K=256 so K-quant super-blocks tile
-        // cleanly. Q8_0 alone only needs K % 32 but we standardise on 256.
-        fprintf(stderr, "ds4_mmq_q8_0_dense: K=%d must be a multiple of 256\n", K);
+        // mmq requires K to be a multiple of the largest super-block size
+        // it sees during the inner tile loop, which is QK_K=256.
+        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
         return -1;
     }
 
@@ -193,55 +192,54 @@ extern "C" int ds4_mmq_q8_0_dense(
 
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "ds4_mmq_q8_0_dense: failed to get cuda context for device %d\n", dev);
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
 
-    // 1. Quantize the F32 activation into the mmq Q8_1 format.
-    //    Layout: ne00=K elements per row, ne10_padded = round-up to 512.
+    // 1. Quantize the F32 activation into the mmq Q8_1 format. The
+    //    target_type parameter only affects the activation scale strategy
+    //    that the quantizer picks (matched to the weight type's K-block
+    //    layout); the output buffer is always Q8_1.
     const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = N;
     const int64_t ne12         = 1;
     const int64_t ne13         = 1;
 
-    // Buffer size matches upstream mmq.cu:128.
     const size_t nbytes_src1_q8_1 =
         ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
-    // Activation strides: dense path is contiguous F32 with K elements per row.
-    //   s11 = K  (per-row stride in floats)
-    //   s12 = 0  (single channel)
-    //   s13 = 0  (single sample)
     quantize_mmq_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
-        GGML_TYPE_Q8_0, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
+        type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
         /*ne0=*/ne10_padded, /*ne1=*/ne11, /*ne2=*/ne12, /*ne3=*/ne13,
         stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4_mmq_q8_0_dense: quantize failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
     }
 
-    // 2. Build mmq_args for the dense path. Shape conventions follow
-    //    upstream mmq.cu:154-159 (the no-ids branch).
-    const int64_t s01 = (int64_t)K / QK8_0;        // Q8_0 blocks per weight row
-    const int64_t s1  = (int64_t)M;                // stride to next output column
-    const int64_t s12 = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
-    const int64_t s13 = ne12 * s12;
+    // 2. Build mmq_args. stride_row_x is in WEIGHT BLOCKS per row, which
+    //    is K / blck_size(type). Q8_0 has block size 32; Q2_K and IQ2_XXS
+    //    are K-quants with block size 256.
+    const int64_t blck   = ggml_blck_size(type);
+    const int64_t s01    = (int64_t)K / blck;
+    const int64_t s1     = (int64_t)M;
+    const int64_t s12    = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s13    = ne12 * s12;
 
     const bool use_stream_k =
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
 
     const mmq_args args = {
-        /*x=*/(const char *)W_q8_0,
-        /*type_x=*/GGML_TYPE_Q8_0,
+        /*x=*/(const char *)W,
+        /*type_x=*/type,
         /*y=*/(const int *)src1_q8_1.get(),
         /*ids_dst=*/nullptr,
         /*expert_bounds=*/nullptr,
@@ -256,20 +254,43 @@ extern "C" int ds4_mmq_q8_0_dense(
         /*ncols_max=*/ne11,
     };
 
-    // 3. Launch.
-    mul_mat_q_case<GGML_TYPE_Q8_0>(*ctx, args, stream);
+    mul_mat_q_case<type>(*ctx, args, stream);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4_mmq_q8_0_dense: mul_mat_q_case launch failed: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
     return 0;
 }
 
-// Explicit instantiation so the Q8_0 case is forced into this TU. Phase 1
-// will add Q2_K and IQ2_XXS; until then those instantiations live nowhere
-// and the switch in ggml_cuda_mul_mat_q_switch_type (mmq.cu, not vendored
-// here) would link-fail if anyone tried to call them.
+} // anonymous namespace
+
+extern "C" int ds4_mmq_q8_0_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q2_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
+}
+
+// Explicit instantiations. One per quant type the public API exposes.
+// Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
+// device functions from mmq.cuh, so the .o objects below contain everything
+// needed to link against the public C entries.
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q2_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
