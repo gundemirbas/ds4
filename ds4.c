@@ -10222,6 +10222,153 @@ static bool metal_graph_encode_decode2_layer_exact(
     return ok;
 }
 
+static bool metal_graph_decode2_batch_ffn_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_BATCH_FFN_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_BATCH_FFN_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_compare_f32_tensor(
+        const char       *stage,
+        uint32_t          il,
+        uint32_t          pos,
+        uint32_t          row,
+        const ds4_gpu_tensor *batch,
+        const ds4_gpu_tensor *scalar,
+        uint64_t          n_f32) {
+    if (!batch || !scalar || n_f32 == 0) return false;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: decode2 batch FFN diff synchronize failed stage=%s layer=%u row=%u\n",
+                stage, il, row);
+        return false;
+    }
+
+    float *batch_buf = xmalloc((size_t)n_f32 * sizeof(batch_buf[0]));
+    float *scalar_buf = xmalloc((size_t)n_f32 * sizeof(scalar_buf[0]));
+    const bool ok =
+        ds4_gpu_tensor_read(batch, 0, batch_buf, n_f32 * sizeof(batch_buf[0])) != 0 &&
+        ds4_gpu_tensor_read(scalar, 0, scalar_buf, n_f32 * sizeof(scalar_buf[0])) != 0;
+    if (ok) {
+        fprintf(stderr,
+                "ds4: decode2 batch FFN diff layer=%u pos=%u row=%u stage=%s max_abs=%g rms=%g\n",
+                il,
+                pos,
+                row,
+                stage,
+                max_abs_diff(batch_buf, scalar_buf, n_f32),
+                rms_abs_diff(batch_buf, scalar_buf, n_f32));
+    }
+    free(scalar_buf);
+    free(batch_buf);
+    if (!ok) return false;
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: decode2 batch FFN diff failed to resume commands stage=%s layer=%u row=%u\n",
+                stage, il, row);
+        return false;
+    }
+    return true;
+}
+
+static bool metal_graph_decode2_compare_batch_row(
+        const char       *stage,
+        uint32_t          il,
+        uint32_t          pos,
+        uint32_t          row,
+        ds4_gpu_tensor *batch_base,
+        uint64_t          row_values,
+        const ds4_gpu_tensor *scalar) {
+    ds4_gpu_tensor *batch_row = metal_graph_tensor_row_view(batch_base, row, row_values);
+    bool ok = batch_row != NULL;
+    if (ok) {
+        ok = metal_graph_decode2_compare_f32_tensor(stage,
+                                                    il,
+                                                    pos,
+                                                    row,
+                                                    batch_row,
+                                                    scalar,
+                                                    row_values);
+    }
+    ds4_gpu_tensor_free(batch_row);
+    return ok;
+}
+
+static bool metal_graph_decode2_batch_ffn_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        uint32_t                il,
+        uint32_t                pos0,
+        int                     token0,
+        int                     token1,
+        ds4_gpu_tensor        *cur0,
+        ds4_gpu_tensor        *cur1,
+        ds4_gpu_tensor        *after0,
+        ds4_gpu_tensor        *after1) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    ds4_gpu_tensor *scalar_next = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    bool ok = scalar_next != NULL;
+    ds4_gpu_tensor *saved_cur = g->cur_hc;
+    ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
+    ds4_gpu_tensor *saved_after_ffn = g->after_ffn_hc;
+
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        const uint32_t pos = pos0 + row;
+        g->cur_hc = row == 0 ? cur0 : cur1;
+        g->after_attn_hc = row == 0 ? after0 : after1;
+        g->after_ffn_hc = scalar_next;
+        ok = metal_graph_encode_decode_ffn_half_exact(g,
+                                                       model,
+                                                       &weights->layer[il],
+                                                       il,
+                                                       pos,
+                                                       row == 0 ? token0 : token1);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("hc_ffn_pre",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_ffn_cur,
+                                                           DS4_N_EMBD,
+                                                           g->ffn_cur);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("ffn_norm",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_ffn_norm,
+                                                           DS4_N_EMBD,
+                                                           g->ffn_norm);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("routed_out",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_routed_out,
+                                                           DS4_N_EMBD,
+                                                           g->routed_out);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("shared_out",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_shared_out,
+                                                           DS4_N_EMBD,
+                                                           g->shared_out);
+        if (ok) ok = metal_graph_decode2_compare_batch_row("hc_ffn_post",
+                                                           il,
+                                                           pos0,
+                                                           row,
+                                                           g->batch_next_hc,
+                                                           hc_dim,
+                                                           scalar_next);
+    }
+
+    g->cur_hc = saved_cur;
+    g->after_attn_hc = saved_after_attn;
+    g->after_ffn_hc = saved_after_ffn;
+    ds4_gpu_tensor_free(scalar_next);
+    return ok;
+}
+
 static bool metal_graph_encode_decode2_layer_state_barrier_exact(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -10301,6 +10448,19 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     g->after_attn_hc = saved_after_attn;
     if (ok && batch_ffn) {
         ok = metal_graph_encode_layer_ffn_batch(g, model, &weights->layer[il], il, pos0, 2);
+        if (ok && metal_graph_decode2_batch_ffn_diff_layer(il)) {
+            ok = metal_graph_decode2_batch_ffn_diff(g,
+                                                    model,
+                                                    weights,
+                                                    il,
+                                                    pos0,
+                                                    token0,
+                                                    token1,
+                                                    cur0,
+                                                    cur1,
+                                                    after0,
+                                                    after1);
+        }
     } else if (ok) {
         g->cur_hc = cur0;
         g->after_attn_hc = after0;
