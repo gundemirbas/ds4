@@ -174,6 +174,7 @@ enum ggml_glu_op {
     GGML_GLU_OP_REGLU,
     GGML_GLU_OP_GEGLU,
     GGML_GLU_OP_SWIGLU,
+    GGML_GLU_OP_SWIGLU_OAI, // referenced by mmvq.cu's fused-GLU epilogue
     GGML_GLU_OP_COUNT,
 };
 
