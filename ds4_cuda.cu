@@ -11508,6 +11508,41 @@ __global__ static void moe_down_sorted_p2_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+/* mmq pipeline helper: SwiGLU + clamp + weight, in (token, slot, feature)
+ * layout matching what ds4_mmq_*_moe writes.  Mirrors the inline math in
+ * moe_gate_up_mid_qwarp32_kernel (line ~9885): clamp gate to [-inf, clamp],
+ * clamp up to [-clamp, clamp], compute silu(gate)*up*weight, store as mid.
+ * Phase 6 uses this on the gate/up matmul outputs to produce mid; the
+ * existing moe_sum_kernel below sums slots into the final per-token output. */
+__global__ static void moe_mmq_swiglu_weighted_clamp_kernel(
+        float *mid_out,
+        float *gate_out_dbg, float *up_out_dbg,
+        const float *gate_buf, const float *up_buf,
+        const float *weights,
+        uint32_t expert_mid_dim,
+        uint32_t n_tokens,
+        uint32_t n_expert_used,
+        float clamp) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * n_expert_used * expert_mid_dim;
+    if (gid >= n) return;
+    uint64_t slot_pair = gid / expert_mid_dim;
+    uint32_t tok = (uint32_t)(slot_pair / n_expert_used);
+    uint32_t slot = (uint32_t)(slot_pair - (uint64_t)tok * n_expert_used);
+    float g = gate_buf[gid];
+    float u = up_buf[gid];
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    const float w = weights[(uint64_t)tok * n_expert_used + slot];
+    const float s = g / (1.0f + expf(-g));
+    if (gate_out_dbg) gate_out_dbg[gid] = g;
+    if (up_out_dbg)   up_out_dbg[gid]   = u;
+    mid_out[gid] = s * u * w;
+}
+
 __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -11724,6 +11759,84 @@ static int routed_moe_launch(
     const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
+
+    /* mmq routed-MoE fast path.  Gated on DS4_CUDA_USE_MMQ + V4-Flash quant
+     * config (IQ2_XXS gate/up + Q2_K down).  Q4_K (q4k_path) is not yet
+     * covered; falls through to the legacy dispatch below.
+     *
+     * Pipeline:
+     *   1. ds4_mmq_iq2_xxs_moe(gate_w, x, selected) -> gate->ptr,
+     *      shape [n_tokens * n_expert_used, expert_mid_dim] col-major =
+     *      row-major same shape.
+     *   2. ds4_mmq_iq2_xxs_moe(up_w, x, selected)   -> up->ptr, same shape.
+     *   3. moe_mmq_swiglu_weighted_clamp_kernel: clamp + silu(gate) * up
+     *      * router_weight[token, slot] -> mid->ptr, same shape.  Mirrors
+     *      the inline math in moe_gate_up_mid_qwarp32_kernel.
+     *   4. ds4_mmq_q2_K_moe(down_w, mid->ptr, selected) -> down->ptr,
+     *      treating each (token, slot) pair as one row of an
+     *      [n_tokens * n_expert_used, 1] activation tensor; the same
+     *      `selected` int32 buffer flat-indexes as the expert id for each
+     *      row.  Output [n_tokens * n_expert_used, out_dim] matches the
+     *      legacy down layout (down[(tok * n_expert_used + slot), row]).
+     *   5. moe_sum_kernel (unchanged): sum across the n_expert_used slot
+     *      dim -> out, since router weights are already baked into mid. */
+    if (ds4_cuda_use_mmq() && !q4k_path && gate_type == 16u && down_type == 10u) {
+        const uint32_t n_expert_used = n_expert;   /* parameter name is a misnomer; this is top_k */
+        const uint32_t n_experts_total = 256u;     /* matches the hardcoded constant at line 11437 */
+        const uint64_t n_assignments = (uint64_t)n_tokens * n_expert_used;
+
+        /* Reuse the caller-allocated buffers - all of gate/up/mid/down are
+         * already sized to [n_tokens, n_expert_used, *].  See validation
+         * block above (lines 11427-11430). */
+        int rc;
+        rc = ds4_mmq_iq2_xxs_moe(gate_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
+                                 (float *)gate->ptr,
+                                 (int)expert_mid_dim, (int)expert_in_dim,
+                                 (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (gate) returned %d; falling back\n", rc);
+            goto mmq_moe_fallback;
+        }
+        rc = ds4_mmq_iq2_xxs_moe(up_w, (const float *)x->ptr, (const int32_t *)selected->ptr,
+                                 (float *)up->ptr,
+                                 (int)expert_mid_dim, (int)expert_in_dim,
+                                 (int)n_tokens, (int)n_experts_total, (int)n_expert_used, /*stream=*/0);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe (up) returned %d; falling back\n", rc);
+            goto mmq_moe_fallback;
+        }
+        {
+            const uint64_t mid_floats = n_assignments * expert_mid_dim;
+            moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256>>>(
+                (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
+                (const float *)gate->ptr, (const float *)up->ptr,
+                (const float *)weights->ptr,
+                expert_mid_dim, n_tokens, n_expert_used, clamp);
+            if (!cuda_ok(cudaGetLastError(), "mmq routed_moe swiglu launch")) goto mmq_moe_fallback;
+        }
+        /* Down matmul: treat each (token, slot) pair as a single-expert
+         * "token" of length expert_mid_dim.  selected is contiguous int32
+         * of length n_tokens * n_expert_used; reinterpreting it as
+         * [n_assignments, 1] gives one expert id per row, which is exactly
+         * what ds4_mmq_q2_K_moe with n_expert_used=1 consumes. */
+        rc = ds4_mmq_q2_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
+                              (float *)down->ptr,
+                              (int)out_dim, (int)expert_mid_dim,
+                              (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1, /*stream=*/0);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: ds4_mmq_q2_K_moe (down) returned %d; falling back\n", rc);
+            goto mmq_moe_fallback;
+        }
+        {
+            uint64_t n = (uint64_t)n_tokens * out_dim;
+            moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+                (float *)out->ptr, (const float *)down->ptr,
+                out_dim, n_expert_used, n_tokens);
+            if (!cuda_ok(cudaGetLastError(), "mmq routed_moe sum launch")) goto mmq_moe_fallback;
+        }
+        return 1;
+    }
+mmq_moe_fallback: ;
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
