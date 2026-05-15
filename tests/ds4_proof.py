@@ -1130,7 +1130,8 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
                     or kind <= 0
                     or in_dim <= 0
                     or out_dim <= 0
-                    or group_count <= 0
+                    or group_count < 0
+                    or (kind == 1 and group_count <= 0)
                     or derived_n <= 0
                     or alloc_n < derived_n
                 ):
@@ -1186,7 +1187,8 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
                 or kind <= 0
                 or in_dim <= 0
                 or out_dim <= 0
-                or group_count <= 0
+                or group_count < 0
+                or (kind == 1 and group_count <= 0)
                 or derived_n <= 0
             ):
                 raise ValueError(f"invalid derived weight manifest bounds on line {lineno}")

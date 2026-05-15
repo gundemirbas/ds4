@@ -154,6 +154,8 @@ struct cuda_q8_f32_range {
 
 enum cuda_derived_kind {
     CUDA_DERIVED_Q8_0_ROW_GROUP_NORMS = 1,
+    CUDA_DERIVED_Q8_0_F16_COLMAJOR = 2,
+    CUDA_DERIVED_Q8_0_F32_COLMAJOR = 3,
 };
 
 struct cuda_derived_range {
@@ -634,12 +636,22 @@ static const __half *cuda_q8_f16_ptr(
         }
     }
     if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
+    const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
+    char *derived = cuda_derived_weight_ptr(model_map,
+                                            offset,
+                                            weight_bytes,
+                                            CUDA_DERIVED_Q8_0_F16_COLMAJOR,
+                                            in_dim,
+                                            out_dim,
+                                            0,
+                                            out_bytes,
+                                            label ? label : "q8_0_f16");
+    if (derived) return (const __half *)derived;
 
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
 
-    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(__half)) return NULL;
-    const uint64_t out_bytes = in_dim * out_dim * sizeof(__half);
     if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
 
     __half *dev = NULL;
@@ -689,11 +701,22 @@ static float *cuda_q8_f32_ptr(
         }
     }
     if (!cuda_q8_f32_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / sizeof(float)) return NULL;
+    const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
+    char *derived = cuda_derived_weight_ptr(model_map,
+                                            offset,
+                                            weight_bytes,
+                                            CUDA_DERIVED_Q8_0_F32_COLMAJOR,
+                                            in_dim,
+                                            out_dim,
+                                            0,
+                                            out_bytes,
+                                            label ? label : "q8_0_f32");
+    if (derived) return (float *)derived;
 
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
     if (!q8) return NULL;
 
-    const uint64_t out_bytes = in_dim * out_dim * sizeof(float);
     float *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
     if (err != cudaSuccess) {

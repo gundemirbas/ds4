@@ -51,6 +51,8 @@ struct tensor_record {
 enum derived_kind {
     DERIVED_NONE = 0,
     DERIVED_Q8_0_ROW_GROUP_NORMS = 1,
+    DERIVED_Q8_0_F16_COLMAJOR = 2,
+    DERIVED_Q8_0_F32_COLMAJOR = 3,
 };
 
 enum weight_backend {
@@ -421,6 +423,44 @@ __global__ static void q8_0_row_group_norms_warp_kernel(
     }
     sum = warp_sum_f32(sum);
     if (lane == 0) row_group_norms[row * group_count + group] = sqrtf(sum);
+}
+
+__global__ static void dequant_q8_0_to_f16_kernel(
+        __half *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = in_dim * out_dim;
+    if (gid >= n) return;
+    const uint64_t row = gid / in_dim;
+    const uint64_t i = gid - row * in_dim;
+    const uint64_t b = i / 32u;
+    const uint64_t j = i - b * 32u;
+    const unsigned char *blk = w + (row * blocks + b) * 34u;
+    const __half scale = *(const __half *)blk;
+    const int8_t q = *(const int8_t *)(blk + 2u + j);
+    out[gid] = __hmul(scale, __float2half((float)q));
+}
+
+__global__ static void dequant_q8_0_to_f32_kernel(
+        float *out,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = in_dim * out_dim;
+    if (gid >= n) return;
+    const uint64_t row = gid / in_dim;
+    const uint64_t i = gid - row * in_dim;
+    const uint64_t b = i / 32u;
+    const uint64_t j = i - b * 32u;
+    const unsigned char *blk = w + (row * blocks + b) * 34u;
+    const float scale = __half2float(*(const __half *)blk);
+    const int8_t q = *(const int8_t *)(blk + 2u + j);
+    out[gid] = scale * (float)q;
 }
 
 static bool map_file(const char *path, mapped_file &m) {
@@ -999,7 +1039,9 @@ static bool build_output_certifier_norms(const char *model_id,
                                          weight_backend backend,
                                          int device,
                                          uint64_t vmm_granularity,
-                                         uint32_t group_count) {
+                                         uint32_t group_count,
+                                         uint64_t *derived_bytes_used,
+                                         uint64_t derived_budget_bytes) {
     if (!model_id || group_count == 0) return false;
     const tensor_record *t = find_tensor_record(records, "output.weight");
     if (!t) {
@@ -1020,6 +1062,18 @@ static bool build_output_certifier_norms(const char *model_id,
     const uint64_t in_dim = t->dims[0];
     const uint64_t out_dim = t->dims[1];
     const uint64_t bytes = out_dim * (uint64_t)group_count * sizeof(float);
+    if (derived_bytes_used &&
+        derived_budget_bytes != 0 &&
+        (*derived_bytes_used > derived_budget_bytes ||
+         bytes > derived_budget_bytes - *derived_bytes_used)) {
+        fprintf(stderr,
+                "ds4_weight_server: output certifier derivation exceeds derived budget "
+                "(request=%.2f MiB used=%.2f MiB budget=%.2f MiB)\n",
+                (double)bytes / 1048576.0,
+                (double)*derived_bytes_used / 1048576.0,
+                (double)derived_budget_bytes / 1048576.0);
+        return false;
+    }
     const unsigned char *src = owned_raw_range_ptr(ranges, model_id, t->off, t->bytes);
     if (!src) {
         fprintf(stderr,
@@ -1091,11 +1145,158 @@ static bool build_output_certifier_norms(const char *model_id,
     }
     const double t1 = now_sec();
     ranges.push_back(r);
+    if (derived_bytes_used) *derived_bytes_used += bytes;
     fprintf(stderr,
             "ds4_weight_server: derived %s output certifier row norms %.2f MiB groups=%u in=%llu out=%llu built in %.3fs\n",
             model_id,
             (double)bytes / 1048576.0,
             group_count,
+            (unsigned long long)in_dim,
+            (unsigned long long)out_dim,
+            t1 - t0);
+    return true;
+}
+
+static bool build_q8_0_dequant_artifact(const char *model_id,
+                                        uint64_t model_size,
+                                        const std::vector<tensor_record> &records,
+                                        std::vector<owned_range> &ranges,
+                                        weight_backend backend,
+                                        int device,
+                                        uint64_t vmm_granularity,
+                                        const char *tensor_name,
+                                        uint32_t kind,
+                                        uint64_t *derived_bytes_used,
+                                        uint64_t derived_budget_bytes) {
+    if (!model_id || !tensor_name ||
+        (kind != DERIVED_Q8_0_F16_COLMAJOR && kind != DERIVED_Q8_0_F32_COLMAJOR)) {
+        return false;
+    }
+    const tensor_record *t = find_tensor_record(records, tensor_name);
+    if (!t) {
+        fprintf(stderr, "ds4_weight_server: q8 derived artifact skipped for %s: missing %s\n",
+                model_id, tensor_name);
+        return false;
+    }
+    if (t->type != 8 || t->ndim != 2 || t->dims[0] == 0 || t->dims[1] == 0) {
+        fprintf(stderr,
+                "ds4_weight_server: q8 derived artifact skipped for %s: %s is not 2D Q8_0\n",
+                model_id,
+                tensor_name);
+        return false;
+    }
+    const uint64_t in_dim = t->dims[0];
+    const uint64_t out_dim = t->dims[1];
+    const uint64_t elem_bytes = kind == DERIVED_Q8_0_F16_COLMAJOR ? sizeof(__half) : sizeof(float);
+    if (in_dim != 0 && out_dim > UINT64_MAX / in_dim / elem_bytes) {
+        fprintf(stderr, "ds4_weight_server: q8 derived artifact size overflow for %s\n", tensor_name);
+        return false;
+    }
+    const uint64_t bytes = in_dim * out_dim * elem_bytes;
+    if (derived_bytes_used &&
+        derived_budget_bytes != 0 &&
+        (*derived_bytes_used > derived_budget_bytes ||
+         bytes > derived_budget_bytes - *derived_bytes_used)) {
+        fprintf(stderr,
+                "ds4_weight_server: q8 derived artifact %s exceeds derived budget "
+                "(request=%.2f MiB used=%.2f MiB budget=%.2f MiB)\n",
+                tensor_name,
+                (double)bytes / 1048576.0,
+                (double)*derived_bytes_used / 1048576.0,
+                (double)derived_budget_bytes / 1048576.0);
+        return false;
+    }
+    const unsigned char *src = owned_raw_range_ptr(ranges, model_id, t->off, t->bytes);
+    if (!src) {
+        fprintf(stderr,
+                "ds4_weight_server: q8 derived artifact skipped for %s: raw %s is not resident\n",
+                model_id,
+                tensor_name);
+        return false;
+    }
+
+    owned_range r;
+    r.backend = backend;
+    r.derived = true;
+    r.model_id = model_id;
+    r.model_size = model_size;
+    r.bytes = bytes;
+    r.alloc_bytes = bytes;
+    r.derived_kind = kind;
+    r.source_off = t->off;
+    r.source_bytes = t->bytes;
+    r.in_dim = in_dim;
+    r.out_dim = out_dim;
+    r.group_count = 0;
+    r.source_name = t->name;
+    if (backend == WEIGHT_BACKEND_VMM) {
+        if (!vmm_alloc_range(device, bytes, vmm_granularity, r)) {
+            fprintf(stderr, "ds4_weight_server: VMM derived allocation failed for %s %.2f MiB\n",
+                    tensor_name,
+                    (double)bytes / 1048576.0);
+            return false;
+        }
+    } else {
+        void *dev = nullptr;
+        cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4_weight_server: cudaMalloc failed for %s derived %.2f MiB: %s\n",
+                    tensor_name,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            return false;
+        }
+        r.dev = dev;
+    }
+
+    const double t0 = now_sec();
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t n = in_dim * out_dim;
+    if (kind == DERIVED_Q8_0_F16_COLMAJOR) {
+        dequant_q8_0_to_f16_kernel<<<(n + 255u) / 256u, 256>>>(
+                (__half *)r.dev,
+                src,
+                in_dim,
+                out_dim,
+                blocks);
+    } else {
+        dequant_q8_0_to_f32_kernel<<<(n + 255u) / 256u, 256>>>(
+                (float *)r.dev,
+                src,
+                in_dim,
+                out_dim,
+                blocks);
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_weight_server: q8 derived kernel failed for %s: %s\n",
+                tensor_name,
+                cudaGetErrorString(err));
+        release_owned_range(r);
+        return false;
+    }
+    if (backend == WEIGHT_BACKEND_IPC) {
+        cudaIpcMemHandle_t handle;
+        err = cudaIpcGetMemHandle(&handle, r.dev);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4_weight_server: cudaIpcGetMemHandle failed for %s derived: %s\n",
+                    tensor_name,
+                    cudaGetErrorString(err));
+            release_owned_range(r);
+            return false;
+        }
+        r.handle = handle;
+    }
+    const double t1 = now_sec();
+    ranges.push_back(r);
+    if (derived_bytes_used) *derived_bytes_used += bytes;
+    fprintf(stderr,
+            "ds4_weight_server: derived %s %s %s %.2f MiB in=%llu out=%llu built in %.3fs\n",
+            model_id,
+            tensor_name,
+            kind == DERIVED_Q8_0_F16_COLMAJOR ? "q8_0_f16" : "q8_0_f32",
+            (double)bytes / 1048576.0,
             (unsigned long long)in_dim,
             (unsigned long long)out_dim,
             t1 - t0);
@@ -1345,6 +1546,9 @@ static void usage(FILE *fp) {
             "  --reserve-gb N    Free CUDA memory to keep unused. Default: 32\n"
             "  --derive-output-certifier Build base output Q8_0 row-group norms for exact verifier\n"
             "  --derive-group-count N Row groups for --derive-output-certifier. Default: 8\n"
+            "  --derive-q8-f16 NAME Build a base Q8_0 tensor as imported F16 layout. Repeatable\n"
+            "  --derive-q8-f32 NAME Build a base Q8_0 tensor as imported F32 layout. Repeatable\n"
+            "  --derive-budget-gb N Maximum derived artifact memory. Default: 4\n"
             "  --dry-run         Parse GGUFs, print upload plan, and exit before allocation\n");
 }
 
@@ -1363,6 +1567,9 @@ int main(int argc, char **argv) {
     uint64_t reserve_bytes = 32ull * 1073741824ull;
     bool derive_output_certifier = false;
     uint32_t derive_group_count = 8;
+    std::vector<std::string> derive_q8_f16;
+    std::vector<std::string> derive_q8_f32;
+    uint64_t derive_budget_bytes = 4ull * 1073741824ull;
     bool dry_run = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--base") && i + 1 < argc) base = argv[++i];
@@ -1387,6 +1594,9 @@ int main(int argc, char **argv) {
                 return 2;
             }
         }
+        else if (!strcmp(argv[i], "--derive-q8-f16") && i + 1 < argc) derive_q8_f16.push_back(argv[++i]);
+        else if (!strcmp(argv[i], "--derive-q8-f32") && i + 1 < argc) derive_q8_f32.push_back(argv[++i]);
+        else if (!strcmp(argv[i], "--derive-budget-gb") && i + 1 < argc) derive_budget_bytes = parse_gib(argv[++i], derive_budget_bytes);
         else if (!strcmp(argv[i], "--dry-run")) dry_run = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout);
@@ -1416,8 +1626,8 @@ int main(int argc, char **argv) {
     if (span_bytes > 4096ull * 1048576ull) span_bytes = 4096ull * 1048576ull;
     if (copy_chunk_bytes < 16ull * 1048576ull) copy_chunk_bytes = 16ull * 1048576ull;
     if (copy_chunk_bytes > 1024ull * 1048576ull) copy_chunk_bytes = 1024ull * 1048576ull;
-    if (derive_output_certifier && !want_base) {
-        fprintf(stderr, "ds4_weight_server: --derive-output-certifier requires base scope\n");
+    if ((derive_output_certifier || !derive_q8_f16.empty() || !derive_q8_f32.empty()) && !want_base) {
+        fprintf(stderr, "ds4_weight_server: derived artifacts currently require base scope\n");
         return 2;
     }
 
@@ -1497,6 +1707,7 @@ int main(int argc, char **argv) {
                                    backend, device, vmm_granularity, &base_records)) return 1;
     if (want_mtp && !upload_model("mtp", mtp, span_bytes, copy_chunk_bytes, ranges,
                                   backend, device, vmm_granularity, &mtp_records)) return 1;
+    uint64_t derived_bytes_used = 0;
     if (derive_output_certifier &&
         !build_output_certifier_norms("base",
                                       base_model_size,
@@ -1505,8 +1716,46 @@ int main(int argc, char **argv) {
                                       backend,
                                       device,
                                       vmm_granularity,
-                                      derive_group_count)) {
+                                      derive_group_count,
+                                      &derived_bytes_used,
+                                      derive_budget_bytes)) {
         return 1;
+    }
+    for (const std::string &name : derive_q8_f16) {
+        if (!build_q8_0_dequant_artifact("base",
+                                         base_model_size,
+                                         base_records,
+                                         ranges,
+                                         backend,
+                                         device,
+                                         vmm_granularity,
+                                         name.c_str(),
+                                         DERIVED_Q8_0_F16_COLMAJOR,
+                                         &derived_bytes_used,
+                                         derive_budget_bytes)) {
+            return 1;
+        }
+    }
+    for (const std::string &name : derive_q8_f32) {
+        if (!build_q8_0_dequant_artifact("base",
+                                         base_model_size,
+                                         base_records,
+                                         ranges,
+                                         backend,
+                                         device,
+                                         vmm_granularity,
+                                         name.c_str(),
+                                         DERIVED_Q8_0_F32_COLMAJOR,
+                                         &derived_bytes_used,
+                                         derive_budget_bytes)) {
+            return 1;
+        }
+    }
+    if (derived_bytes_used != 0) {
+        fprintf(stderr,
+                "ds4_weight_server: derived artifacts total %.2f MiB budget %.2f MiB\n",
+                (double)derived_bytes_used / 1048576.0,
+                (double)derive_budget_bytes / 1048576.0);
     }
     std::string default_broker_socket;
     fd_broker broker;
