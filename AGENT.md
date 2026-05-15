@@ -113,6 +113,21 @@ to opt in to the newer paths.
   range 0-8.  0 disables (same as `DS4_CUDA_NO_MMVQ_DECODE=1` for the
   MoE path).  Values 2-8 extend mmvq coverage to short-prefill batches
   but require n_tokens * n_expert_used &le; 8 for the down matmul.
+- `DS4_CUDA_MOE_GRAPHS=1` (default off): opt-in CUDA Graph capture for
+  the mmvq routed-MoE decode block.  Step 8 of the optimization plan.
+  Each per-layer kernel sequence (gate + up + swiglu + down + sum =
+  ~8 launches) is captured into a `cudaGraphExec_t` on first execution
+  and replayed via `cudaGraphLaunch` on subsequent calls with the same
+  (gate_offset, up_offset, down_offset, n_tokens, q4k_path, buffer
+  pointers) tuple.  The cache holds up to 256 entries (one per layer
+  shape-class).  Replay eliminates ~5-15&micro;s of CPU&harr;driver
+  round-trip per kernel launch, the dominant overhead at decode where
+  individual kernels are small.  Requires an explicit non-default
+  stream (`g_moe_stream`) for capture; routes the ds4_mmq pool's
+  `cudaMallocAsync` through the same stream via the thread-local
+  `ds4_pool_set_stream()` so allocations don't invalidate capture.
+  Falls through to the un-captured mmvq decode path on any capture
+  error; opt-in until validated end-to-end.
 
 ## Testing
 

@@ -100,6 +100,22 @@ int64_t ggml_time_us() {
 
 namespace {
 
+/* Thread-local stream that ds4_naive_pool uses for cudaMallocAsync /
+ * cudaFreeAsync.  Defaults to cudaStreamPerThread (preserves prior
+ * behaviour).  Step 8 / CUDA Graphs sets this to the capture stream
+ * before allocating, so the alloc node lives on the captured stream
+ * and capture is not invalidated.  Set via ds4_pool_set_stream() from
+ * ds4_mmq.cu wrappers. */
+static thread_local cudaStream_t t_ds4_pool_stream = cudaStreamPerThread;
+
+extern "C" void ds4_pool_set_stream(cudaStream_t stream) {
+    t_ds4_pool_stream = stream ? stream : cudaStreamPerThread;
+}
+
+extern "C" cudaStream_t ds4_pool_get_stream(void) {
+    return t_ds4_pool_stream;
+}
+
 struct ds4_naive_pool : public ggml_cuda_pool {
     int device;
 
@@ -108,7 +124,7 @@ struct ds4_naive_pool : public ggml_cuda_pool {
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_cuda_set_device(device);
         void * ptr = nullptr;
-        CUDA_CHECK(cudaMallocAsync(&ptr, size, cudaStreamPerThread));
+        CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
         if (actual_size) *actual_size = size;
         return ptr;
     }
@@ -116,7 +132,7 @@ struct ds4_naive_pool : public ggml_cuda_pool {
     void free(void * ptr, size_t /*size*/) override {
         if (!ptr) return;
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaFreeAsync(ptr, cudaStreamPerThread));
+        CUDA_CHECK(cudaFreeAsync(ptr, t_ds4_pool_stream));
     }
 };
 

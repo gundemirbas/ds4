@@ -6639,6 +6639,113 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
  * mmq on.  Cached on first use. */
 static int g_ds4_use_mmq_init = 0;
 static int g_ds4_use_mmq = 0;
+/* -----------------------------------------------------------------------
+ * Step 8: CUDA Graph cache for the routed-MoE decode block.
+ *
+ * The mmvq decode branch (Step 6) launches ~8 kernels per MoE layer.  At
+ * decode (n_tokens=1) each layer's kernel sequence is repeated identically
+ * across the model's 43 layers, and the BUFFER POINTERS are stable across
+ * forward passes - the model is mmapped and ds4 reuses the same scratch
+ * tensors every call.  This makes the kernel sequence a perfect candidate
+ * for cudaGraph capture+replay: capture once per (layer-shape, weight-offset)
+ * tuple, then on every subsequent call replay the captured graph in a
+ * single cudaGraphLaunch.  Each replay eliminates ~8 CPU<->driver round
+ * trips, worth ~5-15us per launch.  At 350+ launches per token and a 23ms
+ * total token time today, eliminating launch overhead is the largest
+ * remaining gen-tok/s lever.
+ *
+ * Cache key: hash of all input pointers, weight offsets, and shape ints
+ * that affect the captured graph's bound parameters.  If any pointer or
+ * shape differs, we capture a new graph (cheap one-time cost).
+ *
+ * Capture mode: cudaStreamCaptureModeRelaxed on stream=0.  Relaxed is
+ * the permissive mode - tolerates cross-stream ops that strict Global
+ * would reject.  Some pool internals (cudaMallocAsync on the per-thread
+ * default stream) live outside the captured stream; in Relaxed mode they
+ * still complete normally and the cached pool returns the same memory
+ * on subsequent calls.  The captured graph thus contains the kernel
+ * launches and the alloc/free nodes for the malloc-async calls in scope.
+ *
+ * Opt-in: DS4_CUDA_MOE_GRAPHS=1 (default off until proven).
+ * --------------------------------------------------------------------- */
+
+struct moe_graph_key {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint32_t n_tokens;
+    uint32_t q4k_path;
+    uint32_t expert_in_dim;
+    uint32_t expert_mid_dim;
+    uint32_t out_dim;
+    void *gate_ptr;
+    void *up_ptr;
+    void *mid_ptr;
+    void *down_ptr;
+    void *out_ptr;
+    void *x_ptr;
+    void *sel_ptr;
+    void *w_ptr;
+};
+
+struct moe_graph_entry {
+    struct moe_graph_key key;
+    cudaGraphExec_t exec;
+    int valid;
+    uint64_t hits;
+};
+
+#define DS4_MOE_GRAPH_CACHE_SIZE 256
+
+static struct moe_graph_entry g_moe_graphs[DS4_MOE_GRAPH_CACHE_SIZE];
+
+/* Explicit stream used for the captured routed_moe_launch sequence.
+ * Lazily created at first use.  Must be non-default so capture is legal. */
+static cudaStream_t g_moe_stream = NULL;
+
+static cudaStream_t ds4_cuda_moe_stream(void) {
+    if (!g_moe_stream) {
+        cudaError_t ge = cudaStreamCreateWithFlags(&g_moe_stream, cudaStreamNonBlocking);
+        if (ge != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaStreamCreate (moe) failed: %s\n",
+                    cudaGetErrorString(ge));
+            g_moe_stream = NULL;
+        }
+    }
+    return g_moe_stream;
+}
+
+static int ds4_cuda_moe_graphs_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_MOE_GRAPHS");
+        if (s && *s && strcmp(s, "0") != 0 &&
+            strcmp(s, "off") != 0 && strcmp(s, "no") != 0 && strcmp(s, "false") != 0) {
+            enabled = 1;
+            fprintf(stderr, "ds4: DS4_CUDA_MOE_GRAPHS enabled - capturing routed-MoE decode\n");
+        }
+    }
+    return enabled;
+}
+
+static uint64_t moe_graph_hash(const struct moe_graph_key *k) {
+    /* FNV-1a over the key bytes. */
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const uint8_t *p = (const uint8_t *)k;
+    for (size_t i = 0; i < sizeof(*k); i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static struct moe_graph_entry *moe_graph_slot(const struct moe_graph_key *key) {
+    uint64_t h = moe_graph_hash(key);
+    return &g_moe_graphs[h % DS4_MOE_GRAPH_CACHE_SIZE];
+}
+
 static int ds4_cuda_use_mmq() {
     if (!g_ds4_use_mmq_init) {
         g_ds4_use_mmq_init = 1;
@@ -11319,6 +11426,68 @@ static int routed_moe_launch(
         if (n_assignments > 8u) {
             /* Outside the mmvq vec path's batch envelope; fall through. */
         } else {
+            /* Step 8: graph cache fast path.  If enabled, check the cache
+             * for a captured graph matching the current shape + pointers.
+             * On hit: replay (cudaGraphLaunch).  On miss: capture the
+             * kernel sequence below and store the exec for next time. */
+            struct moe_graph_entry *graph_slot = NULL;
+            int graph_capturing = 0;
+            cudaStream_t moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+            if (ds4_cuda_moe_graphs_enabled() && moe_stream) {
+                struct moe_graph_key key;
+                memset(&key, 0, sizeof(key));
+                key.gate_offset     = gate_offset;
+                key.up_offset       = up_offset;
+                key.down_offset     = down_offset;
+                key.n_tokens        = n_tokens;
+                key.q4k_path        = (uint32_t)q4k_path;
+                key.expert_in_dim   = expert_in_dim;
+                key.expert_mid_dim  = expert_mid_dim;
+                key.out_dim         = out_dim;
+                key.gate_ptr        = gate->ptr;
+                key.up_ptr          = up->ptr;
+                key.mid_ptr         = mid->ptr;
+                key.down_ptr        = down->ptr;
+                key.out_ptr         = out->ptr;
+                key.x_ptr           = x->ptr;
+                key.sel_ptr         = selected->ptr;
+                key.w_ptr           = weights->ptr;
+                graph_slot = moe_graph_slot(&key);
+                if (graph_slot->valid &&
+                    memcmp(&graph_slot->key, &key, sizeof(key)) == 0) {
+                    /* HIT: replay the cached graph and return. */
+                    cudaError_t ge = cudaGraphLaunch(graph_slot->exec, moe_stream);
+                    if (ge != cudaSuccess) {
+                        fprintf(stderr, "ds4: cudaGraphLaunch failed: %s; recapturing\n",
+                                cudaGetErrorString(ge));
+                        cudaGraphExecDestroy(graph_slot->exec);
+                        graph_slot->valid = 0;
+                        /* fall through to capture path below */
+                    } else {
+                        graph_slot->hits++;
+                        return 1;
+                    }
+                }
+                /* MISS: begin capture, run the sequence, then end capture
+                 * and instantiate.  Save the exec at graph_slot. */
+                memcpy(&graph_slot->key, &key, sizeof(key));
+                if (graph_slot->valid) {
+                    /* Hash collision with a different key - tear down the
+                     * old exec before recapturing for the new one. */
+                    cudaGraphExecDestroy(graph_slot->exec);
+                    graph_slot->valid = 0;
+                    graph_slot->hits = 0;
+                }
+                cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
+                if (ge == cudaSuccess) {
+                    graph_capturing = 1;
+                } else {
+                    fprintf(stderr, "ds4: cudaStreamBeginCapture failed: %s; graphs disabled this call\n",
+                            cudaGetErrorString(ge));
+                    graph_slot = NULL;
+                }
+            }
+
             int rc = -1;
             /* 1. Two separate gate/up matmuls through mmvq.  Each call
              *    re-quantizes the activation - acceptable for n_tokens=1
@@ -11330,50 +11499,50 @@ static int routed_moe_launch(
                                           (float *)gate->ptr,
                                           (int)expert_mid_dim, (int)expert_in_dim,
                                           (int)n_tokens, (int)n_experts_total,
-                                          (int)n_expert_used, /*stream=*/0);
+                                          (int)n_expert_used, moe_stream);
                 if (rc != 0) {
                     fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_vec (gate) returned %d; falling back\n", rc);
-                    goto mmq_moe_fallback;
+                    goto mmvq_decode_bail;
                 }
                 rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)up->ptr,
                                           (int)expert_mid_dim, (int)expert_in_dim,
                                           (int)n_tokens, (int)n_experts_total,
-                                          (int)n_expert_used, /*stream=*/0);
+                                          (int)n_expert_used, moe_stream);
             } else {
                 rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
                                              (const int32_t *)selected->ptr,
                                              (float *)gate->ptr,
                                              (int)expert_mid_dim, (int)expert_in_dim,
                                              (int)n_tokens, (int)n_experts_total,
-                                             (int)n_expert_used, /*stream=*/0);
+                                             (int)n_expert_used, moe_stream);
                 if (rc != 0) {
                     fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
-                    goto mmq_moe_fallback;
+                    goto mmvq_decode_bail;
                 }
                 rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
                                              (const int32_t *)selected->ptr,
                                              (float *)up->ptr,
                                              (int)expert_mid_dim, (int)expert_in_dim,
                                              (int)n_tokens, (int)n_experts_total,
-                                             (int)n_expert_used, /*stream=*/0);
+                                             (int)n_expert_used, moe_stream);
             }
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (up) returned %d; falling back\n", rc);
-                goto mmq_moe_fallback;
+                goto mmvq_decode_bail;
             }
 
             /* 2. SwiGLU + clamp + router_weight.  Same kernel as the mmq
              *    path uses - applies the V4 clamp to gate/up BEFORE silu. */
             {
                 const uint64_t mid_floats = n_assignments * expert_mid_dim;
-                moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256>>>(
+                moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, moe_stream>>>(
                     (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
                     (const float *)gate->ptr, (const float *)up->ptr,
                     (const float *)weights->ptr,
                     expert_mid_dim, n_tokens, n_expert_used, clamp);
-                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe swiglu launch")) goto mmq_moe_fallback;
+                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe swiglu launch")) goto mmvq_decode_bail;
             }
 
             /* 3. Down matmul: same reinterpretation trick the mmq path uses -
@@ -11386,29 +11555,86 @@ static int routed_moe_launch(
                                           (float *)down->ptr,
                                           (int)out_dim, (int)expert_mid_dim,
                                           (int)n_assignments, (int)n_experts_total,
-                                          /*n_expert_used=*/1, /*stream=*/0);
+                                          /*n_expert_used=*/1, moe_stream);
             } else {
                 rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)down->ptr,
                                           (int)out_dim, (int)expert_mid_dim,
                                           (int)n_assignments, (int)n_experts_total,
-                                          /*n_expert_used=*/1, /*stream=*/0);
+                                          /*n_expert_used=*/1, moe_stream);
             }
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (down) returned %d; falling back\n", rc);
-                goto mmq_moe_fallback;
+                goto mmvq_decode_bail;
             }
 
-            /* 4. Sum across n_expert_used dim - same kernel as the mmq path. */
+            /* 4. Sum across n_expert_used dim - same kernel as the mmq path.
+             *    Launched on moe_stream so Step 8 capture is consistent. */
             {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
-                moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+                moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, moe_stream>>>(
                     (float *)out->ptr, (const float *)down->ptr,
                     out_dim, n_expert_used, n_tokens);
-                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe sum launch")) goto mmq_moe_fallback;
+                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe sum launch")) goto mmvq_decode_bail;
+            }
+            /* Step 8: if we were capturing, finalize the graph and replay
+             * it.  cudaStreamEndCapture builds the graph object; the
+             * captured kernels have NOT executed yet (stream capture
+             * records but doesn't run).  cudaGraphInstantiate builds the
+             * exec; cudaGraphLaunch fires it.  Subsequent calls with the
+             * same key replay via cudaGraphLaunch at the top of this
+             * branch, avoiding the ~8 per-kernel CPU<->driver round
+             * trips. */
+            if (graph_capturing && graph_slot) {
+                cudaGraph_t graph;
+                cudaError_t ge = cudaStreamEndCapture(moe_stream, &graph);
+                graph_capturing = 0;
+                if (ge == cudaSuccess) {
+                    cudaGraphExec_t exec;
+                    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                    if (ge == cudaSuccess) {
+                        graph_slot->exec = exec;
+                        graph_slot->valid = 1;
+                        graph_slot->hits = 0;
+                        /* Execute the just-captured graph for THIS call.
+                         * Capture itself does not run the kernels; we must
+                         * launch the exec to actually do the work. */
+                        ge = cudaGraphLaunch(exec, moe_stream);
+                        if (ge != cudaSuccess) {
+                            fprintf(stderr, "ds4: cudaGraphLaunch (first) failed: %s\n",
+                                    cudaGetErrorString(ge));
+                        }
+                    } else {
+                        fprintf(stderr, "ds4: cudaGraphInstantiate failed: %s; graphs disabled this layer\n",
+                                cudaGetErrorString(ge));
+                    }
+                    cudaGraphDestroy(graph);
+                } else {
+                    fprintf(stderr, "ds4: cudaStreamEndCapture failed: %s\n",
+                            cudaGetErrorString(ge));
+                }
             }
             return 1;
+        mmvq_decode_bail:
+            /* Failure inside the mmvq decode branch: end any in-flight
+             * capture cleanly (discard the partial graph) before falling
+             * through to the mmq path. */
+            if (graph_capturing) {
+                cudaGraph_t partial;
+                cudaError_t ge = cudaStreamEndCapture(0, &partial);
+                if (ge == cudaSuccess) {
+                    cudaGraphDestroy(partial);
+                } else {
+                    /* Stream may be left in a bad capture state; log so we
+                     * notice but proceed - the mmq fallback will reset. */
+                    fprintf(stderr, "ds4: cudaStreamEndCapture (bail) failed: %s\n",
+                            cudaGetErrorString(ge));
+                }
+                graph_capturing = 0;
+                if (graph_slot) graph_slot->valid = 0;
+            }
+            goto mmq_moe_fallback;
         }
     }
 

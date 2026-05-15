@@ -338,6 +338,13 @@ int ds4_mmq_q8_0_dense_vec(
     int           K,
     cudaStream_t  stream);
 
+// Set the thread-local stream that the internal cuda pool uses for
+// cudaMallocAsync / cudaFreeAsync.  Defaults to cudaStreamPerThread.
+// Step 8 (CUDA Graphs) calls this with the capture stream so pool
+// allocations land on the captured stream and don't invalidate capture.
+// Pass NULL to reset to cudaStreamPerThread.
+void ds4_pool_set_stream(cudaStream_t stream);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

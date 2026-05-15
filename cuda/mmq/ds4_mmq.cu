@@ -738,6 +738,12 @@ int ds4_mmq_moe_vec_impl(
         return -1;
     }
 
+    // Route the pool's cudaMallocAsync / cudaFreeAsync through the same
+    // stream the caller uses for kernel launches.  Required for Step 8
+    // (CUDA Graph capture): pool allocations on a different stream than
+    // the capture stream would invalidate the capture.
+    ds4_pool_set_stream(stream);
+
     // 1. Quantize X into CANONICAL Q8_1 (NOT the MMQ-interleaved variant).
     //    Layout: [ne13=1, ne12=n_tokens, ne11=1, ne10_padded blocks].
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
@@ -856,6 +862,10 @@ int ds4_mmq_moe_pair_vec_impl(
         return -1;
     }
 
+    // Route the pool's cudaMallocAsync through the caller-supplied stream
+    // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
+    ds4_pool_set_stream(stream);
+
     const int n_tokens = 1;  // fusion only supported at ncols_dst=1.
 
     // Quantize X (single token) into canonical Q8_1.
@@ -957,6 +967,10 @@ int ds4_mmq_dense_vec_impl(
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
+
+    // Route the pool's cudaMallocAsync through the caller-supplied stream
+    // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
+    ds4_pool_set_stream(stream);
 
     // Dense: no MoE, ids=null. Layout [K, N, 1, 1] for src1.
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
