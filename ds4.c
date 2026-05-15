@@ -10599,6 +10599,141 @@ static bool metal_graph_decode2_batch_ffn_body_diff_layer(uint32_t il) {
     return end != layer_env && v == (unsigned long)il;
 }
 
+static bool metal_graph_decode2_q_batch_diff_layer(uint32_t il) {
+    if (getenv("DS4_MTP_DECODE2_Q_BATCH_DIFF") == NULL) return false;
+    const char *layer_env = getenv("DS4_MTP_DECODE2_Q_BATCH_DIFF_LAYER");
+    if (!layer_env || !layer_env[0] || strcmp(layer_env, "all") == 0) return true;
+    char *end = NULL;
+    unsigned long v = strtoul(layer_env, &end, 10);
+    return end != layer_env && v == (unsigned long)il;
+}
+
+static bool metal_graph_decode2_q_batch_diff(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0) {
+    if (!g || !model || !layer) return false;
+    const uint64_t q_rank = layer->attn_q_a->dim[1];
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    const float freq_base = layer_rope_freq_base(il);
+    const float freq_scale = layer_rope_freq_scale(il);
+    const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+    float attn_factor = 1.0f;
+    if (ext_factor != 0.0f && freq_scale > 0.0f) {
+        attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+    const bool batch_q8_pair =
+        getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL &&
+        getenv("DS4_CUDA_NO_DECODE_Q8_PAIR") == NULL;
+    bool ok = true;
+
+    if (ok && qkv_rms_fused && batch_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->batch_qr,
+                                             g->batch_kv_raw,
+                                             model->map,
+                                             model->size,
+                                             layer->attn_q_a->abs_offset,
+                                             layer->attn_kv->abs_offset,
+                                             DS4_N_EMBD,
+                                             q_rank,
+                                             DS4_N_HEAD_DIM,
+                                             g->batch_attn_norm,
+                                             2) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
+                                          model->map,
+                                          model->size,
+                                          layer->attn_q_a->abs_offset,
+                                          DS4_N_EMBD,
+                                          q_rank,
+                                          g->batch_attn_norm,
+                                          2) != 0;
+        if (ok && qkv_rms_fused) {
+            ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
+                                              model->map,
+                                              model->size,
+                                              layer->attn_kv->abs_offset,
+                                              DS4_N_EMBD,
+                                              DS4_N_HEAD_DIM,
+                                              g->batch_attn_norm,
+                                              2) != 0;
+        }
+    }
+    if (ok && qkv_rms_fused) {
+        ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->batch_qr_norm,
+                                                   g->batch_qr,
+                                                   model->map,
+                                                   model->size,
+                                                   layer->attn_q_a_norm->abs_offset,
+                                                   (uint32_t)q_rank,
+                                                   g->batch_kv,
+                                                   g->batch_kv_raw,
+                                                   layer->attn_kv_a_norm->abs_offset,
+                                                   DS4_N_HEAD_DIM,
+                                                   2,
+                                                   DS4_RMS_EPS) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_qr_norm,
+                                                 g->batch_qr,
+                                                 model->map,
+                                                 model->size,
+                                                 layer->attn_q_a_norm->abs_offset,
+                                                 (uint32_t)q_rank,
+                                                 2,
+                                                 DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_heads,
+                                        model->map,
+                                        model->size,
+                                        layer->attn_q_b->abs_offset,
+                                        q_rank,
+                                        q_dim,
+                                        g->batch_qr_norm,
+                                        2) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_head_rms_norm_tensor(g->batch_heads,
+                                          2,
+                                          DS4_N_HEAD,
+                                          DS4_N_HEAD_DIM,
+                                          DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_rope_tail_tensor(g->batch_heads,
+                                      2,
+                                      DS4_N_HEAD,
+                                      DS4_N_HEAD_DIM,
+                                      DS4_N_ROT,
+                                      pos0,
+                                      compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                      false,
+                                      freq_base,
+                                      freq_scale,
+                                      ext_factor,
+                                      attn_factor,
+                                      DS4_ROPE_YARN_BETA_FAST,
+                                      DS4_ROPE_YARN_BETA_SLOW) != 0;
+    }
+    for (uint32_t row = 0; ok && row < 2; row++) {
+        ds4_gpu_tensor *scalar_q = metal_graph_tensor_row_view(g->batch_q, row, q_dim);
+        ok = scalar_q != NULL &&
+             metal_graph_decode2_compare_batch_row("q_batch_from_scalar_norm",
+                                                   il,
+                                                   pos0,
+                                                   row,
+                                                   g->batch_heads,
+                                                   q_dim,
+                                                   scalar_q);
+        ds4_gpu_tensor_free(scalar_q);
+    }
+    return ok;
+}
+
 static bool metal_graph_decode2_capture_ffn_prefix_scalar_row(
         ds4_gpu_graph *g,
         uint32_t       row) {
@@ -11050,14 +11185,20 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
         getenv("DS4_MTP_DECODE2_NO_PAIR_ATTN_OUT") == NULL &&
         !metal_graph_directional_steering_attn_enabled(g) &&
         !metal_graph_use_reference_attn_out_hc();
+    const bool q_batch_diff = metal_graph_decode2_q_batch_diff_layer(il);
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     ds4_gpu_tensor *heads0 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_heads, 0, q_dim) : NULL;
     ds4_gpu_tensor *heads1 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_heads, 1, q_dim) : NULL;
     ds4_gpu_tensor *split0 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_hc_split, 0, mix_hc) : NULL;
     ds4_gpu_tensor *split1 = pair_attn_out ? metal_graph_tensor_row_view(g->batch_hc_split, 1, mix_hc) : NULL;
+    ds4_gpu_tensor *attn_norm0 = q_batch_diff ? metal_graph_tensor_row_view(g->batch_attn_norm, 0, DS4_N_EMBD) : NULL;
+    ds4_gpu_tensor *attn_norm1 = q_batch_diff ? metal_graph_tensor_row_view(g->batch_attn_norm, 1, DS4_N_EMBD) : NULL;
+    ds4_gpu_tensor *q0 = q_batch_diff ? metal_graph_tensor_row_view(g->batch_q, 0, q_dim) : NULL;
+    ds4_gpu_tensor *q1 = q_batch_diff ? metal_graph_tensor_row_view(g->batch_q, 1, q_dim) : NULL;
     bool ok = after0 && after1 &&
-              (!pair_attn_out || (heads0 && heads1 && split0 && split1));
+              (!pair_attn_out || (heads0 && heads1 && split0 && split1)) &&
+              (!q_batch_diff || (attn_norm0 && attn_norm1 && q0 && q1));
 
     const bool profile = getenv("DS4_MTP_EXACT_DECODE2_LAYER_PROFILE") != NULL;
     const bool routed_batch_diff = metal_graph_decode2_routed_batch_diff_layer(il);
@@ -11071,6 +11212,8 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
     ds4_gpu_tensor *saved_heads = g->heads;
     ds4_gpu_tensor *saved_hc_split = g->hc_split;
+    ds4_gpu_tensor *saved_attn_norm = g->attn_norm;
+    ds4_gpu_tensor *saved_q = g->q;
 
     if (ok) {
         g->cur_hc = cur0;
@@ -11078,6 +11221,10 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
         if (pair_attn_out) {
             g->heads = heads0;
             g->hc_split = split0;
+        }
+        if (q_batch_diff) {
+            g->attn_norm = attn_norm0;
+            g->q = q0;
         }
         ok = metal_graph_encode_decode_layer_impl(g,
                                                   model,
@@ -11114,6 +11261,10 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
             g->heads = heads1;
             g->hc_split = split1;
         }
+        if (q_batch_diff) {
+            g->attn_norm = attn_norm1;
+            g->q = q1;
+        }
         ok = metal_graph_encode_decode_layer_impl(g,
                                                   model,
                                                   &weights->layer[il],
@@ -11139,6 +11290,8 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     g->after_attn_hc = saved_after_attn;
     g->heads = saved_heads;
     g->hc_split = saved_hc_split;
+    g->attn_norm = saved_attn_norm;
+    g->q = saved_q;
     if (ok && pair_attn_out) {
         ok = metal_graph_encode_decode2_pair_attention_output_exact(g,
                                                                     model,
@@ -11148,6 +11301,13 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     }
     if (ok && profile && pair_attn_out) {
         ok = metal_graph_decode2_layer_profile_boundary("pair_attn_output", il, pos0, total_t0, &stage_t0);
+    }
+    if (ok && q_batch_diff) {
+        ok = metal_graph_decode2_q_batch_diff(g,
+                                              model,
+                                              &weights->layer[il],
+                                              il,
+                                              pos0);
     }
     if (ok && batch_ffn) {
         ok = metal_graph_encode_layer_ffn_batch(g, model, &weights->layer[il], il, pos0, 2);
@@ -11284,6 +11444,10 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
 
     ds4_gpu_tensor_free(after1);
     ds4_gpu_tensor_free(after0);
+    ds4_gpu_tensor_free(q1);
+    ds4_gpu_tensor_free(q0);
+    ds4_gpu_tensor_free(attn_norm1);
+    ds4_gpu_tensor_free(attn_norm0);
     ds4_gpu_tensor_free(split1);
     ds4_gpu_tensor_free(split0);
     ds4_gpu_tensor_free(heads1);
@@ -11291,6 +11455,8 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
     g->after_attn_hc = saved_after_attn;
     g->heads = saved_heads;
     g->hc_split = saved_hc_split;
+    g->attn_norm = saved_attn_norm;
+    g->q = saved_q;
 
     if (ok) {
         ds4_gpu_tensor *tmp = cur0; cur0 = next0; next0 = tmp;
