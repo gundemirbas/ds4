@@ -7412,11 +7412,19 @@ static ds4_q8_strategy ds4_cuda_q8_strategy(void) {
         cudaDeviceProp props;
         cudaError_t qe = cudaGetDeviceProperties(&props, 0);
         if (qe == cudaSuccess) {
-            /* memoryClockRate is in kHz; DDR factor of 2; bus width in bits / 8 to bytes; /1e6 to GB/s. */
-            const double bw_gbps = 2.0 * (double)props.memoryClockRate * (double)props.memoryBusWidth / 8.0 / 1.0e6;
+            /* memoryClockRate was removed from cudaDeviceProp in CUDA 13; query via
+             * cudaDeviceGetAttribute.  memoryBusWidth is still in props on CUDA 13
+             * but we query it the same way for forward-compat. */
+            int mem_clock_khz = 0, bus_width_bits = 0;
+            (void)cudaDeviceGetAttribute(&mem_clock_khz,   cudaDevAttrMemoryClockRate,       0);
+            (void)cudaDeviceGetAttribute(&bus_width_bits,  cudaDevAttrGlobalMemoryBusWidth,  0);
+            const double bw_gbps = (mem_clock_khz > 0 && bus_width_bits > 0)
+                ? 2.0 * (double)mem_clock_khz * (double)bus_width_bits / 8.0 / 1.0e6
+                : 0.0;
             if      (bw_gbps > 800.0) { chosen = DS4_Q8_STRATEGY_MMQ;    reason = "auto (memory bandwidth > 800 GB/s)"; }
             else if (bw_gbps > 200.0) { chosen = DS4_Q8_STRATEGY_CUBLAS; reason = "auto (memory bandwidth 200..800 GB/s)"; }
-            else                      { chosen = DS4_Q8_STRATEGY_WARP8;  reason = "auto (memory bandwidth <= 200 GB/s)"; }
+            else if (bw_gbps > 0.0)   { chosen = DS4_Q8_STRATEGY_WARP8;  reason = "auto (memory bandwidth <= 200 GB/s)"; }
+            else                      { chosen = DS4_Q8_STRATEGY_MMQ;    reason = "auto fallback (bandwidth query returned 0)"; }
             fprintf(stderr,
                     "ds4: CUDA Q8_0 dispatch: %s (sm_%d%d, %.0f GB/s memory bandwidth) [%s]\n",
                     ds4_q8_strategy_name(chosen), props.major, props.minor, bw_gbps, reason);
