@@ -60,48 +60,58 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 
 ## CUDA environment variables
 
-The CUDA backend selects a Q8_0 dense-matmul strategy at startup based on
-device memory bandwidth, then dispatches every Q8_0 matmul (attention
-projections, shared expert, lm_head, attn_output_b) through it.  Three
-strategies are available:
+The CUDA backend dispatches every Q8_0 dense matmul (attention
+projections, shared expert, lm_head, attn_output_b) through one of three
+strategies, defaulting to `mmq` with a downgrade chain on init failure.
+cuBLAS is initialized unconditionally at backend startup regardless of
+the chosen strategy; we observed that this triggers CUDA driver-state
+that makes mmq ~4x faster on sm_121 vs a binary that skips
+`cublasCreate`, so the cublas path remains resident even when it isn't
+selected.
 
-|  Strategy | When auto-picked       | What it runs                                  |
-|-----------|------------------------|-----------------------------------------------|
-| `mmq`     | mem bandwidth > 800 GB/s | vendored llama.cpp `mul_mat_q` (cuda/mmq/)   |
-| `cublas`  | 200..800 GB/s            | `cuda_q8_f16_ptr` Q8->FP16 cache + `cublasGemmEx` |
-| `warp8`   | <= 200 GB/s              | native `matmul_q8_0_preq_*_kernel` family    |
+|  Strategy | When picked                                | What it runs                                      |
+|-----------|--------------------------------------------|---------------------------------------------------|
+| `mmq`     | default; on every CUDA arch we've validated| vendored llama.cpp `mul_mat_q` (cuda/mmq/)        |
+| `cublas`  | explicit override or fallback if mmq init fails | `cuda_q8_f16_ptr` Q8->FP16 cache + `cublasGemmEx` |
+| `warp8`   | explicit override or last-resort fallback  | native `matmul_q8_0_preq_*_kernel` family         |
 
 The strategy is logged once on first dispatch, e.g.:
 
-    ds4: CUDA Q8_0 dispatch: mmq (sm_120, 1611 GB/s memory bandwidth) [auto (memory bandwidth > 800 GB/s)]
-    ds4: CUDA Q8_0 dispatch: cublas (sm_121, 273 GB/s memory bandwidth) [auto (memory bandwidth 200..800 GB/s)]
+    ds4: CUDA Q8_0 dispatch: mmq (sm_120, 1792 GB/s memory bandwidth) [default]
+    ds4: CUDA Q8_0 dispatch: mmq (sm_121, 546 GB/s memory bandwidth) [default]
+    ds4: CUDA Q8_0 dispatch: cublas (sm_121, 546 GB/s memory bandwidth) [DS4_CUDA_PREFILL_PATH=cublas]
+
+(The bandwidth figure is informational; we don't tier on it.)
 
 Benchmarked deltas at ctx=2048, V4 Flash IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8,
-promessi_sposi prompt:
+promessi_sposi prompt, no weight server:
 
-| Arch                     | mmq prefill | cublas prefill | warp8 prefill |
-|--------------------------|-------------|-----------------|---------------|
-| PRO 6000 Blackwell sm_120 (1.6 TB/s GDDR7) | **1078**  | 374 | 374 |
-| GB10 Spark sm_121 (273 GB/s LPDDR5X)        |  114      | **398** |  40 |
+| Arch                                       | mmq    | cublas | warp8 |
+|--------------------------------------------|--------|--------|-------|
+| PRO 6000 Blackwell sm_120 (~1.8 TB/s GDDR7) | **1092** | 373   | 373   |
+| GB10 Spark sm_121 (~546 GB/s LPDDR5X)       | **458**  | 401   | 56    |
+
+With the proof-budget weight server backing the same bench on PRO 6000,
+mmq jumps to ~2200 prefill at ctx=2048 (2x of direct-load); cuBLAS and
+warp8 see comparable gains.  The weight server's VMM-mapped weights are
+faster across all three paths; use it for any multi-process bench or
+when reproducible peak prefill matters.
 
 The MTP verifier (Option D, `DS4_CUDA_MTP_VERIFIER_USE_MMQ`) forces
 warp8 inside the verifier regardless of the chosen strategy, because
 the drafter is trained against legacy decoding and only warp8 is
 bit-identical to that distribution.
 
-Env-var surface for path selection:
+Env-var surface:
 
-- `DS4_CUDA_PREFILL_PATH=mmq|cublas|warp8|auto` (default `auto`):
-  explicit strategy override.  `auto` (or unset) lets the runtime pick
-  based on device memory bandwidth tier.  `mmq` forces mmq everywhere
-  (including on Spark where it's a 3.5x regression vs cublas - useful
-  only for direct bench comparison or sm_120 testing).  `warp8` forces
-  the simplest path; useful for debugging or when cuBLAS init fails.
+- `DS4_CUDA_PREFILL_PATH=mmq|cublas|warp8|auto` (default `auto` ->
+  mmq).  Explicit override.  `auto` and unset both resolve to mmq;
+  `cublas` opts into the FP16-expansion + cublasGemmEx path; `warp8`
+  forces the simplest fallback (useful for debugging or for the MTP
+  drafter-bit-equivalence cases when not using Option D).
 - `DS4_CUDA_USE_MMQ=0` (legacy): equivalent to
   `DS4_CUDA_PREFILL_PATH=cublas` for back-compat with the prior
-  override.  Setting the new `DS4_CUDA_PREFILL_PATH` takes precedence.
-  Default behavior (env-var unset) is the auto-tier above, NOT
-  unconditional mmq as it was prior to the dispatch lift.
+  override.  `DS4_CUDA_PREFILL_PATH` takes precedence if both are set.
 - `DS4_CUDA_MMQ_MOE_MIN_TOKENS=N`: minimum `n_tokens` at which the
   routed-MoE mmq path activates.  Default 2.  At `n_tokens=1` mmq's
   matrix-matrix-shaped path has higher per-launch fixed cost than the

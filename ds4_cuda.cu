@@ -7336,25 +7336,28 @@ extern "C" int ds4_gpu_in_mtp_verifier(void) {
  *
  * Three strategies are available:
  *
- *   mmq    - vendored llama.cpp fused-dequant-matmul.  Wins decisively on
- *            high-bandwidth datacenter / pro arches (PRO 6000 Blackwell
- *            GDDR7 ~1.6 TB/s).  Measured ~2.88x prefill vs cuBLAS on V4
- *            Flash sm_120.
- *   cublas - Q8 -> FP16 expansion cache + cublasGemmEx.  Wins on
- *            low-bandwidth consumer / edge arches (Spark / GB10 sm_121,
- *            LPDDR5X 273 GB/s).  mmq's tile-based code wastes memory
- *            bandwidth on these arches; cuBLAS still beats native warp.
- *   warp8  - Native matmul_q8_0_preq_*_kernel family.  Universal
- *            fallback; works everywhere but slowest at high n_tok.
+ *   mmq    - vendored llama.cpp fused-dequant-matmul.  Fastest on every
+ *            arch we've validated when cuBLAS is also initialized at
+ *            startup (which happens unconditionally now).  Measured:
+ *              sm_120 PRO 6000: 1092 t/s vs cublas 373 (~2.9x)
+ *              sm_121 GB10:      458 t/s vs cublas 401 (+14%)
+ *            cuBLAS init has a measured CUDA driver-state side effect on
+ *            sm_121 that makes mmq ~4x faster than the no-cublas-init
+ *            baseline.  We don't delete the cublas path partly for this
+ *            reason - it provides the side-effect for mmq's Spark perf
+ *            and serves as a fallback if mmq init fails.
+ *   cublas - Q8 -> FP16 expansion cache + cublasGemmEx.  Available as
+ *            explicit override; never auto-selected.  Useful for arches
+ *            where mmq init might fail or where cuBLAS's tensor-core
+ *            scheduling beats mmq's tile shape.
+ *   warp8  - Native matmul_q8_0_preq_*_kernel family.  Last-resort
+ *            fallback; correct everywhere but slowest at high n_tok.
+ *            Auto-selected only if both mmq and cublas init fail.
  *
  * Selection order:
  *   1. DS4_CUDA_PREFILL_PATH={mmq,cublas,warp8,auto} explicit override
- *   2. DS4_CUDA_USE_MMQ=0 legacy switch -> forces cuBLAS (or warp8 if
- *      cuBLAS init failed).  Preserves prior bisection semantics.
- *   3. auto-detect from device memory bandwidth:
- *        > 800 GB/s -> mmq
- *        200..800   -> cuBLAS
- *        <= 200     -> warp8
+ *   2. DS4_CUDA_USE_MMQ=0 legacy switch -> equivalent to PREFILL_PATH=cublas
+ *   3. default -> mmq (with auto-downgrade chain on init failures)
  *
  * The chosen strategy is sticky for the process lifetime and printed once
  * at first matmul dispatch.  The MTP-verifier override (Bug 2 / Option D)
@@ -7408,32 +7411,31 @@ static ds4_q8_strategy ds4_cuda_q8_strategy(void) {
         reason = "DS4_CUDA_USE_MMQ=0 (legacy override)";
     }
 
+    /* Default: mmq.  Validated to be fastest on both sm_120 (1078 t/s vs cublas
+     * 373) and sm_121 (458 vs cublas 401, +14%) on V4 Flash Q8_0 dense prefill.
+     * mmq init failure auto-downgrades to cublas inside ds4_cuda_use_mmq().
+     * cuBLAS handle creation in ds4_gpu_init has a CUDA driver-state side
+     * effect that makes mmq 4x faster on sm_121 even when mmq is selected,
+     * so the cublas path is never deleted - it stays resident as a fallback
+     * and as the side-effect provider for mmq's Spark perf. */
     if (chosen == DS4_Q8_STRATEGY_UNKNOWN) {
-        cudaDeviceProp props;
-        cudaError_t qe = cudaGetDeviceProperties(&props, 0);
-        if (qe == cudaSuccess) {
-            /* memoryClockRate was removed from cudaDeviceProp in CUDA 13; query via
-             * cudaDeviceGetAttribute.  memoryBusWidth is still in props on CUDA 13
-             * but we query it the same way for forward-compat. */
-            int mem_clock_khz = 0, bus_width_bits = 0;
-            (void)cudaDeviceGetAttribute(&mem_clock_khz,   cudaDevAttrMemoryClockRate,       0);
-            (void)cudaDeviceGetAttribute(&bus_width_bits,  cudaDevAttrGlobalMemoryBusWidth,  0);
-            const double bw_gbps = (mem_clock_khz > 0 && bus_width_bits > 0)
-                ? 2.0 * (double)mem_clock_khz * (double)bus_width_bits / 8.0 / 1.0e6
-                : 0.0;
-            if      (bw_gbps > 800.0) { chosen = DS4_Q8_STRATEGY_MMQ;    reason = "auto (memory bandwidth > 800 GB/s)"; }
-            else if (bw_gbps > 200.0) { chosen = DS4_Q8_STRATEGY_CUBLAS; reason = "auto (memory bandwidth 200..800 GB/s)"; }
-            else if (bw_gbps > 0.0)   { chosen = DS4_Q8_STRATEGY_WARP8;  reason = "auto (memory bandwidth <= 200 GB/s)"; }
-            else                      { chosen = DS4_Q8_STRATEGY_MMQ;    reason = "auto fallback (bandwidth query returned 0)"; }
-            fprintf(stderr,
-                    "ds4: CUDA Q8_0 dispatch: %s (sm_%d%d, %.0f GB/s memory bandwidth) [%s]\n",
-                    ds4_q8_strategy_name(chosen), props.major, props.minor, bw_gbps, reason);
-        } else {
-            chosen = DS4_Q8_STRATEGY_MMQ;
-            reason = "auto fallback (cudaGetDeviceProperties failed)";
-            fprintf(stderr, "ds4: CUDA Q8_0 dispatch: %s [%s: %s]\n",
-                    ds4_q8_strategy_name(chosen), reason, cudaGetErrorString(qe));
-        }
+        chosen = DS4_Q8_STRATEGY_MMQ;
+        reason = "default";
+    }
+
+    /* Log the choice with device context for diagnosis.  Bandwidth is purely
+     * informational - we no longer tier on it. */
+    cudaDeviceProp props;
+    if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
+        int mem_clock_khz = 0, bus_width_bits = 0;
+        (void)cudaDeviceGetAttribute(&mem_clock_khz,   cudaDevAttrMemoryClockRate,       0);
+        (void)cudaDeviceGetAttribute(&bus_width_bits,  cudaDevAttrGlobalMemoryBusWidth,  0);
+        const double bw_gbps = (mem_clock_khz > 0 && bus_width_bits > 0)
+            ? 2.0 * (double)mem_clock_khz * (double)bus_width_bits / 8.0 / 1.0e6
+            : 0.0;
+        fprintf(stderr,
+                "ds4: CUDA Q8_0 dispatch: %s (sm_%d%d, %.0f GB/s memory bandwidth) [%s]\n",
+                ds4_q8_strategy_name(chosen), props.major, props.minor, bw_gbps, reason);
     } else {
         fprintf(stderr, "ds4: CUDA Q8_0 dispatch: %s [%s]\n", ds4_q8_strategy_name(chosen), reason);
     }
