@@ -7332,30 +7332,127 @@ extern "C" int ds4_gpu_in_mtp_verifier(void) {
     return g_in_mtp_verifier;
 }
 
+/* Q8_0 dense matmul path selection.
+ *
+ * Three strategies are available:
+ *
+ *   mmq    - vendored llama.cpp fused-dequant-matmul.  Wins decisively on
+ *            high-bandwidth datacenter / pro arches (PRO 6000 Blackwell
+ *            GDDR7 ~1.6 TB/s).  Measured ~2.88x prefill vs cuBLAS on V4
+ *            Flash sm_120.
+ *   cublas - Q8 -> FP16 expansion cache + cublasGemmEx.  Wins on
+ *            low-bandwidth consumer / edge arches (Spark / GB10 sm_121,
+ *            LPDDR5X 273 GB/s).  mmq's tile-based code wastes memory
+ *            bandwidth on these arches; cuBLAS still beats native warp.
+ *   warp8  - Native matmul_q8_0_preq_*_kernel family.  Universal
+ *            fallback; works everywhere but slowest at high n_tok.
+ *
+ * Selection order:
+ *   1. DS4_CUDA_PREFILL_PATH={mmq,cublas,warp8,auto} explicit override
+ *   2. DS4_CUDA_USE_MMQ=0 legacy switch -> forces cuBLAS (or warp8 if
+ *      cuBLAS init failed).  Preserves prior bisection semantics.
+ *   3. auto-detect from device memory bandwidth:
+ *        > 800 GB/s -> mmq
+ *        200..800   -> cuBLAS
+ *        <= 200     -> warp8
+ *
+ * The chosen strategy is sticky for the process lifetime and printed once
+ * at first matmul dispatch.  The MTP-verifier override (Bug 2 / Option D)
+ * sits above this layer: while g_in_mtp_verifier is set, both mmq and
+ * cuBLAS are forced off so the verifier always lands on warp8 (the only
+ * path bit-identical to the drafter's training distribution).
+ */
+typedef enum {
+    DS4_Q8_STRATEGY_UNKNOWN = 0,
+    DS4_Q8_STRATEGY_MMQ,
+    DS4_Q8_STRATEGY_CUBLAS,
+    DS4_Q8_STRATEGY_WARP8,
+} ds4_q8_strategy;
+
+static ds4_q8_strategy g_q8_strategy = DS4_Q8_STRATEGY_UNKNOWN;
+
+static const char *ds4_q8_strategy_name(ds4_q8_strategy s) {
+    switch (s) {
+    case DS4_Q8_STRATEGY_MMQ:    return "mmq";
+    case DS4_Q8_STRATEGY_CUBLAS: return "cublas";
+    case DS4_Q8_STRATEGY_WARP8:  return "warp8";
+    default:                     return "unknown";
+    }
+}
+
+static int ds4_q8_env_value_is_off(const char *v) {
+    if (!v || !*v) return 0;
+    if (v[0] == '0' && v[1] == '\0') return 1;
+    if (!strcmp(v, "off")   || !strcmp(v, "OFF"))   return 1;
+    if (!strcmp(v, "no")    || !strcmp(v, "NO"))    return 1;
+    if (!strcmp(v, "false") || !strcmp(v, "FALSE")) return 1;
+    return 0;
+}
+
+static ds4_q8_strategy ds4_cuda_q8_strategy(void) {
+    if (g_q8_strategy != DS4_Q8_STRATEGY_UNKNOWN) return g_q8_strategy;
+
+    ds4_q8_strategy chosen = DS4_Q8_STRATEGY_UNKNOWN;
+    const char *reason = NULL;
+
+    const char *path = getenv("DS4_CUDA_PREFILL_PATH");
+    if (path && *path && strcmp(path, "auto") != 0 && strcmp(path, "AUTO") != 0) {
+        if (!strcmp(path, "mmq")    || !strcmp(path, "MMQ"))    { chosen = DS4_Q8_STRATEGY_MMQ;    reason = "DS4_CUDA_PREFILL_PATH=mmq"; }
+        else if (!strcmp(path, "cublas") || !strcmp(path, "CUBLAS")) { chosen = DS4_Q8_STRATEGY_CUBLAS; reason = "DS4_CUDA_PREFILL_PATH=cublas"; }
+        else if (!strcmp(path, "warp8")  || !strcmp(path, "WARP8"))  { chosen = DS4_Q8_STRATEGY_WARP8;  reason = "DS4_CUDA_PREFILL_PATH=warp8"; }
+        else fprintf(stderr, "ds4: ignoring unknown DS4_CUDA_PREFILL_PATH=%s (expected mmq|cublas|warp8|auto)\n", path);
+    }
+
+    if (chosen == DS4_Q8_STRATEGY_UNKNOWN && ds4_q8_env_value_is_off(getenv("DS4_CUDA_USE_MMQ"))) {
+        chosen = DS4_Q8_STRATEGY_CUBLAS;
+        reason = "DS4_CUDA_USE_MMQ=0 (legacy override)";
+    }
+
+    if (chosen == DS4_Q8_STRATEGY_UNKNOWN) {
+        cudaDeviceProp props;
+        cudaError_t qe = cudaGetDeviceProperties(&props, 0);
+        if (qe == cudaSuccess) {
+            /* memoryClockRate is in kHz; DDR factor of 2; bus width in bits / 8 to bytes; /1e6 to GB/s. */
+            const double bw_gbps = 2.0 * (double)props.memoryClockRate * (double)props.memoryBusWidth / 8.0 / 1.0e6;
+            if      (bw_gbps > 800.0) { chosen = DS4_Q8_STRATEGY_MMQ;    reason = "auto (memory bandwidth > 800 GB/s)"; }
+            else if (bw_gbps > 200.0) { chosen = DS4_Q8_STRATEGY_CUBLAS; reason = "auto (memory bandwidth 200..800 GB/s)"; }
+            else                      { chosen = DS4_Q8_STRATEGY_WARP8;  reason = "auto (memory bandwidth <= 200 GB/s)"; }
+            fprintf(stderr,
+                    "ds4: CUDA Q8_0 dispatch: %s (sm_%d%d, %.0f GB/s memory bandwidth) [%s]\n",
+                    ds4_q8_strategy_name(chosen), props.major, props.minor, bw_gbps, reason);
+        } else {
+            chosen = DS4_Q8_STRATEGY_MMQ;
+            reason = "auto fallback (cudaGetDeviceProperties failed)";
+            fprintf(stderr, "ds4: CUDA Q8_0 dispatch: %s [%s: %s]\n",
+                    ds4_q8_strategy_name(chosen), reason, cudaGetErrorString(qe));
+        }
+    } else {
+        fprintf(stderr, "ds4: CUDA Q8_0 dispatch: %s [%s]\n", ds4_q8_strategy_name(chosen), reason);
+    }
+
+    g_q8_strategy = chosen;
+    return chosen;
+}
+
 static int ds4_cuda_use_mmq() {
     if (g_in_mtp_verifier) return 0;  /* Bug 2 / Option D gate. */
+    if (ds4_cuda_q8_strategy() != DS4_Q8_STRATEGY_MMQ) return 0;
     if (!g_ds4_use_mmq_init) {
         g_ds4_use_mmq_init = 1;
-        const char *e = getenv("DS4_CUDA_USE_MMQ");
-        int want_off = 0;
-        if (e && *e) {
-            if (e[0] == '0' && e[1] == '\0') want_off = 1;
-            else if (!strcmp(e, "off")   || !strcmp(e, "OFF"))   want_off = 1;
-            else if (!strcmp(e, "no")    || !strcmp(e, "NO"))    want_off = 1;
-            else if (!strcmp(e, "false") || !strcmp(e, "FALSE")) want_off = 1;
-        }
-        if (want_off) {
-            fprintf(stderr, "ds4: DS4_CUDA_USE_MMQ=%s - cuda/mmq disabled, using legacy quantized matmul path\n", e);
+        int rc = ds4_mmq_init(0);
+        if (rc == 0) {
+            g_ds4_use_mmq = 1;
         } else {
-            int rc = ds4_mmq_init(0);
-            if (rc == 0) {
-                g_ds4_use_mmq = 1;
-            } else {
-                fprintf(stderr, "ds4: ds4_mmq_init failed (%d); falling back to legacy quantized matmul path\n", rc);
-            }
+            fprintf(stderr, "ds4: ds4_mmq_init failed (%d); downgrading Q8_0 dispatch to cublas\n", rc);
+            g_q8_strategy = DS4_Q8_STRATEGY_CUBLAS;
         }
     }
     return g_ds4_use_mmq;
+}
+
+static int ds4_cuda_use_cublas_q8(void) {
+    if (g_in_mtp_verifier) return 0;  /* MTP verifier wants warp8 for exactness vs drafter. */
+    return ds4_cuda_q8_strategy() == DS4_Q8_STRATEGY_CUBLAS && g_cublas_ready;
 }
 
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
@@ -7494,7 +7591,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const int force_n2_warp8 =
         n_tok == 2 &&
         getenv("DS4_CUDA_Q8_N2_WARP8") != NULL;
-    if (g_cublas_ready && n_tok > 1 && !force_native_attention_output_b && !force_n2_warp8) {
+    if (ds4_cuda_use_cublas_q8() && n_tok > 1 && !force_native_attention_output_b && !force_n2_warp8) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f32) {
             const float alpha = 1.0f;
