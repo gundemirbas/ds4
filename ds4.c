@@ -18464,8 +18464,12 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
  */
 
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(1)
+/* Version 2 appends the MTP accept-gate trio (skip counter, EWMA, sample count)
+ * at the tail so per-frontier bench snapshots restore the gate's state, not just
+ * the KV cache. Older v1 payloads still load; the fields default to zero. */
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+#define DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES (uint64_t)(sizeof(uint32_t) + sizeof(double) + sizeof(uint32_t))
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
@@ -19317,6 +19321,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += session_cpu_payload_live_tensor_bytes(s);
+        bytes += DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES;
         return bytes;
     }
 #ifdef DS4_NO_GPU
@@ -19329,6 +19334,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += session_payload_live_tensor_bytes(g, (uint32_t)s->checkpoint.len);
+    bytes += DS4_SESSION_PAYLOAD_MTP_TAIL_BYTES;
     return bytes;
 #endif
 }
@@ -19401,6 +19407,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
                 if (payload_write_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), err, errlen) != 0) return 1;
             }
         }
+        if (payload_write_u32(fp, s->mtp_accept_gate_skip, err, errlen) != 0) return 1;
+        if (payload_write_bytes(fp, &s->mtp_accept_ewma, sizeof(s->mtp_accept_ewma), err, errlen) != 0) return 1;
+        if (payload_write_u32(fp, s->mtp_accept_samples, err, errlen) != 0) return 1;
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -19524,7 +19533,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         }
     }
     free(buf);
-    return rc;
+    if (rc != 0) return rc;
+    if (payload_write_u32(fp, s->mtp_accept_gate_skip, err, errlen) != 0) return 1;
+    if (payload_write_bytes(fp, &s->mtp_accept_ewma, sizeof(s->mtp_accept_ewma), err, errlen) != 0) return 1;
+    if (payload_write_u32(fp, s->mtp_accept_samples, err, errlen) != 0) return 1;
+    return 0;
 #endif
 }
 
@@ -19538,10 +19551,11 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] == 0 || h[1] > DS4_SESSION_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
+    const uint32_t payload_version = h[1];
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];
         const uint32_t saved_prefill_cap = h[3];
@@ -19665,6 +19679,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 }
             }
         }
+        uint32_t mtp_gate_skip = 0;
+        double mtp_ewma = 0.0;
+        uint32_t mtp_samples = 0;
+        if (payload_version >= 2) {
+            if (payload_read_u32(fp, &mtp_gate_skip, &remaining, err, errlen) != 0 ||
+                payload_read_bytes(fp, &mtp_ewma, sizeof(mtp_ewma), &remaining, err, errlen) != 0 ||
+                payload_read_u32(fp, &mtp_samples, &remaining, err, errlen) != 0)
+            {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+        }
         if (remaining != 0) {
             token_vec_free(&new_checkpoint);
             payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
@@ -19674,6 +19700,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint = new_checkpoint;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        s->mtp_accept_gate_skip = mtp_gate_skip;
+        s->mtp_accept_ewma = mtp_ewma;
+        s->mtp_accept_samples = mtp_samples;
         return 0;
     }
 #ifdef DS4_NO_GPU
@@ -19841,6 +19870,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         token_vec_free(&new_checkpoint);
         return 1;
     }
+    uint32_t mtp_gate_skip = 0;
+    double mtp_ewma = 0.0;
+    uint32_t mtp_samples = 0;
+    if (payload_version >= 2) {
+        if (payload_read_u32(fp, &mtp_gate_skip, &remaining, err, errlen) != 0 ||
+            payload_read_bytes(fp, &mtp_ewma, sizeof(mtp_ewma), &remaining, err, errlen) != 0 ||
+            payload_read_u32(fp, &mtp_samples, &remaining, err, errlen) != 0)
+        {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+    }
     if (remaining != 0) {
         token_vec_free(&new_checkpoint);
         payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
@@ -19856,6 +19897,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
+    s->mtp_accept_gate_skip = mtp_gate_skip;
+    s->mtp_accept_ewma = mtp_ewma;
+    s->mtp_accept_samples = mtp_samples;
     return 0;
 #endif
 }
