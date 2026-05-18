@@ -7570,28 +7570,33 @@ static inline void ds4_cuda_moe_stream_sync_post(cudaStream_t moe_stream) {
 }
 
 static int ds4_cuda_moe_graphs_enabled(void) {
-    /* Default OFF as of 2026-05-16-rev.  The cross-stream sync hazard
-     * has since been diagnosed (g_moe_stream output buffers consumed by
-     * stream=0 kernels without an explicit wait) and is fixed by the
-     * ds4_cuda_moe_stream_sync_pre/_post() calls after each cudaGraphLaunch in
-     * this file.  The default stays OFF until that fix is validated by
-     * the proof-harness 32-token smoke + MTP acceptance sweep against
-     * the legacy path; flip the static below to 1 once validation
-     * passes.  Opt-in for testing: DS4_CUDA_MOE_GRAPHS=1 (or on / yes /
-     * true). */
+    /* Default ON as of 2026-05-18-rev2.  The earlier default-OFF
+     * (commit b66b5d6) was a safety stopgap for the cross-stream sync
+     * hazard between captured g_moe_stream kernels and stream=0
+     * consumers.  Both legs of that race (pre-launch input read and
+     * post-launch output read) are now closed by the
+     * ds4_cuda_moe_stream_sync_pre/_post() calls bracketing every
+     * cudaGraphLaunch.  Validated:
+     *   - PRO 6000 (sm_120):  32-token greedy smoke parity ON vs OFF;
+     *                         ds4-bench ctx=2048..4096: +2.06%..+2.31% gen.
+     *   - GB10    (sm_121):  32-token greedy smoke parity ON vs OFF;
+     *                         MTP-active 64-token output coherent (no
+     *                         corruption); ds4-bench ctx=2048..4096:
+     *                         +5.2%..+5.6% gen.
+     * Opt-out for diagnostics:  DS4_CUDA_MOE_GRAPHS=0 (or off / no /
+     * false). */
     static int init = 0;
-    static int enabled = 0;
+    static int enabled = 1;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_MOE_GRAPHS");
         if (s && *s &&
-            (strcmp(s, "1") == 0 ||
-             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
-             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
-             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
-            enabled = 1;
-            fprintf(stderr, "ds4: DS4_CUDA_MOE_GRAPHS=%s - graph capture enabled (experimental; "
-                            "may diverge from legacy decoded output)\n", s);
+            (strcmp(s, "0") == 0 ||
+             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0)) {
+            enabled = 0;
+            fprintf(stderr, "ds4: DS4_CUDA_MOE_GRAPHS=%s - graph capture disabled\n", s);
         }
     }
     return enabled;
