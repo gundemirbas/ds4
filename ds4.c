@@ -10239,7 +10239,8 @@ static bool metal_graph_encode_decode_ffn_half_exact(
                                                          layer->ffn_up_shexp->abs_offset,
                                                          DS4_N_EMBD,
                                                          shared_dim,
-                                                         g->ffn_norm) != 0;
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
                                                   layer->ffn_gate_shexp->abs_offset,
@@ -10431,7 +10432,8 @@ static bool metal_graph_encode_decode_ffn_shared_post_exact(
                                                          layer->ffn_up_shexp->abs_offset,
                                                          DS4_N_EMBD,
                                                          shared_dim,
-                                                         g->ffn_norm) != 0;
+                                                         g->ffn_norm,
+                                                         DS4_SWIGLU_CLAMP_EXP) != 0;
     } else {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate,
                                                   model->map,
