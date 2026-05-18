@@ -78,12 +78,55 @@ The arena allocates weights with 2&nbsp;MiB CUDA Driver VMM pages
 `ds4_weight_server` provides imported workers. On discrete GPUs this is
 worth roughly 2&times; prefill; on integrated GPUs it's neutral-to-positive.
 
+### Known trade-off: FP32 reduction-order drift vs official vectors
+
+Per-tensor VMM-allocated weight ranges produce a small but real
+**reduction-order drift** in the matmul kernels relative to the
+cudaMalloc-backed arena.  Investigation established:
+
+1. The uploaded weight bytes are byte-identical between the two
+   allocators (verified by post-upload checksum of all 138 weight
+   ranges).
+2. Kernels do not read past tensor bounds (verified by poisoning the
+   chunk tail with 0xAB instead of zero &mdash; output unchanged).
+3. The drift is shared by both the vendored mmq family and the legacy
+   `warp8` native kernels and is therefore upstream of the Q8_0
+   dispatcher.  Same drift on PRO 6000 sm_120 and GB10 sm_121.
+4. Logit-level magnitude is small (~0.08 logprob units at step 0)
+   &mdash; bounded, deterministic, of the same shape as the documented
+   mmq-vs-warp8 ULP-per-layer drift behind `DS4_CUDA_MTP_VERIFIER_USE_MMQ`
+   (Option D).  Most tokens are unaffected; only tight-margin choices
+   flip.
+
+The most plausible mechanism is L2-cache-hit / tile-arrival-order
+differences between 2&nbsp;MiB-page-aligned per-tensor VA ranges and
+sub-granularity-aligned packed allocations.  The matmul kernels split
+work across many CTAs and accumulate partial sums; FP32 is
+non-associative, so the order matters, and the order depends on the
+data's address layout.  This is structural to the kernels' parallel
+reduction strategy, not a misuse of the API.
+
+**Observable cost:** in `./ds4_test --logprob-vectors`, one of four
+test vectors (`short_code_completion`, step 1: the `c` language tag
+after triple-backticks) flips to a textually-equivalent but
+byte-different alternative under the VMM-arena default.  The other
+seven failures in that test family are pre-existing on the CUDA
+backend and reproduce identically with `DS4_CUDA_VMM_ARENA=0`.
+
+**Workaround for users who need official-vector byte equivalence:**
+set `DS4_CUDA_VMM_ARENA=0` to use the cudaMalloc-backed arena.  Prefill
+ceiling drops by ~50% on discrete GPUs in exchange for the parity.
+
+### Env vars
+
 - `DS4_CUDA_VMM_ARENA=0`. Disable; fall back to the cudaMalloc-backed
-  arena. Escape hatch for profiler quirks with VMM-mapped ranges.
+  arena.  Also the workaround for the reduction-order drift above.
 
 - `DS4_CUDA_VMM_ARENA_CHUNK_MB=N`. Minimum chunk size per `cuMemCreate`.
   Default 0 (chunk = request size, rounded up to the driver-reported
   granularity; matches the weight server's per-range allocation).
+  Values 1024+ collapse the per-tensor placement and forfeit the perf
+  benefit; useful only for bisection.
 
 - `DS4_CUDA_WEIGHT_IPC_MANIFEST=/path/to/manifest.json`. Worker-side
   import path for weights owned by `ds4_weight_server`. When set, the

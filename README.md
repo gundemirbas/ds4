@@ -81,6 +81,8 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
+- [misc/cuda-env-vars.md](misc/cuda-env-vars.md): CUDA backend env-var
+  reference and Q8_0 dispatcher behavior.
 - [misc/cuda-mtp/README.md](misc/cuda-mtp/README.md): CUDA MTP enablement,
   DGX Spark / GB10 notes, optimization flags, and benchmark method.
 - [misc/proof-harness/README.md](misc/proof-harness/README.md): generalized
