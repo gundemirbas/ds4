@@ -81,8 +81,10 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [docs/cuda-mtp/README.md](docs/cuda-mtp/README.md): CUDA MTP enablement,
+- [misc/cuda-mtp/README.md](misc/cuda-mtp/README.md): CUDA MTP enablement,
   DGX Spark / GB10 notes, optimization flags, and benchmark method.
+- [misc/proof-harness/README.md](misc/proof-harness/README.md): generalized
+  engine proof harness and weight-server lifecycle.
 - [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
   generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
