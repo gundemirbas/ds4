@@ -21269,6 +21269,11 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+/* MTP speculative-decoding helpers.  All callers live inside
+ * #ifndef DS4_NO_GPU regions (the CPU build stubs out
+ * ds4_session_eval_speculative_argmax to an empty body), so guard the
+ * helper definitions the same way to keep CPU builds warning-free. */
+#ifndef DS4_NO_GPU
 static void ds4_mtp_accept_trace(ds4_session *s,
                                   const char *path,
                                   int start,
@@ -21420,6 +21425,7 @@ static void ds4_mtp_accept_gate_record(ds4_session *s,
                 s->mtp_accept_samples);
     }
 }
+#endif /* DS4_NO_GPU */
 
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
