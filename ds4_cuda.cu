@@ -7491,17 +7491,94 @@ static cudaStream_t ds4_cuda_moe_stream(void) {
     return g_moe_stream;
 }
 
+/* Cross-stream sync events for the captured graph paths.
+ *
+ * The captured cudaGraphLaunch runs on g_moe_stream while the rest of
+ * the layer (HC expand, RoPE, head_rms_norm, KV store, attention,
+ * router select, shared SwiGLU, layer-end add) runs on stream=0.  Two
+ * data-dependency races exist:
+ *
+ *   1. POST-launch: captured kernels write down/mid/out buffers on
+ *      g_moe_stream; stream=0 kernels in the next layer body read
+ *      those buffers without an explicit wait, so they may see stale
+ *      memory if g_moe_stream hasn't drained.
+ *
+ *   2. PRE-launch: the captured graph's first kernels read x and
+ *      selected, both produced by stream=0 kernels (router_select,
+ *      previous layer's add).  cudaGraphLaunch is asynchronous, so
+ *      g_moe_stream may start executing before stream=0 has finished
+ *      writing those inputs.
+ *
+ * Empirically only fixing (1) leaves the corruption observed in
+ * commit b66b5d6 (32-token smoke garbled; MTP acceptance 301/377 ->
+ * 0/314).  Both legs are needed.
+ *
+ * Fix: bracket every cudaGraphLaunch with a pre-sync (record on
+ * stream=0, wait on g_moe_stream) and a post-sync (record on
+ * g_moe_stream, wait on stream=0).  One reusable event per direction.
+ */
+static cudaEvent_t g_moe_sync_event_pre  = NULL;
+static cudaEvent_t g_moe_sync_event_post = NULL;
+
+static cudaEvent_t ds4_cuda_moe_sync_event_pre(void) {
+    if (!g_moe_sync_event_pre) {
+        cudaError_t ge = cudaEventCreateWithFlags(&g_moe_sync_event_pre,
+                                                  cudaEventDisableTiming);
+        if (ge != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaEventCreate (moe sync pre) failed: %s\n",
+                    cudaGetErrorString(ge));
+            g_moe_sync_event_pre = NULL;
+        }
+    }
+    return g_moe_sync_event_pre;
+}
+
+static cudaEvent_t ds4_cuda_moe_sync_event_post(void) {
+    if (!g_moe_sync_event_post) {
+        cudaError_t ge = cudaEventCreateWithFlags(&g_moe_sync_event_post,
+                                                  cudaEventDisableTiming);
+        if (ge != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaEventCreate (moe sync post) failed: %s\n",
+                    cudaGetErrorString(ge));
+            g_moe_sync_event_post = NULL;
+        }
+    }
+    return g_moe_sync_event_post;
+}
+
+static inline void ds4_cuda_moe_stream_sync_pre(cudaStream_t moe_stream) {
+    /* Make g_moe_stream wait on stream=0 BEFORE the captured graph
+     * starts.  Closes the input-read race (captured kernels reading
+     * x/selected before stream=0 has finished writing them). */
+    if (moe_stream == (cudaStream_t)0) return;
+    cudaEvent_t ev = ds4_cuda_moe_sync_event_pre();
+    if (!ev) return;
+    cudaEventRecord(ev, (cudaStream_t)0);
+    cudaStreamWaitEvent(moe_stream, ev, 0);
+}
+
+static inline void ds4_cuda_moe_stream_sync_post(cudaStream_t moe_stream) {
+    /* Make stream=0 wait on g_moe_stream AFTER the captured graph
+     * finishes.  Closes the output-read race (next-layer stream=0
+     * kernels reading down/mid/out before g_moe_stream has finished
+     * writing them). */
+    if (moe_stream == (cudaStream_t)0) return;
+    cudaEvent_t ev = ds4_cuda_moe_sync_event_post();
+    if (!ev) return;
+    cudaEventRecord(ev, moe_stream);
+    cudaStreamWaitEvent((cudaStream_t)0, ev, 0);
+}
+
 static int ds4_cuda_moe_graphs_enabled(void) {
-    /* Default OFF as of 2026-05-16-rev: the earlier "10/10 bit-identical"
-     * validation only proved determinism vs the graphs-OFF baseline on the
-     * same branch.  It did NOT prove exact-byte equivalence vs the legacy
-     * path (DS4_CUDA_USE_MMQ=0).  External proof-harness validation on
-     * GB10/Spark observed gross output corruption on a 32-token smoke with
-     * graphs ON that disappears with graphs OFF, implying an undeclared
-     * cross-stream dependency in the captured region.  Re-enabling graphs
-     * requires bisecting that hazard (see local/docs).  Until then:
-     *   default: OFF
-     *   opt-in:  DS4_CUDA_MOE_GRAPHS=1  (or on / yes / true) */
+    /* Default OFF as of 2026-05-16-rev.  The cross-stream sync hazard
+     * has since been diagnosed (g_moe_stream output buffers consumed by
+     * stream=0 kernels without an explicit wait) and is fixed by the
+     * ds4_cuda_moe_stream_sync_pre/_post() calls after each cudaGraphLaunch in
+     * this file.  The default stays OFF until that fix is validated by
+     * the proof-harness 32-token smoke + MTP acceptance sweep against
+     * the legacy path; flip the static below to 1 once validation
+     * passes.  Opt-in for testing: DS4_CUDA_MOE_GRAPHS=1 (or on / yes /
+     * true). */
     static int init = 0;
     static int enabled = 0;
     if (!init) {
@@ -7788,8 +7865,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             dkey.out_ptr       = out->ptr;
             dslot = dense_graph_slot(&dkey);
             if (dslot->valid && memcmp(&dslot->key, &dkey, sizeof(dkey)) == 0) {
+                ds4_cuda_moe_stream_sync_pre(moe_stream);
                 cudaError_t ge = cudaGraphLaunch(dslot->exec, moe_stream);
                 if (ge == cudaSuccess) {
+                    ds4_cuda_moe_stream_sync_post(moe_stream);
                     dslot->hits++;
                     return 1;
                 }
@@ -7830,6 +7909,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                         dslot->exec = exec;
                         dslot->valid = 1;
                         dslot->hits = 0;
+                        ds4_cuda_moe_stream_sync_pre(moe_stream);
                         ge = cudaGraphLaunch(exec, moe_stream);
                         if (ge != cudaSuccess) {
                             fprintf(stderr, "ds4: cudaGraphLaunch (dense first) failed: %s\n",
@@ -7852,7 +7932,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             if (ge == cudaSuccess) cudaGraphDestroy(partial);
         }
 
-        if (rc == 0) return 1;
+        if (rc == 0) {
+            ds4_cuda_moe_stream_sync_post(moe_stream);
+            return 1;
+        }
         fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_vec returned %d (label='%s' in=%llu out=%llu); falling back to mmq\n",
                 rc, label ? label : "", (unsigned long long)in_dim, (unsigned long long)out_dim);
     }
@@ -12643,6 +12726,7 @@ static int routed_moe_launch(
                 if (graph_slot->valid &&
                     memcmp(&graph_slot->key, &key, sizeof(key)) == 0) {
                     /* HIT: replay the cached graph and return. */
+                    ds4_cuda_moe_stream_sync_pre(moe_stream);
                     cudaError_t ge = cudaGraphLaunch(graph_slot->exec, moe_stream);
                     if (ge != cudaSuccess) {
                         fprintf(stderr, "ds4: cudaGraphLaunch failed: %s; recapturing\n",
@@ -12651,6 +12735,7 @@ static int routed_moe_launch(
                         graph_slot->valid = 0;
                         /* fall through to capture path below */
                     } else {
+                        ds4_cuda_moe_stream_sync_post(moe_stream);
                         graph_slot->hits++;
                         return 1;
                     }
@@ -12787,6 +12872,7 @@ static int routed_moe_launch(
                         /* Execute the just-captured graph for THIS call.
                          * Capture itself does not run the kernels; we must
                          * launch the exec to actually do the work. */
+                        ds4_cuda_moe_stream_sync_pre(moe_stream);
                         ge = cudaGraphLaunch(exec, moe_stream);
                         if (ge != cudaSuccess) {
                             fprintf(stderr, "ds4: cudaGraphLaunch (first) failed: %s\n",
@@ -12802,6 +12888,7 @@ static int routed_moe_launch(
                             cudaGetErrorString(ge));
                 }
             }
+            ds4_cuda_moe_stream_sync_post(moe_stream);
             return 1;
         mmvq_decode_bail:
             /* Failure inside the mmvq decode branch: end any in-flight
