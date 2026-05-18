@@ -72,17 +72,43 @@ The bandwidth figure is informational; we don't tier on it.
 
 ## In-process VMM weight arena
 
-The arena allocates weights with 2&nbsp;MiB CUDA Driver VMM pages
-(`cuMemCreate` &rarr; `cuMemAddressReserve` &rarr; `cuMemMap` &rarr;
-`cuMemSetAccess`) matching the layout the out-of-process
-`ds4_weight_server` provides imported workers. On discrete GPUs this is
-worth roughly 2&times; prefill; on integrated GPUs it's neutral-to-positive.
+The arena allocates each weight tensor in its own CUDA Driver VMM
+region (`cuMemCreate` &rarr; `cuMemAddressReserve` &rarr; `cuMemMap`
+&rarr; `cuMemSetAccess`), giving every tensor its own
+2&nbsp;MiB-aligned virtual address.  This matches what the
+out-of-process `ds4_weight_server` provides imported workers.  On
+discrete GPUs this is worth roughly 2&times; prefill; on integrated
+GPUs it's neutral-to-positive.
+
+### Why per-tensor chunks specifically
+
+The chunk-size bisect we ran during development clarified the
+mechanism.  VMM with one large chunk (e.g.
+`DS4_CUDA_VMM_ARENA_CHUNK_MB=1792`) performs identically to the
+cudaMalloc-backed arena (~1080 t/s prefill on PRO 6000), even though
+the underlying memory is still 2&nbsp;MiB-paged.  The actual
+differentiator is **per-tensor 2&nbsp;MiB-aligned base addresses**:
+when each weight tensor sits at its own fresh
+`cuMemAddressReserve`-handed VA, matmul kernels' tile-load coalescing
+and L2 spatial-locality patterns improve enough to roughly double
+prefill.  Pack the same VMM-paged memory into one big chunk and the
+bases land at sub-granularity offsets &mdash; the perf advantage
+disappears.
+
+This also unifies cleanly with the drift below: same root cause, two
+effects you cannot separate.
 
 ### Known trade-off: FP32 reduction-order drift vs official vectors
 
 Per-tensor VMM-allocated weight ranges produce a small but real
 **reduction-order drift** in the matmul kernels relative to the
-cudaMalloc-backed arena.  Investigation established:
+cudaMalloc-backed arena.  The same cache/tile-arrival-order behavior
+that gives the 2&times; perf win also changes the order in which tile
+partial sums reach the FP32 accumulator; FP32 is non-associative, so
+the order matters.  This is structural to the kernels' parallel
+reduction strategy, not a misuse of the API.
+
+Investigation established:
 
 1. The uploaded weight bytes are byte-identical between the two
    allocators (verified by post-upload checksum of all 138 weight
@@ -97,14 +123,6 @@ cudaMalloc-backed arena.  Investigation established:
    mmq-vs-warp8 ULP-per-layer drift behind `DS4_CUDA_MTP_VERIFIER_USE_MMQ`
    (Option D).  Most tokens are unaffected; only tight-margin choices
    flip.
-
-The most plausible mechanism is L2-cache-hit / tile-arrival-order
-differences between 2&nbsp;MiB-page-aligned per-tensor VA ranges and
-sub-granularity-aligned packed allocations.  The matmul kernels split
-work across many CTAs and accumulate partial sums; FP32 is
-non-associative, so the order matters, and the order depends on the
-data's address layout.  This is structural to the kernels' parallel
-reduction strategy, not a misuse of the API.
 
 **Observable cost:** in `./ds4_test --logprob-vectors`, one of four
 test vectors (`short_code_completion`, step 1: the `c` language tag
