@@ -13068,6 +13068,20 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
+        /* Step 7 hash dump: hash the layer's output (now in g->cur_hc
+         * after the swap).  Per-layer labels are static strings; build
+         * a small lookup so labels match across runs. */
+        if (ok) {
+            static const char *layer_labels[DS4_N_LAYER] = {
+                "L00_out","L01_out","L02_out","L03_out","L04_out","L05_out","L06_out","L07_out",
+                "L08_out","L09_out","L10_out","L11_out","L12_out","L13_out","L14_out","L15_out",
+                "L16_out","L17_out","L18_out","L19_out","L20_out","L21_out","L22_out","L23_out",
+                "L24_out","L25_out","L26_out","L27_out","L28_out","L29_out","L30_out","L31_out",
+                "L32_out","L33_out","L34_out","L35_out","L36_out","L37_out","L38_out","L39_out",
+                "L40_out","L41_out","L42_out",
+            };
+            ds4_cuda_dump_hash_after(g->cur_hc, (uint64_t)DS4_N_HC * DS4_N_EMBD, layer_labels[il]);
+        }
         if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
         }
