@@ -11884,6 +11884,12 @@ static bool metal_graph_encode_output_head_norm(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
+    /* Step 7 hash probes: dump output-head intermediates to find where
+     * the captured path diverges from eager. */
+    if (ok) ds4_cuda_dump_hash_after(g->output_pre, DS4_N_HC, "OH:output_pre");
+    if (ok) ds4_cuda_dump_hash_after(g->output_weights, DS4_N_HC, "OH:output_weights");
+    if (ok) ds4_cuda_dump_hash_after(g->output_embd, DS4_N_EMBD, "OH:output_embd");
+    if (ok) ds4_cuda_dump_hash_after(g->output_norm, DS4_N_EMBD, "OH:output_norm");
     return ok;
 }
 
@@ -11915,6 +11921,9 @@ static bool metal_graph_encode_output_head_impl(
     }
     if (ok && !top2_only) {
         metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
+        /* Step 7: final logits hash - if this differs, divergence is in
+         * the output head or earlier; if not, it's in the sampler. */
+        ds4_cuda_dump_hash_after(g->logits, vocab_dim, "OH:logits");
     }
     return ok;
 }
