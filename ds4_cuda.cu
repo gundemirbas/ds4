@@ -8645,9 +8645,38 @@ static struct dense_graph_entry *dense_graph_slot(const struct dense_graph_key *
  * Step 6: ds4.c per-layer loop builds the key and wires begin/end_or_commit.
  * ------------------------------------------------------------------------ */
 
-/* Step 6: struct moved to ds4_gpu.h as `struct ds4_layer_graph_key` so
- * ds4.c can build keys for the begin_or_replay caller.  Same memory
- * layout as the original Step 5 internal struct; rename only. */
+/* Step 6: struct mirrors the public `struct ds4_layer_graph_key` decl in
+ * ds4_gpu.h byte-for-byte.  Re-declared locally because ds4_cuda.cu
+ * doesn't #include "ds4_gpu.h" (it carries its own extern "C" signatures
+ * inline); the two definitions MUST stay in lockstep.  The static_assert
+ * below catches accidental drift.  Adding a new field => update both
+ * sites and bump the asserted size. */
+struct ds4_layer_graph_key {
+    uint32_t il;
+    uint32_t n_tok;
+    uint32_t flags;
+    uint32_t _pad;
+    void    *cur_hc;
+    void    *after_ffn_hc;
+    void    *raw_cache;
+    void    *comp_cache;
+    void    *index_comp_cache;
+    void    *q;
+    void    *kv;
+    void    *heads;
+    void    *indexer_q;
+    void    *indexer_weights;
+    void    *indexer_scores;
+    void    *comp_selected;
+    void    *comp_kv_cur;
+    void    *comp_sc_cur;
+    void    *attn_state_kv;
+    void    *attn_state_score;
+    void    *index_state_kv;
+    void    *index_state_score;
+};
+static_assert(sizeof(struct ds4_layer_graph_key) == 160u,
+              "ds4_layer_graph_key must match ds4_gpu.h decl (16 B header + 18 ptrs)");
 
 struct layer_graph_entry {
     struct ds4_layer_graph_key key;
