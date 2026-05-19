@@ -649,7 +649,12 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos0,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        /* Step 4c C1: optional device-scalars override.  Decode-time
+         * caller passes ds4_gpu_decode_scalars_device_ptr(); prefill +
+         * batch callers pass NULL (kernel uses inline pos0).  Metal
+         * backend ignores the argument. */
+        const void             *scalars);
 
 int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,

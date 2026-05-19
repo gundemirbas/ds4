@@ -6800,7 +6800,10 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos0,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        const void             *scalars) {
+    (void)scalars;  /* Metal kernels read inline args; no device-scalars
+                     * substrate on this backend. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
@@ -8271,7 +8274,8 @@ int ds4_gpu_compressor_update_tensor(
                                                       head_dim,
                                                       ratio,
                                                       pos,
-                                                      1);
+                                                      1,
+                                                      NULL /* scalars: Metal ignores */);
         if (!store_ok) {
             return 0;
         }

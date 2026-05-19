@@ -6307,7 +6307,18 @@ __global__ static void compressor_store_kernel(
         uint32_t head_dim,
         uint32_t ratio,
         uint32_t pos0,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        /* Step 4c C1: optional device-scalars override.  When non-NULL the
+         * kernel reads pos0 from s->pos0 at execution time instead of using
+         * the inline arg.  Same pattern as attention's s_override from
+         * Step 4a Commit B.  Prefill callers pass NULL and keep the inline-
+         * arg path; the decode-time caller passes g_decode_dev so the
+         * kernel-node arg list bakes a session-stable pointer rather than
+         * a per-token literal. */
+        const struct ds4_decode_scalars * __restrict__ s_override) {
+    if (s_override) {
+        pos0 = s_override->pos0;
+    }
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -9825,7 +9836,14 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         uint32_t                pos0,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        /* Step 4c C1: optional device-side decode-scalars override.
+         * When non-NULL the kernel reads pos0 from s->pos0 at execution
+         * time instead of the inline pos0 arg.  Decode-time caller
+         * passes ds4_gpu_decode_scalars_device_ptr(); prefill caller
+         * passes NULL (n_tokens > 1 prefill stays inline; C3 in &sect;16
+         * is the deferred migration for that path). */
+        const void           *scalars) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         (ape_type != 0u && ape_type != 1u)) {
@@ -9857,7 +9875,8 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
             head_dim,
             ratio,
             pos0,
-            n_tokens);
+            n_tokens,
+            (const struct ds4_decode_scalars *)scalars);
     return cuda_ok(cudaGetLastError(), "compressor store launch");
 }
 
@@ -9909,9 +9928,16 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         (emit && comp_cache->bytes < comp_bytes)) {
         return 0;
     }
+    /* Step 4c C1: pass the device-side decode-scalars pointer so the
+     * compressor_store_kernel reads pos0 from g_decode_dev at execution
+     * time.  The inline `pos` arg is still forwarded for the no-override
+     * fallback path (NULL scalars) used by batch/prefill callers
+     * elsewhere; here on the decode-time emit path scalars != NULL and
+     * the kernel ignores the inline arg. */
     if (!ds4_gpu_compressor_store_batch_tensor(kv_cur, sc_cur, state_kv, state_score,
                                                  model_map, model_size, ape_offset, ape_type,
-                                                 head_dim, ratio, pos, 1)) {
+                                                 head_dim, ratio, pos, 1,
+                                                 ds4_gpu_decode_scalars_device_ptr())) {
         return 0;
     }
     if (!emit) return 1;
