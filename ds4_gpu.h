@@ -606,6 +606,11 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         uint32_t                head_dim,
         uint32_t                pos0);
 
+/* Decode-time attention shim (n_tok=1).  `scalars` is the opaque device-side
+ * decode_scalars pointer from ds4_gpu_decode_scalars_device_ptr(); when
+ * non-NULL the kernel reads n_raw, raw_start, n_comp from the struct at
+ * execution time instead of from the inline args (Step-4 / R5 invariant).
+ * Pass NULL for callers that don't participate in graph capture. */
 int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -621,7 +626,8 @@ int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        const void             *scalars);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -672,6 +678,10 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* Decode-time indexed-attention shim.  See ds4_gpu_attention_decode_heads_
+ * tensor for the `scalars` semantics.  Pass NULL for the batched/prefill
+ * callers; pass ds4_gpu_decode_scalars_device_ptr() for the in-decode-
+ * body caller. */
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -691,7 +701,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        const void             *scalars);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

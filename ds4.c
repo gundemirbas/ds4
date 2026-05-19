@@ -9781,6 +9781,9 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
+            /* Step 4: in-decode-body caller passes the device-side scalars
+             * pointer so the kernel reads n_raw/raw_start/n_comp from there
+             * at execution time (capture-safe). */
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
@@ -9800,7 +9803,8 @@ static bool metal_graph_encode_decode_layer_impl(
                     g->raw_window,
                     ds4_layer_compress_ratio(il),
                     DS4_N_HEAD,
-                    DS4_N_HEAD_DIM) != 0;
+                    DS4_N_HEAD_DIM,
+                    ds4_gpu_decode_scalars_device_ptr()) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -9820,7 +9824,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                          n_comp,
                                                          NULL,
                                                          0,
-                                                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                                                         DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                         ds4_gpu_decode_scalars_device_ptr()) != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
@@ -14224,6 +14229,9 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             if (ok) {
                 if (use_indexed_comp) {
+                    /* Out-of-decode-body caller (batch path): scalars=NULL
+                     * keeps the kernel reading inline args, identical to
+                     * pre-Step-4 behavior. */
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                               model->map,
                                                                               model->size,
@@ -14242,7 +14250,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->raw_window,
                                                                               ratio,
                                                                               DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM) != 0;
+                                                                              DS4_N_HEAD_DIM,
+                                                                              /* scalars (batch path) */ NULL) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -14354,7 +14363,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           g->raw_window,
                                                                           ratio,
                                                                           DS4_N_HEAD,
-                                                                          DS4_N_HEAD_DIM) != 0;
+                                                                          DS4_N_HEAD_DIM,
+                                                                          /* scalars (batch path) */ NULL) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -14479,7 +14489,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->raw_window,
                                                                               ratio,
                                                                               DS4_N_HEAD,
-                                                                              DS4_N_HEAD_DIM) != 0;
+                                                                              DS4_N_HEAD_DIM,
+                                                                              /* scalars (batch path) */ NULL) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,
@@ -14495,7 +14506,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  comp_mask,
                                                                  n_selected,
                                                                  DS4_N_HEAD,
-                                                                 DS4_N_HEAD_DIM) != 0;
+                                                                 DS4_N_HEAD_DIM,
+                                                                 /* scalars (batch path) */ NULL) != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);
