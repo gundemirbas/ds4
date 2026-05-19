@@ -263,7 +263,19 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
-        float                   scale);
+        float                   scale,
+        /* PC5 micro-pilot: max-grid + bounds-check substrate params.
+         *   n_comp_max -- session-stable per-layer comp_cap (upper bound
+         *                  on n_comp).  Pass 0 to opt out (legacy n_comp
+         *                  grid; decode2-exact + Metal stub).
+         *   il         -- layer index; pass UINT32_MAX for legacy path.
+         * When both are set, the CUDA backend launches the _direct
+         * kernel with grid = n_comp_max and the kernel reads the runtime
+         * count from ls->n_index_comp (PC3 substrate field).  Set the
+         * env var DS4_CUDA_PC5_LEGACY_GRID=1 to force the legacy path
+         * for A/B perf measurement. */
+        uint32_t                n_comp_max,
+        uint32_t                il);
 
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,

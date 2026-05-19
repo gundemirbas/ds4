@@ -4611,7 +4611,10 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
-        float                   scale) {
+        float                   scale,
+        uint32_t                n_comp_max,
+        uint32_t                il) {
+    (void)n_comp_max; (void)il;  /* PC5: Metal reads inline n_comp; no max-grid substrate. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_head == 0 || head_dim == 0) {

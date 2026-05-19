@@ -9738,7 +9738,9 @@ static bool metal_graph_encode_decode_layer_impl(
                                                                 g->layer_n_index_comp[il],
                                                                 DS4_N_INDEXER_HEAD,
                                                                 DS4_N_INDEXER_HEAD_DIM,
-                                                                index_scale) != 0;
+                                                                index_scale,
+                                                                g->layer_comp_cap[il],  /* PC5: per-layer max for grid bound */
+                                                                il                      /* PC5: substrate index for ls_override */) != 0;
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
@@ -14490,7 +14492,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             cur_index,
                                                             DS4_N_INDEXER_HEAD,
                                                             DS4_N_INDEXER_HEAD_DIM,
-                                                            index_scale) != 0 &&
+                                                            index_scale,
+                                                            0u,           /* PC5: decode2-exact, legacy n_comp grid */
+                                                            UINT32_MAX    /* PC5: no substrate */) != 0 &&
                          ds4_gpu_indexer_topk_tensor(g->comp_selected,
                                                        g->indexer_scores,
                                                        cur_index,

@@ -6965,14 +6965,22 @@ __global__ static void indexer_score_one_direct_kernel(
         uint32_t pos0,
         uint32_t ratio,
         float scale,
-        int causal) {
+        int causal,
+        /* PC5 micro-pilot: optional per-layer substrate override.  When
+         * non-NULL the kernel reads the runtime indexer count from
+         * ls_override->n_index_comp instead of the inline n_comp arg.
+         * Lets the shim launch with a session-stable max grid (e.g.
+         * comp_cap) for capture-safety while preserving correctness
+         * via this bounds check.  NULL = legacy path (n_comp == grid).*/
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     const uint32_t c = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
-    if (c >= n_comp || tid >= 128u) return;
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
+    if (c >= n_actual || tid >= 128u) return;
     if (causal) {
-        const uint32_t visible = ratio ? (pos0 + 1u) / ratio : n_comp;
+        const uint32_t visible = ratio ? (pos0 + 1u) / ratio : n_actual;
         if (c >= visible) {
             if (tid == 0) scores[c] = -INFINITY;
             return;
@@ -7986,7 +7994,15 @@ static int indexer_scores_launch(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale,
-        uint32_t                causal) {
+        uint32_t                causal,
+        /* PC5 micro-pilot: max-grid + bounds-check substrate params for
+         * the _direct fast path.
+         *   n_comp_max  -- session-stable upper bound on n_comp (per-layer
+         *                  comp_cap from ds4.c).  0 = legacy n_comp grid.
+         *   il          -- layer index for ls_override read; UINT32_MAX
+         *                  signals "no substrate" (legacy path). */
+        uint32_t                n_comp_max,
+        uint32_t                il) {
     if (!scores || !q || !weights || !index_comp ||
         n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -7998,12 +8014,25 @@ static int indexer_scores_launch(
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
-        indexer_score_one_direct_kernel<<<n_comp, 128, 0, ds4_current_stream()>>>((float *)scores->ptr,
-                                                         (const float *)q->ptr,
-                                                         (const float *)weights->ptr,
-                                                         (const float *)index_comp->ptr,
-                                                         n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0);
+        /* PC5: max-grid path is active when (a) shim caller plumbed a
+         * substrate index, (b) the per-layer max is non-zero, (c) the
+         * substrate is allocated, and (d) the user hasn't opted out via
+         * DS4_CUDA_PC5_LEGACY_GRID.  Otherwise legacy n_comp grid. */
+        const bool pc5_active =
+            (g_layer_dev != NULL) &&
+            (il < DS4_LAYER_SCALARS_COUNT) &&
+            (n_comp_max != 0u) &&
+            (getenv("DS4_CUDA_PC5_LEGACY_GRID") == NULL);
+        const uint32_t grid_dim = pc5_active ? n_comp_max : n_comp;
+        const struct ds4_layer_scalars *ls = pc5_active
+            ? (g_layer_dev + il) : NULL;
+        indexer_score_one_direct_kernel<<<grid_dim, 128, 0, ds4_current_stream()>>>(
+                (float *)scores->ptr,
+                (const float *)q->ptr,
+                (const float *)weights->ptr,
+                (const float *)index_comp->ptr,
+                n_comp, pos0, ratio,
+                scale, causal ? 1 : 0, ls);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
@@ -8064,9 +8093,15 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         uint32_t                n_comp,
         uint32_t                n_head,
         uint32_t                head_dim,
-        float                   scale) {
+        float                   scale,
+        /* PC5 micro-pilot: substrate params for the max-grid + bounds-
+         * check path.  Decode1 caller passes (g->layer_comp_cap[il], il);
+         * decode2-exact + Metal stub pass (0, UINT32_MAX) for legacy. */
+        uint32_t                n_comp_max,
+        uint32_t                il) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
-                                 n_head, head_dim, 1, scale, 0);
+                                 n_head, head_dim, 1, scale, 0,
+                                 n_comp_max, il);
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
@@ -8080,8 +8115,11 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    /* PC5: prefill never hits the _direct path (n_tokens > 1).  Pass
+     * legacy (0, UINT32_MAX) so n_comp_max never activates. */
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
-                                 n_head, head_dim, ratio, scale, 1);
+                                 n_head, head_dim, ratio, scale, 1,
+                                 0u, UINT32_MAX);
 }
 
 extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -8096,8 +8134,10 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    /* PC5: batch path never hits the _direct kernel either (n_tokens > 1). */
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
-                                 n_head, head_dim, ratio, scale, 1);
+                                 n_head, head_dim, ratio, scale, 1,
+                                 0u, UINT32_MAX);
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
