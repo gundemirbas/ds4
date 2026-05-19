@@ -685,7 +685,7 @@ static const __half *cuda_q8_f16_ptr(
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256>>>(dev,
+    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(dev,
                                                           (const unsigned char *)q8,
                                                           in_dim,
                                                           out_dim,
@@ -748,7 +748,7 @@ static float *cuda_q8_f32_ptr(
     }
     const uint64_t blocks = (in_dim + 31) / 32;
     const uint64_t n = in_dim * out_dim;
-    dequant_q8_0_to_f32_kernel<<<(n + 255) / 256, 256>>>(dev,
+    dequant_q8_0_to_f32_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(dev,
                                                           (const unsigned char *)q8,
                                                           in_dim,
                                                           out_dim,
@@ -1741,7 +1741,7 @@ extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
-    fill_f32_kernel<<<(count + 255u) / 256u, 256>>>((float *)tensor->ptr, count, value);
+    fill_f32_kernel<<<(count + 255u) / 256u, 256, 0, ds4_current_stream()>>>((float *)tensor->ptr, count, value);
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
@@ -7069,7 +7069,7 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    embed_token_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
@@ -7095,7 +7095,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
                                             "token_embd");
     if (!wptr) return 0;
     uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
-    embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
+    embed_tokens_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
         (float *)out_hc->ptr,
         (const int32_t *)tokens_t->ptr,
         (const __half *)wptr,
@@ -7127,7 +7127,7 @@ static int indexer_scores_launch(
     if (causal && ratio == 0) return 0;
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_DIRECT_ONE") == NULL) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
+        indexer_score_one_direct_kernel<<<n_comp, 128, 0, ds4_current_stream()>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
@@ -7139,7 +7139,7 @@ static int indexer_scores_launch(
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
             dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
-            indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
+            indexer_scores_wmma128_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
                                                          (const float *)weights->ptr,
                                                          (const float *)index_comp->ptr,
@@ -7148,7 +7148,7 @@ static int indexer_scores_launch(
             return cuda_ok(cudaGetLastError(), "indexer scores wmma128 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA64") == NULL) {
             dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1);
-            indexer_scores_wmma64_kernel<<<grid, 128>>>((float *)scores->ptr,
+            indexer_scores_wmma64_kernel<<<grid, 128, 0, ds4_current_stream()>>>((float *)scores->ptr,
                                                         (const float *)q->ptr,
                                                         (const float *)weights->ptr,
                                                         (const float *)index_comp->ptr,
@@ -7157,7 +7157,7 @@ static int indexer_scores_launch(
             return cuda_ok(cudaGetLastError(), "indexer scores wmma64 launch");
         } else if (getenv("DS4_CUDA_NO_INDEXER_WMMA32") == NULL) {
             dim3 grid((n_comp + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
-            indexer_scores_wmma32_kernel<<<grid, 64>>>((float *)scores->ptr,
+            indexer_scores_wmma32_kernel<<<grid, 64, 0, ds4_current_stream()>>>((float *)scores->ptr,
                                                        (const float *)q->ptr,
                                                        (const float *)weights->ptr,
                                                        (const float *)index_comp->ptr,
@@ -7166,7 +7166,7 @@ static int indexer_scores_launch(
             return cuda_ok(cudaGetLastError(), "indexer scores wmma32 launch");
         } else {
             dim3 grid((n_comp + 15u) / 16u, (n_tokens + 15u) / 16u, 1);
-            indexer_scores_wmma_kernel<<<grid, 32>>>((float *)scores->ptr,
+            indexer_scores_wmma_kernel<<<grid, 32, 0, ds4_current_stream()>>>((float *)scores->ptr,
                                                      (const float *)q->ptr,
                                                      (const float *)weights->ptr,
                                                      (const float *)index_comp->ptr,
@@ -7176,7 +7176,7 @@ static int indexer_scores_launch(
         }
     }
     dim3 grid(n_comp, n_tokens, 1);
-    indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
+    indexer_scores_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)scores->ptr,
                                          (const float *)q->ptr,
                                          (const float *)weights->ptr,
                                          (const float *)index_comp->ptr,
@@ -7243,14 +7243,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     }
     if (top_k == 512u && n_comp <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
-        indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_1024_kernel<<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
     if (top_k == 512u && n_comp <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
-        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
@@ -7273,14 +7273,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
                                                            n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
@@ -7304,14 +7304,14 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
         }
-        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
                                                                n_comp, n_tokens, top_k);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
@@ -7336,7 +7336,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         n_sets = n_chunks;
         uint32_t cur_stride = candidate_stride;
         dim3 grid_chunks(n_tokens, n_chunks, 1);
-        indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024>>>(cur,
+        indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024, 0, ds4_current_stream()>>>(cur,
                                                                     (const float *)scores->ptr,
                                                                     n_comp,
                                                                     n_tokens,
@@ -7349,7 +7349,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             const uint32_t next_stride = next_sets * top_k;
             uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
             dim3 grid_merge(n_tokens, next_sets, 1);
-            indexer_topk_tree_merge_pow2_kernel<4096><<<grid_merge, 1024>>>(
+            indexer_topk_tree_merge_pow2_kernel<4096><<<grid_merge, 1024, 0, ds4_current_stream()>>>(
                     next,
                     cur,
                     (const float *)scores->ptr,
@@ -7366,7 +7366,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
             cur_stride = next_stride;
         }
 
-        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
+        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                  cur,
                                                                  (const float *)scores->ptr,
                                                                  n_comp,
@@ -7376,7 +7376,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                  cur_stride);
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
-    indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
+    indexer_topk_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
@@ -7396,7 +7396,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
     uint64_t n = (uint64_t)n_tokens * n_comp;
     uint64_t nk = (uint64_t)n_tokens * top_k;
     uint64_t blocks = ((n > nk ? n : nk) + 255) / 256;
-    topk_mask_kernel<<<blocks, 256>>>((float *)mask->ptr,
+    topk_mask_kernel<<<blocks, 256, 0, ds4_current_stream()>>>((float *)mask->ptr,
                                       (const uint32_t *)topk->ptr,
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
@@ -8040,7 +8040,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             const uint64_t xh_count = n_tok * in_dim;
             __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
             if (!xh) return 0;
-            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+            f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, ds4_current_stream()>>>(xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
             const float alpha = 1.0f;
             const float beta = 0.0f;
@@ -8081,10 +8081,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
-        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+        matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -8096,7 +8096,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
     }
     if (n_tok == 2 && force_n2_warp8) {
-        matmul_q8_0_preq_n2_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+        matmul_q8_0_preq_n2_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -8109,7 +8109,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
-        matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
+        matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256, 0, ds4_current_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -8124,7 +8124,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     if (n_tok == 2 &&
         cuda_q8_label_is_attention_output_b(label) &&
         g_attention_output_b_n2_q8_override) {
-        matmul_q8_0_preq_n2_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+        matmul_q8_0_preq_n2_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
                 xq,
@@ -8136,7 +8136,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 n2 warp launch");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,
+    matmul_q8_0_preq_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)out->ptr,
                                            reinterpret_cast<const unsigned char *>(wptr),
                                            xq,
                                            xscale,
@@ -8175,9 +8175,9 @@ extern "C" int ds4_gpu_matmul_q8_0_top2_tensor(ds4_gpu_tensor *top2, const void 
     float *xscale = (float *)((char *)tmp + scale_offset);
     ds4_gpu_top2_result *candidates = (ds4_gpu_top2_result *)((char *)tmp + candidate_offset);
 
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "q8_0 top2 quantize launch")) return 0;
-    matmul_q8_0_top2_warp8_kernel<<<(unsigned)candidate_count, 256>>>(
+    matmul_q8_0_top2_warp8_kernel<<<(unsigned)candidate_count, 256, 0, ds4_current_stream()>>>(
             candidates,
             reinterpret_cast<const unsigned char *>(wptr),
             xq,
@@ -8187,7 +8187,7 @@ extern "C" int ds4_gpu_matmul_q8_0_top2_tensor(ds4_gpu_tensor *top2, const void 
             blocks,
             cuda_q8_use_dp4a());
     if (!cuda_ok(cudaGetLastError(), "q8_0 top2 matmul launch")) return 0;
-    q8_0_top2_merge_kernel<<<1, 1024>>>((ds4_gpu_top2_result *)top2->ptr,
+    q8_0_top2_merge_kernel<<<1, 1024, 0, ds4_current_stream()>>>((ds4_gpu_top2_result *)top2->ptr,
                                         candidates,
                                         (uint32_t)candidate_count);
     return cuda_ok(cudaGetLastError(), "q8_0 top2 merge launch");
@@ -8234,9 +8234,9 @@ extern "C" int ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(
     ds4_gpu_top2_result *candidates = (ds4_gpu_top2_result *)((char *)tmp + candidate_offset);
 
     dim3 qgrid((unsigned)blocks, 2u, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x2->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x2->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "q8_0 top2 logits n2 quantize launch")) return 0;
-    matmul_q8_0_top2_logits_n2_warp8_kernel<<<(unsigned)candidate_count, 256>>>(
+    matmul_q8_0_top2_logits_n2_warp8_kernel<<<(unsigned)candidate_count, 256, 0, ds4_current_stream()>>>(
             candidates,
             (float *)row1_logits->ptr,
             reinterpret_cast<const unsigned char *>(wptr),
@@ -8247,7 +8247,7 @@ extern "C" int ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(
             blocks,
             cuda_q8_use_dp4a());
     if (!cuda_ok(cudaGetLastError(), "q8_0 top2 logits n2 matmul launch")) return 0;
-    q8_0_top2_merge_kernel<<<1, 1024>>>((ds4_gpu_top2_result *)row0_top2->ptr,
+    q8_0_top2_merge_kernel<<<1, 1024, 0, ds4_current_stream()>>>((ds4_gpu_top2_result *)row0_top2->ptr,
                                         candidates,
                                         (uint32_t)candidate_count);
     return cuda_ok(cudaGetLastError(), "q8_0 top2 logits n2 merge launch");
@@ -8287,9 +8287,9 @@ extern "C" int ds4_gpu_matmul_q8_0_candidates_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
 
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "q8_0 candidates quantize launch")) return 0;
-    matmul_q8_0_candidates_warp8_kernel<<<(candidate_count + 7u) / 8u, 256>>>(
+    matmul_q8_0_candidates_warp8_kernel<<<(candidate_count + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
             (float *)out->ptr,
             (const uint32_t *)candidate_ids->ptr,
             candidate_count,
@@ -8323,7 +8323,7 @@ extern "C" int ds4_gpu_q8_0_row_group_norms_tensor(
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0 row group norms");
     if (!wptr) return 0;
 
-    q8_0_row_group_norms_warp_kernel<<<(unsigned)out_dim, 512>>>(
+    q8_0_row_group_norms_warp_kernel<<<(unsigned)out_dim, 512, 0, ds4_current_stream()>>>(
             (float *)row_group_norms->ptr,
             reinterpret_cast<const unsigned char *>(wptr),
             in_dim,
@@ -8412,16 +8412,16 @@ extern "C" int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
     float *candidate_logits = (float *)((char *)tmp + cand_logit_offset);
     ds4_gpu_top2_result *cert_candidates = (ds4_gpu_top2_result *)((char *)tmp + candidates_offset);
 
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "q8_0 cert quantize launch")) return 0;
-    q8_0_x_group_norms_kernel<<<group_count, 256>>>(x_group_norms,
+    q8_0_x_group_norms_kernel<<<group_count, 256, 0, ds4_current_stream()>>>(x_group_norms,
                                                     xq,
                                                     xscale,
                                                     in_dim,
                                                     blocks,
                                                     group_count);
     if (!cuda_ok(cudaGetLastError(), "q8_0 cert x norms launch")) return 0;
-    matmul_q8_0_candidates_warp8_kernel<<<1, 256>>>(
+    matmul_q8_0_candidates_warp8_kernel<<<1, 256, 0, ds4_current_stream()>>>(
             candidate_logits,
             (const uint32_t *)candidate_ids->ptr,
             1u,
@@ -8433,7 +8433,7 @@ extern "C" int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
             blocks,
             cuda_q8_use_dp4a());
     if (!cuda_ok(cudaGetLastError(), "q8_0 cert candidate launch")) return 0;
-    q8_0_candidate_certify_prune_warp8_kernel<<<(unsigned)candidate_count, 256>>>(
+    q8_0_candidate_certify_prune_warp8_kernel<<<(unsigned)candidate_count, 256, 0, ds4_current_stream()>>>(
             cert_candidates,
             candidate_logits,
             (const uint32_t *)candidate_ids->ptr,
@@ -8448,7 +8448,7 @@ extern "C" int ds4_gpu_matmul_q8_0_candidate_certify_tensor(
             group_count,
             cuda_q8_use_dp4a());
     if (!cuda_ok(cudaGetLastError(), "q8_0 cert prune launch")) return 0;
-    q8_0_candidate_certify_merge_kernel<<<1, 1024>>>(
+    q8_0_candidate_certify_merge_kernel<<<1, 1024, 0, ds4_current_stream()>>>(
             (ds4_gpu_candidate_cert_result *)result->ptr,
             cert_candidates,
             (uint32_t)candidate_count,
@@ -8500,11 +8500,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     if (n_tok == 1) {
-        matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
+        matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
                 (float *)out0->ptr,
                 (float *)out1->ptr,
                 reinterpret_cast<const unsigned char *>(w0),
@@ -8518,7 +8518,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                 use_dp4a);
     } else {
         dim3 grid(((unsigned)max_out + 7u) / 8u, (unsigned)n_tok, 1);
-        matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256>>>(
+        matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
                 (float *)out0->ptr,
                 (float *)out1->ptr,
                 reinterpret_cast<const unsigned char *>(w0),
@@ -8580,9 +8580,9 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+    matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, ds4_current_stream()>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -8698,10 +8698,10 @@ static int cuda_matmul_q8_0_hc_expand_n2_split_residual_tensor_labeled(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, 2u, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand_n2 quantize launch")) return 0;
     dim3 grid(((unsigned)out_dim + 7u) / 8u, 2u, 1u);
-    matmul_q8_0_hc_expand_preq_n2_warp8_kernel<<<grid, 256>>>(
+    matmul_q8_0_hc_expand_preq_n2_warp8_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             (const float *)residual0_hc->ptr,
@@ -8744,7 +8744,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
-        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
+        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256, 0, ds4_current_stream()>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -8771,14 +8771,14 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     if (serial_f16 || serial_router) {
-        matmul_f16_serial_kernel<<<grid, 1>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+        matmul_f16_serial_kernel<<<grid, 1, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
     }
     if (ordered_router) {
-        matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+        matmul_f16_ordered_chunks_kernel<<<grid, 32, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
-    matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+    matmul_f16_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
@@ -8821,7 +8821,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
-    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
+    matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32, 0, ds4_current_stream()>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
         w0,
@@ -8865,7 +8865,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
         return cublas_ok(st, "f32 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
-    matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
+    matmul_f32_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
 
@@ -8876,20 +8876,20 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
         return 0;
     }
     uint64_t n = (uint64_t)n_embd * n_hc;
-    repeat_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
+    repeat_hc_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc launch");
 }
 
 extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * sizeof(float) ||
         x->bytes < (uint64_t)n * sizeof(float)) return 0;
-    rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
+    rms_norm_plain_kernel<<<1, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!out || !x || out->bytes < (uint64_t)n * rows * sizeof(float) ||
         x->bytes < (uint64_t)n * rows * sizeof(float)) return 0;
-    rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
+    rms_norm_plain_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
@@ -8900,7 +8900,7 @@ extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
+    rms_norm_weight_kernel<<<1, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, 1, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
@@ -8911,7 +8911,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
@@ -8945,7 +8945,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
                 kv_weight_offset, (uint64_t)kv_n * sizeof(float), "kv_rms_weight");
         if (!q_w || !kv_w) return 0;
         dim3 grid(rows, 2u, 1u);
-        dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
+        dsv4_qkv_rms_norm_rows_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
                 (float *)q_out->ptr,
                 (const float *)q->ptr,
                 q_w,
@@ -8965,18 +8965,18 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
 }
 extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     if (!x || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
+    head_rms_norm_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm launch");
 }
 extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
     if (!x || n_rot > head_dim || (n_rot & 1u) ||
         x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
-    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
-    fp8_kv_quantize_kernel<<<n_tok, 64>>>((float *)x->ptr, n_tok, head_dim, n_rot);
+    fp8_kv_quantize_kernel<<<n_tok, 64, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
@@ -8984,13 +8984,13 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, n_rows, head_dim);
+    indexer_hadamard_fp4_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>((float *)x->ptr, n_rows, head_dim);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
 }
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
-    rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+    rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
@@ -9008,7 +9008,7 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
+    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
@@ -9016,7 +9016,7 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     uint64_t n = (uint64_t)n_tokens * head_dim;
-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
+    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
 extern "C" int ds4_gpu_compressor_store_batch_tensor(
@@ -9052,7 +9052,7 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
     if (!ape) return 0;
     uint64_t n = (uint64_t)n_tokens * width;
-    compressor_store_kernel<<<(n + 255) / 256, 256>>>(
+    compressor_store_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (const float *)kv->ptr,
             (const float *)sc->ptr,
             (float *)state_kv->ptr,
@@ -9126,7 +9126,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             (uint64_t)comp_row * head_dim * sizeof(float),
             (uint64_t)head_dim * sizeof(float));
     if (!comp_row_view) return 0;
-    compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256>>>(
+    compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)comp_row_view->ptr,
             (const float *)state_kv->ptr,
             (const float *)state_score->ptr,
@@ -9143,7 +9143,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     ds4_gpu_tensor_free(comp_row_view);
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;
-        compressor_shift_ratio4_kernel<<<(half + 255) / 256, 256>>>(
+        compressor_shift_ratio4_kernel<<<(half + 255) / 256, 256, 0, ds4_current_stream()>>>(
                 (float *)state_kv->ptr, (float *)state_score->ptr, width);
         ok = cuda_ok(cudaGetLastError(), "compressor ratio4 shift launch");
     }
@@ -9206,16 +9206,16 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     if (!ape) return 0;
 
     uint64_t state_n = (uint64_t)state_rows * width;
-    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),
+    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float)), ds4_current_stream()),
                  "compressor state kv zero")) return 0;
-    fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_score->ptr, state_n, -INFINITY);
+    fill_f32_kernel<<<(state_n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)state_score->ptr, state_n, -INFINITY);
     if (!cuda_ok(cudaGetLastError(), "compressor state score fill launch")) return 0;
 
     if (ratio == 4u) {
         if (cutoff >= ratio) {
             uint32_t prev_start = cutoff - ratio;
             uint64_t n = (uint64_t)ratio * width;
-            compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
+            compressor_set_rows_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
                     (float *)state_kv->ptr, (float *)state_score->ptr,
                     (const float *)kv->ptr, (const float *)sc->ptr,
                     ape, 0, ape_type, width, ratio, pos0,
@@ -9224,7 +9224,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         }
         if (rem != 0) {
             uint64_t n = (uint64_t)rem * width;
-            compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
+            compressor_set_rows_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
                     (float *)state_kv->ptr, (float *)state_score->ptr,
                     (const float *)kv->ptr, (const float *)sc->ptr,
                     ape, 0, ape_type, width, ratio, pos0,
@@ -9233,7 +9233,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         }
     } else if (rem != 0) {
         uint64_t n = (uint64_t)rem * width;
-        compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
+        compressor_set_rows_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
                 (float *)state_kv->ptr, (float *)state_score->ptr,
                 (const float *)kv->ptr, (const float *)sc->ptr,
                 ape, 0, ape_type, width, ratio, pos0,
@@ -9242,7 +9242,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     }
     if (n_comp != 0) {
         dim3 grid((head_dim + 255) / 256, n_comp, 1);
-        compressor_prefill_pool_kernel<<<grid, 256>>>(
+        compressor_prefill_pool_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
                 (float *)comp_cache->ptr,
                 (const float *)kv->ptr,
                 (const float *)sc->ptr,
@@ -9255,7 +9255,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
                                                    head_dim, n_comp, rms_eps)) return 0;
         if (n_rot != 0) {
             const uint32_t pairs = n_comp * (n_rot / 2u);
-            rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+            rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>(
                     (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                     pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
@@ -9317,7 +9317,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
     if (!ape) return 0;
     dim3 grid((head_dim + 255) / 256, n_comp, 1);
-    compressor_prefill_pool_kernel<<<grid, 256>>>(
+    compressor_prefill_pool_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
             (float *)comp_cache->ptr,
             (const float *)kv->ptr,
             (const float *)sc->ptr,
@@ -9330,7 +9330,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                                                head_dim, n_comp, rms_eps)) return 0;
     if (n_rot != 0) {
         const uint32_t pairs = n_comp * (n_rot / 2u);
-        rope_tail_kernel<<<(pairs + 255) / 256, 256>>>(
+        rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>(
                 (float *)comp_cache->ptr, n_comp, 1, head_dim, n_rot,
                 pos0, ratio, n_ctx_orig, 0, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow);
@@ -9339,13 +9339,13 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
 
     uint64_t state_n = (uint64_t)state_rows * width;
-    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),
+    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float)), ds4_current_stream()),
                  "compressor replay state kv zero")) return 0;
-    fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_score->ptr, state_n, -INFINITY);
+    fill_f32_kernel<<<(state_n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)state_score->ptr, state_n, -INFINITY);
     if (!cuda_ok(cudaGetLastError(), "compressor replay state score fill launch")) return 0;
     uint32_t prev_start = n_tokens - ratio;
     uint64_t n = (uint64_t)ratio * width;
-    compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
+    compressor_set_rows_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)state_kv->ptr, (float *)state_score->ptr,
             (const float *)kv->ptr, (const float *)sc->ptr,
             ape, 0, ape_type, width, ratio, pos0,
@@ -9382,12 +9382,12 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
     const char *ape = cuda_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
     if (!ape) return 0;
     uint64_t state_n = (uint64_t)state_rows * width;
-    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),
+    if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float)), ds4_current_stream()),
                  "compressor state kv zero")) return 0;
-    fill_f32_kernel<<<(state_n + 255) / 256, 256>>>((float *)state_score->ptr, state_n, -INFINITY);
+    fill_f32_kernel<<<(state_n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)state_score->ptr, state_n, -INFINITY);
     if (!cuda_ok(cudaGetLastError(), "compressor state score fill launch")) return 0;
     uint64_t n = (uint64_t)ratio * width;
-    compressor_set_rows_kernel<<<(n + 255) / 256, 256>>>(
+    compressor_set_rows_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)state_kv->ptr, (float *)state_score->ptr,
             (const float *)kv_tail->ptr, (const float *)sc_tail->ptr,
             ape, 0, ape_type, width, ratio, pos0,
@@ -9428,7 +9428,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(1, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
@@ -9449,7 +9449,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         return 0;
     }
     dim3 grid(1, n_head, 1);
-    attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_decode_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
@@ -9474,7 +9474,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+        attention_static_mixed_heads8_online_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -9521,7 +9521,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                       (int)n_head);
         if (!cublas_ok(st, "attention raw score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
-        attention_prefill_raw_softmax_kernel<<<sgrid, 256>>>(scores, sinks, n_tokens, window, n_keys);
+        attention_prefill_raw_softmax_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(scores, sinks, n_tokens, window, n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention raw softmax launch")) return 0;
         const float one = 1.0f;
         st = cublasSgemmStridedBatched(g_cublas,
@@ -9544,7 +9544,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                        (int)n_head);
         if (!cublas_ok(st, "attention raw value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
-        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
+        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                         out_tmp,
                                                                         n_tokens,
                                                                         n_head,
@@ -9552,7 +9552,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         return cuda_ok(cudaGetLastError(), "attention raw unpack launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_prefill_raw_kernel<<<grid, 128>>>((float *)heads->ptr,
+    attention_prefill_raw_kernel<<<grid, 128, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                 sinks,
                                                 (const float *)q->ptr,
                                                 (const float *)raw_kv->ptr,
@@ -9599,7 +9599,7 @@ static int attention_decode_batch_launch(
         if (!use_comp_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
-            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256>>>((float *)heads->ptr,
+            attention_decode_mixed_heads8_online_kernel<<<online_grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                               sinks,
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
@@ -9623,7 +9623,7 @@ static int attention_decode_batch_launch(
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+        attention_decode_mixed_heads8_online_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -9641,7 +9641,7 @@ static int attention_decode_batch_launch(
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_decode_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_decode_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                  sinks,
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
@@ -9741,7 +9741,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
         if (!sorted) return 0;
-        indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
+        indexed_topk_sort_512_asc_kernel<<<n_tokens, 512, 0, ds4_current_stream()>>>(sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
@@ -9749,7 +9749,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
+            attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                                sinks,
                                                                                (const float *)q->ptr,
                                                                                (const float *)raw_kv->ptr,
@@ -9769,7 +9769,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_indexed_mixed_heads8_rb4_kernel<<<grid, 256>>>((float *)heads->ptr,
+        attention_indexed_mixed_heads8_rb4_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                  sinks,
                                                                  (const float *)q->ptr,
                                                                  (const float *)raw_kv->ptr,
@@ -9789,7 +9789,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_indexed_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
@@ -9843,7 +9843,7 @@ static int attention_prefill_mixed_launch(
         getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL &&
         (getenv("DS4_CUDA_WINDOW_ATTENTION") != NULL || (!g_quality_mode && n_tokens >= 128u))) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+        attention_static_mixed_heads8_online_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -9872,7 +9872,7 @@ static int attention_prefill_mixed_launch(
         float *kv = tmp;
         float *scores = (float *)((char *)tmp + score_offset);
         float *out_tmp = (float *)((char *)tmp + out_offset);
-        attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256>>>(
+        attention_prefill_pack_mixed_kv_kernel<<<(kv_count + 255) / 256, 256, 0, ds4_current_stream()>>>(
                 kv,
                 (const float *)raw_kv->ptr,
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
@@ -9902,7 +9902,7 @@ static int attention_prefill_mixed_launch(
                                                       (int)n_head);
         if (!cublas_ok(st, "attention mixed score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
-        attention_prefill_mixed_softmax_kernel<<<sgrid, 256>>>(
+        attention_prefill_mixed_softmax_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
                 scores,
                 sinks,
                 use_comp_mask ? (const float *)comp_mask->ptr : NULL,
@@ -9934,7 +9934,7 @@ static int attention_prefill_mixed_launch(
                                        (int)n_head);
         if (!cublas_ok(st, "attention mixed value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
-        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
+        attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                                         out_tmp,
                                                                         n_tokens,
                                                                         n_head,
@@ -9942,7 +9942,7 @@ static int attention_prefill_mixed_launch(
         return cuda_ok(cudaGetLastError(), "attention mixed unpack launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_prefill_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    attention_prefill_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
@@ -10052,7 +10052,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
         __half *heads_h = (__half *)tmp;
-        attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
+        attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256, 0, ds4_current_stream()>>>(
                 heads_h,
                 (const float *)heads->ptr,
                 n_tokens,
@@ -10096,14 +10096,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         float *xscale = (float *)((char *)tmp + scale_offset);
         const int use_dp4a = cuda_q8_use_dp4a();
         dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
+        quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(xq,
                                                 xscale,
                                                 (const float *)heads->ptr,
                                                 group_dim,
                                                 blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
         dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
-        grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+        grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
                                                           out_a,
                                                           xq,
                                                           xscale,
@@ -10162,14 +10162,14 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(xq,
                                             xscale,
                                             (const float *)heads->ptr,
                                             group_dim,
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
-    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
                                                       out_a,
                                                       xq,
                                                       xscale,
@@ -10219,14 +10219,14 @@ extern "C" int ds4_gpu_attention_output_low_q8_batch_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, ds4_current_stream()>>>(xq,
                                             xscale,
                                             (const float *)heads->ptr,
                                             group_dim,
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8_batch prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
-    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+    grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, ds4_current_stream()>>>((float *)low->ptr,
                                                       out_a,
                                                       xq,
                                                       xscale,
@@ -10244,7 +10244,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
         up->bytes < (uint64_t)n * sizeof(float)) return 0;
-    swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
+    swiglu_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
@@ -10278,7 +10278,7 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
         out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
         b->bytes < (uint64_t)n * sizeof(float)) return 0;
-    add_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+    add_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
     return cuda_ok(cudaGetLastError(), "add launch");
 }
 extern "C" int ds4_gpu_directional_steering_project_tensor(
@@ -10295,7 +10295,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 
     uint32_t nth = 256u;
     while (nth > width && nth > 1u) nth >>= 1;
-    directional_steering_project_kernel<<<rows, nth>>>(
+    directional_steering_project_kernel<<<rows, nth, 0, ds4_current_stream()>>>(
             (float *)x->ptr,
             (const float *)directions->ptr,
             layer,
@@ -10325,15 +10325,15 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
         if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
             getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             dim3 block(32, 4, 1);
-            router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+            router_select_warp_topk_kernel<<<1, block, 0, ds4_current_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                          has_bias && !hash_mode, hash_mode);
         } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-            router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+            router_select_parallel_kernel<<<1, 256, 0, ds4_current_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                                       has_bias && !hash_mode, hash_mode);
         } else {
-            router_select_kernel<<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+            router_select_kernel<<<1, 1, 0, ds4_current_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                           bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
                                           has_bias && !hash_mode, hash_mode);
         }
@@ -10366,7 +10366,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
         getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
         dim3 block(32, 4, 1);
-        router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
+        router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block, 0, ds4_current_stream()>>>((int32_t *)selected->ptr,
                                                                         (float *)weights->ptr,
                                                                         (float *)probs->ptr,
                                                                         bias,
@@ -10379,7 +10379,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         has_bias && !hash_mode,
                                                                         hash_mode);
     } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-        router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
+        router_select_parallel_kernel<<<n_tokens, 256, 0, ds4_current_stream()>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
                                                          (float *)probs->ptr,
                                                          bias,
@@ -10392,7 +10392,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                          has_bias && !hash_mode,
                                                          hash_mode);
     } else {
-        router_select_kernel<<<n_tokens, 1>>>((int32_t *)selected->ptr,
+        router_select_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((int32_t *)selected->ptr,
                                               (float *)weights->ptr,
                                               (float *)probs->ptr,
                                               bias,
@@ -12802,6 +12802,12 @@ static int routed_moe_launch(
                 cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
                 if (ge == cudaSuccess) {
                     graph_capturing = 1;
+                    /* Route the in-capture <<<>>> kernel launches at
+                     * moe_mmq_swiglu_weighted_clamp_kernel and moe_sum_kernel
+                     * to moe_stream so they record into the capture.  The
+                     * ds4_mmq_*_moe_vec calls below carry moe_stream as an
+                     * explicit parameter and are unaffected by this. */
+                    ds4_capture_set_stream(moe_stream);
                 } else {
                     fprintf(stderr, "ds4: cudaStreamBeginCapture failed: %s; graphs disabled this call\n",
                             cudaGetErrorString(ge));
@@ -12858,7 +12864,7 @@ static int routed_moe_launch(
              *    path uses - applies the V4 clamp to gate/up BEFORE silu. */
             {
                 const uint64_t mid_floats = n_assignments * expert_mid_dim;
-                moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, moe_stream>>>(
+                moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, ds4_current_stream()>>>(
                     (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
                     (const float *)gate->ptr, (const float *)up->ptr,
                     (const float *)weights->ptr,
@@ -12894,7 +12900,7 @@ static int routed_moe_launch(
              *    Launched on moe_stream so Step 8 capture is consistent. */
             {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
-                moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, moe_stream>>>(
+                moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
                     (float *)out->ptr, (const float *)down->ptr,
                     out_dim, n_expert_used, n_tokens);
                 if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe sum launch")) goto mmvq_decode_bail;
@@ -12911,6 +12917,7 @@ static int routed_moe_launch(
                 cudaGraph_t graph;
                 cudaError_t ge = cudaStreamEndCapture(moe_stream, &graph);
                 graph_capturing = 0;
+                ds4_capture_set_stream((cudaStream_t)0);  /* restore: capture done */
                 if (ge == cudaSuccess) {
                     cudaGraphExec_t exec;
                     ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
@@ -12946,6 +12953,8 @@ static int routed_moe_launch(
             if (graph_capturing) {
                 cudaGraph_t partial;
                 cudaError_t ge = cudaStreamEndCapture(0, &partial);
+                graph_capturing = 0;
+                ds4_capture_set_stream((cudaStream_t)0);  /* restore on bail */
                 if (ge == cudaSuccess) {
                     cudaGraphDestroy(partial);
                 } else {
@@ -13002,7 +13011,7 @@ static int routed_moe_launch(
         }
         {
             const uint64_t mid_floats = n_assignments * expert_mid_dim;
-            moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256>>>(
+            moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, ds4_current_stream()>>>(
                 (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
                 (const float *)gate->ptr, (const float *)up->ptr,
                 (const float *)weights->ptr,
@@ -13035,7 +13044,7 @@ static int routed_moe_launch(
         }
         {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+            moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(
                 (float *)out->ptr, (const float *)down->ptr,
                 out_dim, n_expert_used, n_tokens);
             if (!cuda_ok(cudaGetLastError(), "mmq routed_moe sum launch")) goto mmq_moe_fallback;
@@ -13132,7 +13141,7 @@ mmq_moe_fallback:
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
-        q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+        q8_K_quantize_kernel<<<xq_grid, 256, 0, ds4_current_stream()>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
@@ -13180,18 +13189,18 @@ mmq_moe_fallback:
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
                 ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
                 if (ok) {
-                    moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+                    moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
                         counts,
                         (const int32_t *)selected->ptr,
                         pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
                 if (ok) {
-                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts);
+                    moe_prefix_sorted_pairs_kernel<<<1, 1, 0, ds4_current_stream()>>>(offsets, cursors, counts);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok) {
-                    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
+                    moe_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
                         sorted_pairs,
                         cursors,
                         (const int32_t *)selected->ptr,
@@ -13199,19 +13208,19 @@ mmq_moe_fallback:
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, ds4_current_stream()>>>(tile_offsets, tile_total, counts, expert_tile_m);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
+                    moe_build_expert_tiles_kernel<<<1, 256, 0, ds4_current_stream()>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, ds4_current_stream()>>>(tile16_offsets, tile16_total, counts, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
+                    moe_build_expert_tiles_kernel<<<1, 256, 0, ds4_current_stream()>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
                 }
             }
@@ -13223,7 +13232,7 @@ mmq_moe_fallback:
                 if (use_gate_row2048) {
                     if (gate_row_span == 512u) {
                         dim3 tgrid((expert_mid_dim + 511u) / 512u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<512><<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_rowspan_kernel<512><<<tgrid, 256, 0, ds4_current_stream()>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -13231,7 +13240,7 @@ mmq_moe_fallback:
                             write_gate_up, clamp);
                     } else if (gate_row_span == 1024u) {
                         dim3 tgrid((expert_mid_dim + 1023u) / 1024u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_rowspan_kernel<1024><<<tgrid, 256, 0, ds4_current_stream()>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -13239,7 +13248,7 @@ mmq_moe_fallback:
                             write_gate_up, clamp);
                     } else {
                         dim3 tgrid((expert_mid_dim + 2047u) / 2048u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_row2048_kernel<<<tgrid, 256>>>(
+                        moe_gate_up_mid_expert_tile8_row2048_kernel<<<tgrid, 256, 0, ds4_current_stream()>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -13248,7 +13257,7 @@ mmq_moe_fallback:
                     }
                 } else if (expert_tile_m == 8u) {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                    moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                    moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -13256,7 +13265,7 @@ mmq_moe_fallback:
                         write_gate_up, clamp);
                 } else {
                     dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                    moe_gate_up_mid_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                    moe_gate_up_mid_expert_tile4_row32_kernel<<<tgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                         gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                         tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -13265,7 +13274,7 @@ mmq_moe_fallback:
                 }
             } else if (ok && sorted_pairs && use_p2_sorted) {
                 dim3 p2_mgrid((expert_mid_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
-                moe_gate_up_mid_sorted_p2_qwarp32_kernel<<<p2_mgrid, 256>>>(
+                moe_gate_up_mid_sorted_p2_qwarp32_kernel<<<p2_mgrid, 256, 0, ds4_current_stream()>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
                     (float *)mid->ptr,
@@ -13283,7 +13292,7 @@ mmq_moe_fallback:
                     pair_count,
                     clamp);
             } else if (ok && sorted_pairs) {
-                moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256>>>(
+                moe_gate_up_mid_sorted_qwarp32_kernel<<<mgrid, 256, 0, ds4_current_stream()>>>(
                     (float *)gate->ptr,
                     (float *)up->ptr,
                     (float *)mid->ptr,
@@ -13302,7 +13311,7 @@ mmq_moe_fallback:
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
                 if (use_decode_lut_gate && q4k_path) {
-                    moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -13319,7 +13328,7 @@ mmq_moe_fallback:
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate || use_direct_gate_up_n2) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -13336,7 +13345,7 @@ mmq_moe_fallback:
                         write_gate_up,
                         clamp);
                 } else {
-                    moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -13358,7 +13367,7 @@ mmq_moe_fallback:
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         if (ok) {
             dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
-            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
+            q8_K_quantize_kernel<<<midq_grid, 256, 0, ds4_current_stream()>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
         }
         if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
@@ -13377,7 +13386,7 @@ mmq_moe_fallback:
             if (use_direct_down_sum6) {
                 if (q4k_path) {
                     dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -13388,7 +13397,7 @@ mmq_moe_fallback:
                         out_dim);
                 } else if (use_direct_down_sum6_n2) {
                     dim3 sgrid((out_dim + 31u) / 32u, 2, 1);
-                    moe_down_sum6_n2_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sum6_n2_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -13399,7 +13408,7 @@ mmq_moe_fallback:
                         out_dim);
                 } else {
                     dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
-                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                    moe_down_sum6_qwarp32_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
                         (float *)out->ptr,
                         down_w,
                         midq,
@@ -13411,7 +13420,7 @@ mmq_moe_fallback:
                 }
             } else if (use_atomic_down) {
                 uint64_t n = (uint64_t)n_tokens * out_dim;
-                zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
+                zero_kernel<<<(n + 255u) / 256u, 256, 0, ds4_current_stream()>>>((float *)out->ptr, n);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
             if (use_direct_down_sum6) {
@@ -13421,21 +13430,21 @@ mmq_moe_fallback:
                 if (use_down_row2048) {
                     if (down_row_span == 512u) {
                         dim3 tgrid((out_dim + 511u) / 512u, down_tile_capacity, 1);
-                        moe_down_expert_tile16_rowspan_kernel<512><<<tgrid, 256>>>(
+                        moe_down_expert_tile16_rowspan_kernel<512><<<tgrid, 256, 0, ds4_current_stream()>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert, use_atomic_down);
                     } else if (down_row_span == 1024u) {
                         dim3 tgrid((out_dim + 1023u) / 1024u, down_tile_capacity, 1);
-                        moe_down_expert_tile16_rowspan_kernel<1024><<<tgrid, 256>>>(
+                        moe_down_expert_tile16_rowspan_kernel<1024><<<tgrid, 256, 0, ds4_current_stream()>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert, use_atomic_down);
                     } else {
                         dim3 tgrid((out_dim + 2047u) / 2048u, down_tile_capacity, 1);
-                        moe_down_expert_tile16_row2048_kernel<<<tgrid, 256>>>(
+                        moe_down_expert_tile16_row2048_kernel<<<tgrid, 256, 0, ds4_current_stream()>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
@@ -13443,21 +13452,21 @@ mmq_moe_fallback:
                     }
                 } else if (use_down_tile16) {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    moe_down_expert_tile16_row32_kernel<<<tgrid, 256>>>(
+                    moe_down_expert_tile16_row32_kernel<<<tgrid, 256, 0, ds4_current_stream()>>>(
                         use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 } else if (expert_tile_m == 8u) {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    moe_down_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                    moe_down_expert_tile8_row32_kernel<<<tgrid, 256, 0, ds4_current_stream()>>>(
                         use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 } else {
                     dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                    moe_down_expert_tile4_row32_kernel<<<tgrid, 256>>>(
+                    moe_down_expert_tile4_row32_kernel<<<tgrid, 256, 0, ds4_current_stream()>>>(
                         use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                         down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
@@ -13465,7 +13474,7 @@ mmq_moe_fallback:
                 }
             } else if (sorted_pairs && use_p2_sorted) {
                 dim3 p2_dgrid((out_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
-                moe_down_sorted_p2_qwarp32_kernel<<<p2_dgrid, 256>>>(
+                moe_down_sorted_p2_qwarp32_kernel<<<p2_dgrid, 256, 0, ds4_current_stream()>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
@@ -13478,7 +13487,7 @@ mmq_moe_fallback:
                     n_expert,
                     pair_count);
             } else if (sorted_pairs) {
-                moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                moe_down_sorted_qwarp32_kernel<<<dgrid, 256, 0, ds4_current_stream()>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
@@ -13490,7 +13499,7 @@ mmq_moe_fallback:
                     out_dim,
                     n_expert);
             } else {
-                moe_down_qwarp32_kernel<<<dgrid, 256>>>(
+                moe_down_qwarp32_kernel<<<dgrid, 256, 0, ds4_current_stream()>>>(
                     (float *)down->ptr,
                     down_w,
                     midq,
@@ -13506,7 +13515,7 @@ mmq_moe_fallback:
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
         if (ok && !use_atomic_down && !use_direct_down_sum6) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            moe_sum_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (prof_ev[6]) {
@@ -13531,7 +13540,7 @@ mmq_moe_fallback:
 
     if (ok) {
         dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
-        moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
+        moe_gate_up_mid_f32_kernel<<<mgrid, 256, 0, ds4_current_stream()>>>(
             (float *)gate->ptr,
             (float *)up->ptr,
             (float *)mid->ptr,
@@ -13550,7 +13559,7 @@ mmq_moe_fallback:
     }
     if (ok) {
         dim3 dgrid(out_dim, n_tokens * n_expert, 1);
-        moe_down_f32_kernel<<<dgrid, 256>>>(
+        moe_down_f32_kernel<<<dgrid, 256, 0, ds4_current_stream()>>>(
             (float *)down->ptr,
             down_w,
             (const float *)mid->ptr,
@@ -13564,7 +13573,7 @@ mmq_moe_fallback:
     }
     if (ok) {
         uint64_t n = (uint64_t)n_tokens * out_dim;
-        moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        moe_sum_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     return ok;
@@ -13599,7 +13608,7 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_g
     if (!scale || !base) return 0;
     uint32_t n_rows = (uint32_t)(mix->bytes / mix_bytes);
     if (out->bytes / mix_bytes < n_rows) n_rows = (uint32_t)(out->bytes / mix_bytes);
-    hc_split_sinkhorn_kernel<<<(n_rows + 255) / 256, 256>>>(
+    hc_split_sinkhorn_kernel<<<(n_rows + 255) / 256, 256, 0, ds4_current_stream()>>>(
         (float *)out->ptr, (const float *)mix->ptr,
         scale,
         base,
@@ -13609,7 +13618,7 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_g
 extern "C" int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc) {
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
-    hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
+    hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256, 0, ds4_current_stream()>>>(
         (float *)out->ptr, (const float *)residual_hc->ptr, (const float *)weights->ptr,
         n_embd, n_hc, n_tokens, n_hc);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum launch");
@@ -13618,7 +13627,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const d
     if (!out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out->bytes / ((uint64_t)n_embd * sizeof(float)));
     uint32_t stride = (uint32_t)(2u * n_hc + n_hc * n_hc);
-    hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256>>>(
+    hc_weighted_sum_kernel<<<((uint64_t)n_embd * n_tokens + 255) / 256, 256, 0, ds4_current_stream()>>>(
         (float *)out->ptr, (const float *)residual_hc->ptr, (const float *)split->ptr,
         n_embd, n_hc, n_tokens, stride);
     return cuda_ok(cudaGetLastError(), "hc_weighted_sum_split launch");
@@ -13658,7 +13667,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
     const float *scale = (const float *)cuda_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
     const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, mix_bytes, "hc_base");
     if (!scale || !base) return 0;
-    hc_split_weighted_sum_fused_kernel<<<(uint32_t)n_rows, 256>>>(
+    hc_split_weighted_sum_fused_kernel<<<(uint32_t)n_rows, 256, 0, ds4_current_stream()>>>(
             (float *)out->ptr,
             (float *)split->ptr,
             (const float *)mix->ptr,
@@ -13715,7 +13724,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
             const float *norm_w = (const float *)cuda_model_range_ptr(model_map, norm_weight_offset,
                     (uint64_t)n_embd * sizeof(float), "hc_norm_weight");
             if (!scale || !base || !norm_w) return 0;
-            hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256>>>(
+            hc_split_weighted_sum_norm_fused_kernel<<<(uint32_t)n_rows, 256, 0, ds4_current_stream()>>>(
                     (float *)out->ptr,
                     (float *)norm_out->ptr,
                     (float *)split->ptr,
@@ -13758,7 +13767,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
     const float *base = (const float *)cuda_model_range_ptr(model_map, base_offset, row_bytes, "output_hc_base");
     if (!scale || !base) return 0;
     uint64_t n = n_tokens * n_hc;
-    output_hc_weights_kernel<<<(n + 255) / 256, 256>>>(
+    output_hc_weights_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)out->ptr,
             (const float *)pre->ptr,
             scale,
@@ -13772,7 +13781,7 @@ extern "C" int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
     if (!out_hc || !block_out || !residual_hc || !post || !comb || n_embd == 0 || n_hc == 0) return 0;
     uint32_t n_tokens = (uint32_t)(out_hc->bytes / ((uint64_t)n_hc * n_embd * sizeof(float)));
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)residual_hc->ptr,
@@ -13788,7 +13797,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)residual_hc->ptr,
@@ -13804,7 +13813,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
     uint32_t mix_hc = 2u * n_hc + n_hc * n_hc;
     uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
+    hc_expand_kernel<<<(n_elem + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)block_add->ptr,
                                                     (const float *)residual_hc->ptr,
@@ -13829,7 +13838,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_n2_rows_tensor(ds4_gpu_tensor *out0_h
     }
     uint64_t n_elem = 2ull * n_hc * n_embd;
     const float *base = (const float *)split->ptr;
-    hc_expand_add_split_n2_rows_kernel<<<(n_elem + 255) / 256, 256>>>(
+    hc_expand_add_split_n2_rows_kernel<<<(n_elem + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)out0_hc->ptr,
             (float *)out1_hc->ptr,
             (const float *)block_out->ptr,
