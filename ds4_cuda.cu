@@ -108,6 +108,33 @@ static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
+
+/* --------------------------------------------------------------------
+ * Thread-local capture stream override (Step A: full-layer graphs).
+ *
+ * Defined this early so every kernel launch and cuda*Async call later in
+ * this file can refer to ds4_current_stream() without a forward declaration.
+ * The detailed rationale lives next to the MoE/dense capture machinery
+ * (search for "Step A scaffold context"); this block only carries what
+ * the compiler needs first.
+ *
+ * Default value (cudaStream_t)0 makes ds4_current_stream() return the
+ * implicit default stream, preserving pre-A behavior byte-for-byte on
+ * every non-capture code path. */
+static thread_local cudaStream_t t_ds4_capture_stream = (cudaStream_t)0;
+
+static inline void ds4_capture_set_stream(cudaStream_t s) {
+    t_ds4_capture_stream = s;
+}
+
+static inline cudaStream_t ds4_current_stream(void) {
+    return t_ds4_capture_stream;
+}
+
+static inline int ds4_capture_active(void) {
+    return t_ds4_capture_stream != (cudaStream_t)0;
+}
+
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -7492,7 +7519,14 @@ static cudaStream_t ds4_cuda_moe_stream(void) {
 }
 
 /* --------------------------------------------------------------------
- * Thread-local capture stream override (Step A: full-layer graphs).
+ * Step A scaffold context.
+ *
+ * The thread-local capture stream override (t_ds4_capture_stream and the
+ * ds4_capture_set_stream / ds4_current_stream / ds4_capture_active helpers)
+ * is defined near the top of this file, just after the g_model_*_stream
+ * globals, so that every kernel launch and cuda*Async call below can
+ * reference ds4_current_stream() unconditionally.  This block documents
+ * why those helpers exist:
  *
  * Step 8/8.2 wrap individual kernel clusters (dense Q8_0 vec at n_tok=1,
  * routed MoE at n_assignments<=8) in their own cudaStreamBeginCapture
@@ -7505,35 +7539,19 @@ static cudaStream_t ds4_cuda_moe_stream(void) {
  * an explicit cudaStream_t through every shim's ABI would touch 100+
  * call sites and change the cross-platform interface.
  *
- * Instead, expose a thread-local stream override.  Every kernel launch
- * and cuda*Async call reachable from the per-layer decode body queries
- * ds4_current_stream(); when t_ds4_capture_stream is set (during outer
+ * Instead the thread-local stream override gives every reachable launch
+ * the same treatment: when t_ds4_capture_stream is set (during outer
  * capture), the launch lands on that stream and gets recorded.  When
  * unset (the default), launches land on stream=0 as before -- preserves
  * all non-decode-1 code paths byte-for-byte.
  *
- * The inner Step 8/8.2 captures detect the active outer capture via
- * ds4_current_stream() != 0 and skip their own cudaStreamBeginCapture
- * (CUDA doesn't allow nested begins), letting the outer capture absorb
- * their kernels. */
-static thread_local cudaStream_t t_ds4_capture_stream = (cudaStream_t)0;
-
-static inline void ds4_capture_set_stream(cudaStream_t s) {
-    t_ds4_capture_stream = s;
-}
-
-static inline cudaStream_t ds4_current_stream(void) {
-    /* Returns the active capture stream, or stream=0 (default) when no
-     * outer capture is in progress.  Designed so call sites can use it
-     * unconditionally: when capture is inactive the result is identical
-     * to passing 0 explicitly, which is what every legacy launch did
-     * implicitly. */
-    return t_ds4_capture_stream;
-}
-
-static inline int ds4_capture_active(void) {
-    return t_ds4_capture_stream != (cudaStream_t)0;
-}
+ * The inner Step 8/8.2 captures call ds4_capture_set_stream(moe_stream)
+ * at BeginCapture and restore at EndCapture so their captured-region
+ * <<<...>>> launches still land on moe_stream after the A2 routing pass.
+ * When an outer capture is active (a future commit; not yet wired) those
+ * inner captures will detect ds4_capture_active() and skip their own
+ * cudaStreamBeginCapture -- CUDA doesn't allow nested begins, and the
+ * outer capture absorbs their kernels via the same thread-local. */
 
 /* Cross-stream sync events for the captured graph paths.
  *
