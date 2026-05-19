@@ -8682,6 +8682,13 @@ struct layer_graph_entry {
     struct ds4_layer_graph_key key;
     cudaGraphExec_t            exec;
     int                        valid;
+    int                        warmed;  /* Step 6 fixup: 1 once the eager
+                                          * pass for this key has sized
+                                          * cuda_tmp_alloc + any other
+                                          * lazy allocators referenced by
+                                          * the body.  Capture only when
+                                          * warmed -- cudaMalloc/cudaFree
+                                          * are forbidden inside capture. */
     uint64_t                   hits;
 };
 
@@ -8771,6 +8778,27 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         }
     }
 
+    /* Step 6 fixup: warmup pass.  The per-layer body contains kernels
+     * (e.g. matmul_q8_0_pair, q8 f16 gemm, indexer topk tree) that lazy-
+     * size a session-global scratch buffer via cuda_tmp_alloc -> cudaMalloc
+     * on first use at each new max size.  cudaMalloc is forbidden during
+     * capture, so we must let every (il, key) combination run at least
+     * once eagerly so the scratch buffer grows to the size all layers
+     * need.  Track per-slot `warmed`: on first sighting of a key, store
+     * it but return -1 (eager); on the second sighting, BEGIN capture. */
+    if (!slot->warmed || memcmp(&slot->key, key, sizeof(*key)) != 0) {
+        if (slot->valid) {
+            cudaGraphExecDestroy(slot->exec);
+            slot->valid = 0;
+            slot->hits = 0;
+        }
+        memcpy(&slot->key, key, sizeof(*key));
+        slot->warmed = 1;
+        /* Caller runs the body eagerly on ds4_current_stream() == stream=0,
+         * sizing any lazy scratch buffers.  Next time this key shows up
+         * we'll capture. */
+        return -1;
+    }
     /* Capture path.  Evict any stale exec at this slot; install the new
      * key; begin capture; signal caller to encode the body. */
     if (slot->valid) {
