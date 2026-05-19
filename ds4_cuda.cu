@@ -4828,21 +4828,17 @@ __global__ static void attention_decode_mixed_kernel(
          * pos0, n_tokens, window, ratio are passed = 0 by the decode shim
          * and remain inline (no per-token variation). */
         const struct ds4_decode_scalars * __restrict__ s_override) {
+    /* Step 4 / R5: override only the TOKEN-STABLE scalars from the device-
+     * side struct.  n_comp is PER-LAYER (g->layer_n_comp[il]) so it can't
+     * be safely propagated through a single pinned host buffer (the CPU's
+     * per-layer overwrites race with the GPU's queued async memcpy).
+     * Per-layer scalars need a per-layer source — a 43-entry host array or
+     * one host buffer per layer.  Deferred to Step 5/6's layer-graph
+     * capture design.  Until then, n_comp stays inline (baked at launch);
+     * acceptable pre-capture because the inline value is per-call accurate. */
     if (s_override) {
-        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-            if (s_override->n_raw != n_raw ||
-                s_override->raw_start != raw_start ||
-                s_override->n_comp != n_comp) {
-                printf("ATTN_DECODE_MIXED MISMATCH: inline(n_raw=%u raw_start=%u n_comp=%u) "
-                       "s(n_raw=%u raw_start=%u n_comp=%u pos0=%u)\n",
-                       n_raw, raw_start, n_comp,
-                       s_override->n_raw, s_override->raw_start, s_override->n_comp,
-                       s_override->pos0);
-            }
-        }
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
-        n_comp    = s_override->n_comp;
     }
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
@@ -5013,10 +5009,10 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t n_head,
         uint32_t head_dim,
         const struct ds4_decode_scalars * __restrict__ s_override) {
+    /* See attention_decode_mixed_kernel: token-stable scalars only. */
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
-        n_comp    = s_override->n_comp;
     }
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
@@ -5642,10 +5638,10 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         uint32_t n_head,
         uint32_t head_dim,
         const struct ds4_decode_scalars * __restrict__ s_override) {
+    /* See attention_decode_mixed_kernel: token-stable scalars only. */
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
-        n_comp    = s_override->n_comp;
     }
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;

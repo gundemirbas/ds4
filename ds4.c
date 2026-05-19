@@ -9780,12 +9780,12 @@ static bool metal_graph_encode_decode_layer_impl(
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
-        /* Step 4: push this layer's n_comp + raw_start to the device-side
-         * scalars struct so the captured attention kernels see the right
-         * value at execution time.  Pos / raw_row / n_raw are stable across
-         * layers and were set once at the top of the token. */
-        ds4_gpu_decode_scalars_set_n_comp(n_comp);
-        ds4_gpu_decode_scalars_flush();
+        /* Step 4: n_raw and raw_start are token-stable (same across all
+         * layers within a token) and were set once at the top of the token.
+         * n_comp is PER-LAYER and stays as an inline kernel arg in this
+         * step.  Under Step 5/6's layer-graph capture, per-layer scalars
+         * will need a per-layer source (array of host buffers) to avoid
+         * the single-buffer reuse race with queued async memcpys. */
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             /* Step 4: in-decode-body caller passes the device-side scalars
              * pointer so the kernel reads n_raw/raw_start/n_comp from there
