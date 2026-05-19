@@ -8860,10 +8860,15 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         slot->hits = 0;
     }
     memcpy(&slot->key, key, sizeof(*key));
-    /* Step 7 determinism probe: try cudaStreamCaptureModeGlobal instead of
-     * ThreadLocal.  Global mode is stricter about cross-thread cuda calls
-     * during capture but may yield different scheduling on replay.  If
-     * determinism is restored, the capture-mode interaction is the source. */
+    /* Step 7 finding (009b1b2): cudaStreamCaptureModeGlobal RESTORES
+     * determinism across replay runs.  ThreadLocal mode (the original
+     * Step 5/6 choice, matching the inner moe/dense caches) produced
+     * non-deterministic output across separate invocations even with
+     * CUDA_LAUNCH_BLOCKING=1.  Global mode is stricter about cross-thread
+     * cuda calls during capture but in our case all GPU dispatch is
+     * single-threaded, so the strictness costs nothing.  Output is now
+     * deterministic; a separate divergence-from-eager-baseline remains
+     * the Step 7 open item (per-kernel hash dump bisection next). */
     cudaError_t ge = cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaStreamBeginCapture (layer %u) failed: %s\n",
