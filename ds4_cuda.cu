@@ -8810,20 +8810,22 @@ extern "C" void ds4_cuda_dump_hash_at_slot(
      * captured graph at slots 0..6, while L0n_out probes also start
      * auto-numbering from slot 0 on replay tokens).  Reserve a high
      * range for fixed-slot probes (e.g. 200..299) and let auto-slot
-     * probes occupy the low range. */
+     * probes occupy the low range.  Does NOT touch g_dump_next so
+     * subsequent auto-slot calls aren't displaced.  Flush iterates all
+     * slots with non-NULL labels to find these. */
     if (!ds4_cuda_dump_hash_enabled() || !tensor) return;
     if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
     g_dump_labels[slot] = label;
-    if (slot >= g_dump_next) g_dump_next = slot + 1;
     ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
             (const float *)tensor->ptr, n_elem, slot);
 }
 
 extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
     if (!ds4_cuda_dump_hash_enabled()) return;
-    if (g_dump_next == 0) return;
     /* Synchronize all pending captures + launches so device hashes are
-     * stable, then copy to host and print. */
+     * stable, then copy to host and print every slot with a non-NULL
+     * label (catches both auto-slot probes and fixed-slot probes at
+     * the high range). */
     cudaDeviceSynchronize();
     cudaError_t e = cudaMemcpyFromSymbol(g_dump_hashes_host, g_dump_hashes_dev,
                                           sizeof(g_dump_hashes_host),
@@ -8833,10 +8835,11 @@ extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
                 cudaGetErrorString(e));
         return;
     }
-    for (uint32_t i = 0; i < g_dump_next; i++) {
+    for (uint32_t i = 0; i < DS4_CUDA_DUMP_HASH_SLOTS; i++) {
+        if (g_dump_labels[i] == NULL) continue;
         fprintf(stderr, "DS4_HASH pos=%u slot=%3u %016lx %s\n",
                 pos, i, (unsigned long)g_dump_hashes_host[i],
-                g_dump_labels[i] ? g_dump_labels[i] : "(no-label)");
+                g_dump_labels[i]);
     }
 }
 
