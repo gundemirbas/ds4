@@ -635,7 +635,12 @@ int ds4_gpu_compressor_update_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps);
+        float                   rms_eps,
+        /* Step 4c C2: layer index for the per-layer scalars substrate.
+         * Decode1 path passes il (0..42); decode2-exact + Metal callers
+         * pass UINT32_MAX to signal "no substrate" (kernels fall back to
+         * inline comp_row).  See plan doc sec 16 commit C2 / sec 15.8. */
+        uint32_t                il_for_decode1);
 
 int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,

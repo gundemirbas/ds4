@@ -9569,7 +9569,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         attn_factor,
                                                         DS4_ROPE_YARN_BETA_FAST,
                                                         DS4_ROPE_YARN_BETA_SLOW,
-                                                        DS4_RMS_EPS) != 0;
+                                                        DS4_RMS_EPS,
+                                                        il /* Step 4c C2: per-layer substrate index for emit-row */) != 0;
         if (ok && emit) {
             /* Step 4c R1': read comp_row from g_layer_dev[il].comp_row in
              * the per-layer substrate (populated at top of token in
@@ -9661,7 +9662,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             attn_factor,
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
-                                                            DS4_RMS_EPS) != 0;
+                                                            DS4_RMS_EPS,
+                                                            il | 0x80000000u /* C2: indexer compressor -- bit31 selects index_row in per-layer substrate */) != 0;
             if (ok && emit) {
                 /* Step 4c R1': index emit reads index_row from
                  * g_layer_dev[il].index_row in the per-layer substrate.
@@ -13852,7 +13854,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             attn_factor,
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
-                                                            DS4_RMS_EPS) != 0;
+                                                            DS4_RMS_EPS,
+                                                            UINT32_MAX /* C2: decode2-exact path, no substrate; inline comp_row */) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
                                 g->layer_attn_comp_cache[il],
@@ -14146,7 +14149,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 attn_factor,
                                                                 DS4_ROPE_YARN_BETA_FAST,
                                                                 DS4_ROPE_YARN_BETA_SLOW,
-                                                                DS4_RMS_EPS) != 0;
+                                                                DS4_RMS_EPS,
+                                                                UINT32_MAX /* C2: decode2-exact indexer, no substrate */) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],

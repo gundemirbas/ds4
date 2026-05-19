@@ -4272,6 +4272,36 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     }
 }
 
+/* Step 4c C2: row-variant of rms_norm_weight_kernel for the compressor
+ * emit path.  Normalizes exactly one row of `base` at index *row_ptr_dev.
+ * The shim selects whether the device pointer addresses comp_row or
+ * index_row inside the per-layer substrate; the kernel doesn't care. */
+__global__ static void rms_norm_weight_layer_row_kernel(
+        float *base,
+        const float *w,
+        uint32_t n,
+        const uint32_t * __restrict__ row_ptr_dev,
+        float eps) {
+    const uint32_t row = *row_ptr_dev;
+    float *xr = base + (uint64_t)row * n;  /* in-place: dst == src */
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        xr[i] = xr[i] * scale * w[i];
+    }
+}
+
 __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         float *q_out,
         const float *q,
@@ -4524,6 +4554,66 @@ __global__ static void rope_tail_scalars_kernel(
     if (inverse) s = -s;
 
     float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
+    float x0 = tail[i];
+    float x1 = tail[i + 1];
+    tail[i] = x0 * c - x1 * s;
+    tail[i + 1] = x0 * s + x1 * c;
+}
+
+/* Step 4c C2: row-layer variant of rope_tail_scalars_kernel.  Rotates
+ * exactly one row of `base` (n_head=1, n_tok=1 collapsed away) at index
+ * *row_ptr_dev.  pos0 source is the token-stable decode_scalars struct
+ * (same as rope_tail_scalars_kernel above); the row index comes from
+ * a single uint32 the shim selects (comp_row or index_row inside the
+ * per-layer substrate).  Used by the compressor emit path which
+ * previously rotated via a transient comp_row_view. */
+__global__ static void rope_tail_layer_row_kernel(
+        float *base,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        const struct ds4_decode_scalars * __restrict__ scalars,
+        const uint32_t                  * __restrict__ row_ptr_dev,
+        int32_t pos_offset,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t pairs = n_rot / 2;
+    if (gid >= pairs) return;
+    uint32_t i = gid * 2;
+    uint32_t n_nope = head_dim - n_rot;
+
+    const uint32_t pos0 = (uint32_t)((int32_t)scalars->pos0 + pos_offset);
+    const uint32_t row  = *row_ptr_dev;
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+
+    float theta_extrap = (float)pos0 * powf(freq_base, -((float)i) / (float)n_rot);
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+
+    float *tail = base + (uint64_t)row * head_dim + n_nope;
     float x0 = tail[i];
     float x1 = tail[i + 1];
     tail[i] = x0 * c - x1 * s;
@@ -6427,14 +6517,34 @@ __global__ static void compressor_prefill_pool_kernel(
     comp[(uint64_t)c * head_dim + d] = den != 0.0f ? acc / den : 0.0f;
 }
 
+/* Step 4c C2: target the destination row via (base, comp_row_inline,
+ * row_ptr_dev) instead of a transient row pointer.  When row_ptr_dev
+ * != NULL, the kernel reads the row index from *row_ptr_dev at
+ * execution time -- per-layer substrate source (decode1 path).  When
+ * row_ptr_dev == NULL, the kernel uses comp_row_inline (decode2-exact
+ * paths still pass inline values).
+ *
+ * The shim selects the device pointer source per call: primary
+ * compressor passes &g_layer_dev[il].comp_row; indexer compressor
+ * passes &g_layer_dev[il].index_row.  Same kernel handles both because
+ * it just reads a single uint32 at the supplied address.
+ *
+ * Closes P1b (the comp_row_view transient that previously baked a per-
+ * token row pointer into the captured kernel-node arg list).  The base
+ * pointer + per-layer row_ptr_dev are both session-stable; the captured
+ * graph correctly indexes its layer's slot on every replay. */
 __global__ static void compressor_update_pool_kernel(
-        float *row,
+        float *base,
         const float *state_kv,
         const float *state_score,
         uint32_t head_dim,
-        uint32_t ratio) {
+        uint32_t ratio,
+        uint32_t comp_row_inline,
+        const uint32_t * __restrict__ row_ptr_dev) {
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= head_dim) return;
+    const uint32_t comp_row = row_ptr_dev ? *row_ptr_dev : comp_row_inline;
+    float *row = base + (uint64_t)comp_row * head_dim;
     uint32_t coff = ratio == 4u ? 2u : 1u;
     uint32_t width = coff * head_dim;
     float vals[128];
@@ -9904,7 +10014,15 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        /* Step 4c C2: layer index for the per-layer scalars substrate.
+         * Decode1 path passes the actual `il` in 0..42 so the emit
+         * kernels read row index from g_layer_dev[il].comp_row.  Decode2-
+         * exact paths pass UINT32_MAX (or any value >= DS4_LAYER_SCALARS
+         * _COUNT) to signal "no substrate"; the kernels fall back to the
+         * inline comp_row arg.  Closes P1b by eliminating the transient
+         * comp_row_view from this shim's capture-reachable path. */
+        uint32_t                il_for_decode1) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -9941,44 +10059,94 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         return 0;
     }
     if (!emit) return 1;
-    ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
-            comp_cache,
-            (uint64_t)comp_row * head_dim * sizeof(float),
-            (uint64_t)head_dim * sizeof(float));
-    if (!comp_row_view) return 0;
+
+    /* Step 4c C2 (P1b fix): the three emit-row kernels (compressor pool
+     * update + rms-norm + rope-tail) all operate on the same row of
+     * comp_cache.  Previously addressed via a transient
+     * ds4_gpu_tensor_view (comp_row_view) whose ptr was baked into the
+     * captured kernel-node arg lists -- not capture-safe.  Now all three
+     * read the row index from a device-side uint32 the shim selects
+     * (primary compressor caller -> &g_layer_dev[il].comp_row;
+     *  indexer compressor caller  -> &g_layer_dev[il].index_row).
+     *
+     * il_for_decode1 encoding (compact ABI extension):
+     *   bit 31:    0 = use comp_row field, 1 = use index_row field
+     *   bits 0-30: layer index (must be < DS4_LAYER_SCALARS_COUNT to
+     *              activate the substrate; UINT32_MAX with bit31 clear
+     *              signals "no substrate", inline comp_row used).
+     *
+     * The R5 audit gate `git grep ds4_gpu_tensor_view ds4_cuda.cu` within
+     * this function body returns 0 hits after this commit. */
+    const uint32_t USE_INDEX_ROW_BIT = 0x80000000u;
+    const bool     use_index_row     = (il_for_decode1 & USE_INDEX_ROW_BIT) != 0u;
+    const uint32_t il_clean          = il_for_decode1 & ~USE_INDEX_ROW_BIT;
+    const uint32_t *row_ptr_dev = NULL;
+    if (g_layer_dev != NULL && il_clean < DS4_LAYER_SCALARS_COUNT) {
+        row_ptr_dev = use_index_row
+            ? &g_layer_dev[il_clean].index_row
+            : &g_layer_dev[il_clean].comp_row;
+    }
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
-            (float *)comp_row_view->ptr,
+            (float *)comp_cache->ptr,
             (const float *)state_kv->ptr,
             (const float *)state_score->ptr,
             head_dim,
-            ratio);
+            ratio,
+            comp_row,
+            row_ptr_dev);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_row_view, comp_row_view,
+    if (ok) {
+        if (row_ptr_dev) {
+            const char *w = cuda_model_range_ptr(model_map, norm_offset,
+                                                  (uint64_t)head_dim * sizeof(float),
+                                                  "compressor_norm");
+            if (!w) { ok = 0; }
+            else {
+                rms_norm_weight_layer_row_kernel<<<1, 256, 0, ds4_current_stream()>>>(
+                        (float *)comp_cache->ptr,
+                        (const float *)w,
+                        head_dim,
+                        row_ptr_dev,
+                        rms_eps);
+                ok = cuda_ok(cudaGetLastError(), "compressor rms_norm row launch");
+            }
+        } else {
+            /* decode2-exact fallback: build a transient view over the
+             * inline-arg row.  This path is NOT capture-targeted (decode2
+             * is deferred per &sect;8.3); the view here is exempt from
+             * the capture-reachable audit because the surrounding code
+             * path runs eagerly. */
+            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
+                    comp_cache,
+                    (uint64_t)comp_row * head_dim * sizeof(float),
+                    (uint64_t)head_dim * sizeof(float));
+            if (!comp_row_view) return 0;
+            ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_row_view, comp_row_view,
                                                        model_map, model_size, norm_offset,
                                                        head_dim, 1, rms_eps);
-    /* Step-3 pilot: route through the device-scalars shim so pos0 is read
-     * from g_decode_dev at execution time, not baked from `pos` at capture
-     * time.  pos_offset = 1 - ratio expresses the compressor-emit offset
-     * (pos+1-ratio) without touching the global host struct. */
-    if (ok) {
-        const void *dev_s = ds4_gpu_decode_scalars_device_ptr();
-        if (dev_s == NULL) {
-            /* Fallback if scalars-init never ran (legacy path). */
-            ok = ds4_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
-                                            pos + 1u - ratio, n_ctx_orig, false,
-                                            freq_base, freq_scale, ext_factor, attn_factor,
-                                            beta_fast, beta_slow);
-        } else {
-            ok = ds4_gpu_rope_tail_scalars_tensor(comp_row_view, 1, 1, head_dim, n_rot,
-                                                    dev_s,
-                                                    1 - (int32_t)ratio, /* pos_offset */
-                                                    1u,                 /* pos_stride */
-                                                    n_ctx_orig, false,
+            if (ok) ok = ds4_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
+                                                    pos + 1u - ratio, n_ctx_orig, false,
                                                     freq_base, freq_scale, ext_factor, attn_factor,
                                                     beta_fast, beta_slow);
+            ds4_gpu_tensor_free(comp_row_view);
         }
     }
-    ds4_gpu_tensor_free(comp_row_view);
+    if (ok && row_ptr_dev) {
+        const void *dev_s = ds4_gpu_decode_scalars_device_ptr();
+        if (dev_s == NULL) { ok = 0; }
+        else {
+            rope_tail_layer_row_kernel<<<((n_rot / 2u) + 255u) / 256u, 256, 0, ds4_current_stream()>>>(
+                    (float *)comp_cache->ptr,
+                    head_dim, n_rot,
+                    (const struct ds4_decode_scalars *)dev_s,
+                    row_ptr_dev,
+                    1 - (int32_t)ratio, /* pos_offset: pos+1-ratio */
+                    n_ctx_orig, 0,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    beta_fast, beta_slow);
+            ok = cuda_ok(cudaGetLastError(), "compressor rope_tail row launch");
+        }
+    }
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;
         compressor_shift_ratio4_kernel<<<(half + 255) / 256, 256, 0, ds4_current_stream()>>>(
