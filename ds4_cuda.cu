@@ -254,6 +254,12 @@ static struct ds4_decode_scalars *g_decode_dev  = NULL;  /* cudaMalloc */
  * together (same discipline as DS4_N_HEAD_DIM / DS4_N_ROT etc.). */
 #define DS4_LAYER_SCALARS_COUNT 43u
 
+/* PC2: row-field selector for ds4_gpu_compressor_update_tensor.  Mirrors
+ * the macros in ds4_gpu.h; defined locally because ds4_cuda.cu doesn't
+ * include the header (carries its own extern "C" signatures inline). */
+#define DS4_COMPRESSOR_ROW_COMP   0
+#define DS4_COMPRESSOR_ROW_INDEX  1
+
 struct ds4_layer_scalars {
     uint32_t n_comp;      /* post-this-token's-emit count for attention */
     uint32_t comp_row;    /* pre-emit row index for fp8 row-kernel */
