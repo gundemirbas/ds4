@@ -322,6 +322,18 @@ int ds4_gpu_decode_scalars_flush(void) {
     return 1;
 }
 
+/* Metal records the most recent comp_row / index_row from set_emit_rows
+ * so the R1 row-variant shims (defined in ds4_metal.m alongside the row-
+ * view callers) can forward to the inline-pos0 path with the correct row. */
+static uint32_t g_metal_decode_comp_row  = 0;
+static uint32_t g_metal_decode_index_row = 0;
+
+void ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
+                                            uint32_t index_row) {
+    g_metal_decode_comp_row  = comp_row;
+    g_metal_decode_index_row = index_row;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
@@ -6072,6 +6084,25 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     return 1;
 }
 
+/* R1 row-variant stub: forwards to the inline-tensor shim with a transient
+ * view at the most recently set comp_row.  Metal doesn't use captured-memcpy
+ * semantics so the opaque `scalars` arg is ignored. */
+int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
+        ds4_gpu_tensor *base,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const void       *scalars) {
+    (void)scalars;
+    if (!base) return 0;
+    ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
+        (uint64_t)g_metal_decode_comp_row * head_dim * sizeof(float),
+        (uint64_t)head_dim * sizeof(float));
+    if (!row_view) return 0;
+    int ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(row_view, 1, head_dim, n_rot);
+    ds4_gpu_tensor_free(row_view);
+    return ok;
+}
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -6110,6 +6141,23 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
     }
 
     return 1;
+}
+
+/* R1 row-variant stub: forwards to the inline-tensor shim with a transient
+ * view at the most recently set index_row. */
+int ds4_gpu_dsv4_indexer_qat_row_tensor(
+        ds4_gpu_tensor *base,
+        uint32_t          head_dim,
+        const void       *scalars) {
+    (void)scalars;
+    if (!base) return 0;
+    ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
+        (uint64_t)g_metal_decode_index_row * head_dim * sizeof(float),
+        (uint64_t)head_dim * sizeof(float));
+    if (!row_view) return 0;
+    int ok = ds4_gpu_dsv4_indexer_qat_tensor(row_view, 1, head_dim);
+    ds4_gpu_tensor_free(row_view);
+    return ok;
 }
 
 static void ds4_gpu_set_rows_thread_shape(

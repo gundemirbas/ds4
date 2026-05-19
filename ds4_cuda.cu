@@ -167,14 +167,23 @@ struct ds4_decode_scalars {
     uint32_t n_raw;       /* min(pos0 + 1, raw_window); raw count */
     uint32_t n_comp;      /* visible compressed tokens this step */
     uint32_t emit_phase;  /* pos0 % ratio; compressor cyclic slot */
+    /* Row scalars for the row-view kernels (R1, Step-4 analyst review).
+     * Per-layer state: layer_n_comp[il] and layer_n_index_comp[il].  Callers
+     * write these via ds4_gpu_decode_scalars_set_emit_rows() + flush()
+     * immediately before each per-layer emit, so subsequent kernels in that
+     * layer's body see the right row.  Under future layer-graph capture
+     * the flush becomes either a per-layer captured memcpy node or a per-
+     * layer entry in a device-side array (Step 5/6 detail). */
+    uint32_t comp_row;    /* layer_n_comp[il] at the current per-layer emit */
+    uint32_t index_row;   /* layer_n_index_comp[il] at the current per-layer emit */
     uint32_t flags;       /* bit 0: emit FP8 KV this step
                            * bit 1: indexed-attention path active
                            * bit 2: ratio4 compressor schedule
                            * bits 3..31: reserved (must be 0) */
-    uint32_t _pad;        /* align to 32 B (one transaction on Blackwell) */
+    uint32_t _pad;        /* align to 40 B */
 };
-static_assert(sizeof(struct ds4_decode_scalars) == 32u,
-              "ds4_decode_scalars must be exactly 32 bytes");
+static_assert(sizeof(struct ds4_decode_scalars) == 40u,
+              "ds4_decode_scalars must be exactly 40 bytes");
 
 /* Allocated once at first init; reused for every replay.
  * Host buffer is pinned (cudaHostAlloc) so the captured async H2D doesn't
@@ -960,8 +969,22 @@ extern "C" void ds4_gpu_decode_scalars_set(
     g_decode_host->n_raw      = n_raw;
     g_decode_host->n_comp     = n_comp;
     g_decode_host->emit_phase = pos0 % r;
+    /* comp_row / index_row are NOT touched here -- they're set per-emit by
+     * ds4_gpu_decode_scalars_set_emit_rows() and remain valid across the
+     * non-emit per-layer steps too (kernels just won't read them). */
     g_decode_host->flags      = flags;
     g_decode_host->_pad       = 0;
+}
+
+/* Per-emit setter for the row scalars.  Called from ds4.c at each per-layer
+ * emit step (compressor + indexer), immediately before invoking the row-view
+ * row-shim variants.  Followed by ds4_gpu_decode_scalars_flush() so the new
+ * row values reach the device before the kernels read them. */
+extern "C" void ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
+                                                       uint32_t index_row) {
+    if (g_decode_host == NULL) return;
+    g_decode_host->comp_row  = comp_row;
+    g_decode_host->index_row = index_row;
 }
 
 /* Push the current pinned-host struct contents to the device-side mirror.
@@ -4343,6 +4366,48 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
     }
 }
 
+/* R1 / Step-4 variant: writes exactly one row of `base` at index s->comp_row.
+ *
+ * The inline-arg kernel above takes (x, n_tok, head_dim, n_rot) where x must
+ * point at the first of n_tok contiguous rows.  Callers in the per-layer
+ * decode body used to construct a transient `ds4_gpu_tensor_view` over a
+ * single row of comp_cache and pass that.  Under graph capture, the view's
+ * ptr (= base + comp_row * head_dim * sizeof(float)) is baked into the
+ * recorded kernel-node argument list, so replays at a different comp_row
+ * would write the wrong row.
+ *
+ * Resolution: take (base, const decode_scalars *s) and compute
+ * dst = base + s->comp_row * head_dim at execution time.  Captures the
+ * pointer to s (stable for session lifetime), not to a per-token row.
+ *
+ * Body math identical to fp8_kv_quantize_kernel.  One block, 64 threads. */
+__global__ static void fp8_kv_quantize_row_kernel(
+        float *base,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        const struct ds4_decode_scalars * __restrict__ s) {
+    uint32_t tid = threadIdx.x;
+    uint32_t n_nope = head_dim - n_rot;
+    float *xr = base + (uint64_t)s->comp_row * head_dim;
+    __shared__ float scratch[64];
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        float v = 0.0f;
+        if (off + tid < n_nope) v = xr[off + tid];
+        scratch[tid] = off + tid < n_nope ? fabsf(v) : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
+        if (off + tid < n_nope) {
+            float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
+            xr[off + tid] = q;
+        }
+        __syncthreads();
+    }
+}
+
 __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, uint32_t head_dim) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
@@ -4371,6 +4436,55 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
     uint32_t block_base = fp4_block * 32u;
     absbuf[tid] = fabsf(v);
     __syncthreads();
+
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            absbuf[block_base + lane] = fmaxf(absbuf[block_base + lane],
+                                              absbuf[block_base + lane + stride]);
+        }
+        __syncthreads();
+    }
+
+    float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
+    float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+    xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
+}
+
+/* R1 / Step-4 variant: writes exactly one row of `base` at index
+ * s->index_row.  See fp8_kv_quantize_row_kernel for the rationale.
+ *
+ * Body math identical to indexer_hadamard_fp4_kernel.  One block,
+ * 128 threads. */
+__global__ static void indexer_hadamard_fp4_row_kernel(
+        float *base,
+        uint32_t head_dim,
+        const struct ds4_decode_scalars * __restrict__ s) {
+    uint32_t tid = threadIdx.x;
+    if (head_dim != 128u || tid >= 128u) return;
+
+    __shared__ float vals[128];
+    __shared__ float absbuf[128];
+    float *xr = base + (uint64_t)s->index_row * head_dim;
+    vals[tid] = xr[tid];
+    __syncthreads();
+
+    for (uint32_t stride = 1u; stride < 128u; stride <<= 1u) {
+        if ((tid & stride) == 0u) {
+            uint32_t base_idx = (tid & ~(2u * stride - 1u)) + (tid & (stride - 1u));
+            float a = vals[base_idx];
+            float b = vals[base_idx + stride];
+            vals[base_idx] = a + b;
+            vals[base_idx + stride] = a - b;
+        }
+        __syncthreads();
+    }
+
+    float v = vals[tid];
+    absbuf[tid] = fabsf(v);
+    __syncthreads();
+
+    uint32_t lane = tid & 31u;
+    uint32_t block_base = tid & ~31u;
 
     for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
@@ -9252,6 +9366,25 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n
     fp8_kv_quantize_kernel<<<n_tok, 64, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, head_dim, n_rot);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
+
+/* R1: row-variant for the decode-time emit path.  Takes `base` (the full
+ * comp_cache tensor, not a transient view) plus the device-side scalars
+ * pointer.  Kernel reads `s->comp_row` at execution time and writes only
+ * that row.  The caller must have already updated comp_row via
+ * ds4_gpu_decode_scalars_set_emit_rows() + flush() for this layer's emit. */
+extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
+        ds4_gpu_tensor *base,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        const void *scalars) {
+    if (!base || !scalars || n_rot > head_dim ||
+        base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    fp8_kv_quantize_row_kernel<<<1, 64, 0, ds4_current_stream()>>>(
+            (float *)base->ptr, head_dim, n_rot,
+            (const struct ds4_decode_scalars *)scalars);
+    return cuda_ok(cudaGetLastError(), "fp8_kv_quantize_row launch");
+}
+
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
@@ -9259,6 +9392,21 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
     }
     indexer_hadamard_fp4_kernel<<<n_rows, 128, 0, ds4_current_stream()>>>((float *)x->ptr, n_rows, head_dim);
     return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch");
+}
+
+/* R1: row-variant for the indexer emit path.  Takes `base` (the full
+ * index_comp_cache tensor) + scalars pointer; reads s->index_row at
+ * execution time. */
+extern "C" int ds4_gpu_dsv4_indexer_qat_row_tensor(
+        ds4_gpu_tensor *base,
+        uint32_t head_dim,
+        const void *scalars) {
+    if (!base || !scalars || head_dim != 128u ||
+        base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    indexer_hadamard_fp4_row_kernel<<<1, 128, 0, ds4_current_stream()>>>(
+            (float *)base->ptr, head_dim,
+            (const struct ds4_decode_scalars *)scalars);
+    return cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4_row launch");
 }
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;

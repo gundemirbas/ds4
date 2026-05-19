@@ -9571,18 +9571,31 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS) != 0;
         if (ok && emit) {
-            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
+            /* R1: replace transient row view + tensor_view/tensor_free pair
+             * with a single base+s->comp_row launch.  Set the row scalar
+             * for this layer's emit, flush so the device-side struct sees
+             * the update before the kernel reads it. */
+            ds4_gpu_decode_scalars_set_emit_rows(comp_row, g->layer_n_index_comp[il]);
+            ds4_gpu_decode_scalars_flush();
+            ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
                     g->layer_attn_comp_cache[il],
-                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
-                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-            if (!comp_row_view) {
-                ok = false;
-            } else {
-                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
-                if (ok) {
+                    DS4_N_HEAD_DIM, DS4_N_ROT,
+                    ds4_gpu_decode_scalars_device_ptr()) != 0;
+            if (ok && metal_graph_debug_wants("KVcompress", il, pos)) {
+                /* Debug-only path (DS4_METAL_GRAPH_DUMP_PREFIX env-gated).
+                 * The synchronize inside the dumper is incompatible with
+                 * captured replay; this branch is unreachable under any
+                 * future layer-graph capture and therefore exempt from
+                 * the R5 "no transient view inside the captured body"
+                 * audit gate. */
+                ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
+                        g->layer_attn_comp_cache[il],
+                        (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
+                        (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                if (comp_row_view) {
                     metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
+                    ds4_gpu_tensor_free(comp_row_view);
                 }
-                ds4_gpu_tensor_free(comp_row_view);
             }
         }
         if (ok && emit) g->layer_n_comp[il]++;
@@ -9651,18 +9664,14 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
             if (ok && emit) {
-                ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
+                /* R1: index emit uses base+s->index_row instead of a
+                 * transient row view.  set_emit_rows + flush ran a few
+                 * lines above for the comp emit; index_row in the device
+                 * struct is already this layer's g->layer_n_index_comp[il]. */
+                ok = ds4_gpu_dsv4_indexer_qat_row_tensor(
                         g->layer_index_comp_cache[il],
-                        (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                        (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-                if (!index_row_view) {
-                    ok = false;
-                } else {
-                    ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
-                                                          1,
-                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
-                    ds4_gpu_tensor_free(index_row_view);
-                }
+                        DS4_N_INDEXER_HEAD_DIM,
+                        ds4_gpu_decode_scalars_device_ptr()) != 0;
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);

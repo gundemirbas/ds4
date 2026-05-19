@@ -90,6 +90,13 @@ void  ds4_gpu_decode_scalars_set(
  * Returns 1 on success / no-op, 0 on infrastructure failure. */
 int   ds4_gpu_decode_scalars_flush(void);
 
+/* Per-emit setter for the row scalars used by the R1 row-variant shims.
+ * Called from ds4.c at each per-layer emit step (compressor + indexer),
+ * followed by ds4_gpu_decode_scalars_flush() so the new values reach the
+ * device before the next kernel reads them.  Other scalar fields preserved. */
+void  ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
+                                             uint32_t index_row);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
@@ -388,10 +395,28 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+/* R1 row-variant: writes one row of `base` at index s->comp_row.
+ * Replaces the (transient view, n_tok=1) form used in the decode-time
+ * compressor emit path so the captured kernel-node arg list bakes a
+ * stable base pointer + the session-stable scalars pointer, not a per-
+ * token row pointer.  See local/docs/ds4_full_layer_graph_capture_plan
+ * .html R1. */
+int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
+        ds4_gpu_tensor *base,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const void       *scalars);
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
         uint32_t          head_dim);
+
+/* R1 row-variant: writes one row of `base` at index s->index_row. */
+int ds4_gpu_dsv4_indexer_qat_row_tensor(
+        ds4_gpu_tensor *base,
+        uint32_t          head_dim,
+        const void       *scalars);
 
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
