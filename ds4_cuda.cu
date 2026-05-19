@@ -8761,6 +8761,37 @@ static void ds4_cuda_layer_graph_warm_tmp_scratch(void) {
     (void)cuda_tmp_alloc((uint64_t)4 * 1024 * 1024, "layer_graph_warmup");
 }
 
+/* Step 6 diagnostic: cudaPeekAtLastError check used to localize the
+ * exact shim in metal_graph_encode_decode_layer_impl that first trips
+ * a capture-mode error.  No-op unless DS4_CUDA_LAYER_GRAPHS_DEBUG=1 is
+ * set AND a capture is in progress.  Prints "label: <error string>"
+ * the first time it sees a non-success error.  Doesn't clear the error
+ * state (cudaPeekAtLastError, not cudaGetLastError) so subsequent
+ * shims still see + report the sticky propagation. */
+extern "C" void ds4_cuda_layer_graph_debug_peek(const char *label) {
+    static int init = 0;
+    static int dbg  = 0;
+    static int seen = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_LAYER_GRAPHS_DEBUG");
+        dbg = (s && *s && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    if (!dbg) return;
+    if (!ds4_capture_active()) return;
+    cudaError_t e = cudaPeekAtLastError();
+    if (e != cudaSuccess) {
+        if (!seen) {
+            fprintf(stderr, "ds4: layer-graph capture: first error at '%s': %s\n",
+                    label ? label : "(null)", cudaGetErrorString(e));
+            seen = 1;
+        } else {
+            fprintf(stderr, "ds4: layer-graph capture: sticky at '%s': %s\n",
+                    label ? label : "(null)", cudaGetErrorString(e));
+        }
+    }
+}
+
 extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         uint32_t il,
         const struct ds4_layer_graph_key *key) {

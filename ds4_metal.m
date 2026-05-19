@@ -420,6 +420,10 @@ void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
     (void)il;
 }
 
+void ds4_cuda_layer_graph_debug_peek(const char *label) {
+    (void)label;  /* Step 6 diagnostic; CUDA-only. */
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {

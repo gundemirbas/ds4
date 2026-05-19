@@ -274,6 +274,11 @@ int  ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
                                             const struct ds4_layer_graph_key *key);
 void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
 
+/* Step 6 diagnostic: cudaPeekAtLastError check.  No-op unless
+ * DS4_CUDA_LAYER_GRAPHS_DEBUG=1 AND a layer-graph capture is in flight.
+ * Used to bisect capture-mode incompatibilities by call site. */
+void ds4_cuda_layer_graph_debug_peek(const char *label);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

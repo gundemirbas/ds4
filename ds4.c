@@ -9335,12 +9335,16 @@ static bool metal_graph_encode_decode_layer_impl(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
+    ds4_cuda_layer_graph_debug_peek("dbg:enter-layer-body");
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_plain");
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
+    ds4_cuda_layer_graph_debug_peek("dbg:after-matmul_plain(hc_mix)");
     const bool fuse_hc_norm =
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
+    ds4_cuda_layer_graph_debug_peek("dbg:before-hc_split_or_pre");
     if (ok && fuse_hc_norm) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(g->attn_cur,
                                                          g->attn_norm,
@@ -9376,14 +9380,17 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_pre", g->attn_cur, DS4_N_EMBD, il, pos);
     }
+    ds4_cuda_layer_graph_debug_peek("dbg:after-hc_split_or_pre");
     if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->attn_cur,
                                                                    model->map, model->size,
                                                                    layer->attn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_weight");
     DS4_METAL_PROFILE_DECODE_STAGE("attn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
+    ds4_cuda_layer_graph_debug_peek("dbg:before-q8_0_pair");
     if (ok && qkv_rms_fused && decode_q8_pair) {
         ok = ds4_gpu_matmul_q8_0_pair_tensor(g->qr,
                                              g->kv_raw,
@@ -9413,6 +9420,7 @@ static bool metal_graph_encode_decode_layer_impl(
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
+        ds4_cuda_layer_graph_debug_peek("dbg:after-q8_0_pair-or-q8_0_kv");
         if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
                                                              g->qr,
                                                              model->map,
@@ -9425,6 +9433,7 @@ static bool metal_graph_encode_decode_layer_impl(
                                                              DS4_N_HEAD_DIM,
                                                              1,
                                                              DS4_RMS_EPS) != 0;
+        ds4_cuda_layer_graph_debug_peek("dbg:after-qkv_rms_norm_rows");
     } else {
         if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->qr_norm, g->qr,
                                                       model->map, model->size,
@@ -9437,14 +9446,17 @@ static bool metal_graph_encode_decode_layer_impl(
     if (qkv_rms_fused && ok) {
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
+    ds4_cuda_layer_graph_debug_peek("dbg:before-matmul_q8_0(q_b)");
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
                                               q_rank, q_dim,
                                               g->qr_norm, 1) != 0;
+    ds4_cuda_layer_graph_debug_peek("dbg:after-matmul_q8_0(q_b)");
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
     if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+    ds4_cuda_layer_graph_debug_peek("dbg:after-head_rms_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
     }
