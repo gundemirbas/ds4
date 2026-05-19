@@ -2256,6 +2256,13 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
+extern "C" const void *ds4_gpu_tensor_ptr(const ds4_gpu_tensor *tensor) {
+    /* Step 6: pointer-identity accessor for layer-graph cache-key
+     * construction.  Returns the cudaMalloc base; never dereferenced from
+     * C-side (just memcmp'd into the key). */
+    return tensor ? tensor->ptr : NULL;
+}
+
 extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
@@ -8625,58 +8632,28 @@ static struct dense_graph_entry *dense_graph_slot(const struct dense_graph_key *
  * capture time; the GPU dereferences them at execution time on every
  * replay.  See plan doc sec 4.2 + 15 for the full design.
  *
- * Entry-point contract (Step 6 wires the per-layer loop):
+ * Entry-point contract (publicly declared in ds4_gpu.h; Step 6 wires the
+ * per-layer loop):
  *   int  ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
- *                                              const struct layer_graph_key *key);
+ *                                              const struct ds4_layer_graph_key *key);
  *       returns  1: replayed (caller skips body encoding for this layer)
  *                0: capturing (caller proceeds; close with end_or_commit)
  *               -1: graphs disabled / unavailable (caller proceeds eagerly)
  *   void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
  *
- * Step 5 scope: cache infra + entry points + R3 inner-bypass.  No callers
- * yet (Step 6 adds them).  Gate is "compile clean".
+ * Step 5: cache infra + entry points + R3 inner-bypass (compile clean).
+ * Step 6: ds4.c per-layer loop builds the key and wires begin/end_or_commit.
  * ------------------------------------------------------------------------ */
 
-struct layer_graph_key {
-    /* Structural bits.  Per-layer scalars (n_comp, comp_row, etc.) do NOT
-     * enter the key -- the ds4_layer_scalars substrate carries them via
-     * a baked &g_layer_dev[il] pointer that's stable across replays. */
-    uint32_t il;          /* layer index, 0..DS4_N_LAYER-1 */
-    uint32_t n_tok;       /* 1 for normal decode, 2 for MTP decode2-exact */
-    uint32_t flags;       /* bit 0: emit_this_step  (ratio-4 emit token)
-                           * bit 1: indexed_active  (n_comp > decode_top_k)
-                           * bit 2: compressed_layer (ratio != 0)
-                           * bit 3: ratio4 vs ratio1 (compressor schedule)
-                           * bits 4..31: reserved */
-    uint32_t _pad;        /* align to 8 for the pointer block below */
-    /* Pointer set: tensor base addresses referenced by the captured
-     * kernels.  Reallocation invalidates the cached graph (eviction +
-     * recapture).  Domain of the P1c pointer validator added in Step 7. */
-    void    *cur_hc;
-    void    *after_ffn_hc;
-    void    *raw_cache;
-    void    *comp_cache;
-    void    *index_comp_cache;
-    void    *q;
-    void    *kv;
-    void    *heads;
-    void    *indexer_q;
-    void    *indexer_weights;
-    void    *indexer_scores;
-    void    *comp_selected;
-    void    *comp_kv_cur;
-    void    *comp_sc_cur;
-    void    *attn_state_kv;
-    void    *attn_state_score;
-    void    *index_state_kv;
-    void    *index_state_score;
-};
+/* Step 6: struct moved to ds4_gpu.h as `struct ds4_layer_graph_key` so
+ * ds4.c can build keys for the begin_or_replay caller.  Same memory
+ * layout as the original Step 5 internal struct; rename only. */
 
 struct layer_graph_entry {
-    struct layer_graph_key key;
-    cudaGraphExec_t        exec;
-    int                    valid;
-    uint64_t               hits;
+    struct ds4_layer_graph_key key;
+    cudaGraphExec_t            exec;
+    int                        valid;
+    uint64_t                   hits;
 };
 
 #define DS4_LAYER_GRAPH_CACHE_SIZE 256
@@ -8685,8 +8662,9 @@ static struct layer_graph_entry g_layer_graphs[DS4_LAYER_GRAPH_CACHE_SIZE];
 
 /* Env-var enable.  Default OFF for Step 5; Step 8 flips to ON after Step 7
  * proves bit-identical determinism + perf uplift.  Recognized values for
- * enable: 1, on, ON, yes, YES, true, TRUE.  Anything else is disable. */
-static int ds4_cuda_layer_graphs_enabled(void) {
+ * enable: 1, on, ON, yes, YES, true, TRUE.  Anything else is disable.
+ * extern "C" so ds4.c can gate the R4 split-flush + key build (Step 6). */
+extern "C" int ds4_cuda_layer_graphs_enabled(void) {
     static int init = 0;
     static int enabled = 0;
     if (!init) {
@@ -8704,7 +8682,7 @@ static int ds4_cuda_layer_graphs_enabled(void) {
     return enabled;
 }
 
-static uint64_t layer_graph_hash(const struct layer_graph_key *k) {
+static uint64_t layer_graph_hash(const struct ds4_layer_graph_key *k) {
     /* FNV-1a over the key bytes.  Matches moe_graph_hash / dense_graph_hash. */
     uint64_t h = 0xcbf29ce484222325ULL;
     const uint8_t *p = (const uint8_t *)k;
@@ -8715,7 +8693,7 @@ static uint64_t layer_graph_hash(const struct layer_graph_key *k) {
     return h;
 }
 
-static struct layer_graph_entry *layer_graph_slot(const struct layer_graph_key *key) {
+static struct layer_graph_entry *layer_graph_slot(const struct ds4_layer_graph_key *key) {
     return &g_layer_graphs[layer_graph_hash(key) % DS4_LAYER_GRAPH_CACHE_SIZE];
 }
 
@@ -8728,7 +8706,7 @@ static uint32_t                  g_layer_graph_capturing_il   = UINT32_MAX;
 
 extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         uint32_t il,
-        const struct layer_graph_key *key) {
+        const struct ds4_layer_graph_key *key) {
     if (!ds4_cuda_layer_graphs_enabled()) return -1;
     if (il >= DS4_LAYER_SCALARS_COUNT || !key) return -1;
     if (g_layer_graph_capturing_slot != NULL) {

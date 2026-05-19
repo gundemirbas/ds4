@@ -12968,17 +12968,77 @@ static bool metal_graph_encode_token_raw_swa(
         if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
     }
 
+    /* Step 6: per-layer cudaGraph capture/replay gate.  When
+     * DS4_CUDA_LAYER_GRAPHS=1 (and we're on a CUDA build), each layer body
+     * is captured into its own cudaGraphExec_t and replayed on subsequent
+     * tokens with matching keys.  R4: the mid-loop split-flush MUST be
+     * disabled here -- on CUDA `ds4_gpu_flush_commands()` is
+     * `cudaDeviceSynchronize()` which would break the pipeline of replays.
+     * Metal stub returns 0 from layer_graphs_enabled so behavior is
+     * unchanged on macOS. */
+    const bool layer_graphs = ds4_cuda_layer_graphs_enabled() != 0;
+    if (layer_graphs) allow_split_flush = false;
+
+    /* PC5 metadata that the cache key consumes: decode_top_k is config-
+     * stable per session (cheap to recompute each loop iteration but
+     * hoisted here for clarity). */
+    const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
+
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        ok = metal_graph_encode_decode_layer(g,
-                                             model,
-                                             &weights->layer[il],
-                                             il,
-                                             pos,
-                                             g->layer_raw_cache[il],
-                                             g->raw_cap,
-                                             raw_row,
-                                             n_raw,
-                                             token);
+        int rc = -1;
+        if (layer_graphs) {
+            const uint32_t il_ratio = ds4_layer_compress_ratio(il);
+            const bool emit_il      = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
+            const bool compressed   = il_ratio != 0u;
+            const bool ratio4       = il_ratio == 4u;
+            const bool indexed_act  = compressed && g->layer_n_comp[il] > decode_top_k;
+            struct ds4_layer_graph_key key;
+            memset(&key, 0, sizeof(key));
+            key.il    = il;
+            key.n_tok = 1;
+            key.flags = (emit_il      ? 1u  : 0u)
+                      | (indexed_act  ? 2u  : 0u)
+                      | (compressed   ? 4u  : 0u)
+                      | (ratio4       ? 8u  : 0u);
+            /* ds4_gpu_tensor is opaque to ds4.c -- use the accessor. */
+            key.cur_hc            = (void *)ds4_gpu_tensor_ptr(g->cur_hc);
+            key.after_ffn_hc      = (void *)ds4_gpu_tensor_ptr(g->after_ffn_hc);
+            key.raw_cache         = (void *)ds4_gpu_tensor_ptr(g->layer_raw_cache[il]);
+            key.comp_cache        = (void *)ds4_gpu_tensor_ptr(g->layer_attn_comp_cache[il]);
+            key.index_comp_cache  = (void *)ds4_gpu_tensor_ptr(g->layer_index_comp_cache[il]);
+            key.q                 = (void *)ds4_gpu_tensor_ptr(g->q);
+            key.kv                = (void *)ds4_gpu_tensor_ptr(g->kv);
+            key.heads             = (void *)ds4_gpu_tensor_ptr(g->heads);
+            key.indexer_q         = (void *)ds4_gpu_tensor_ptr(g->indexer_q);
+            key.indexer_weights   = (void *)ds4_gpu_tensor_ptr(g->indexer_weights);
+            key.indexer_scores    = (void *)ds4_gpu_tensor_ptr(g->indexer_scores);
+            key.comp_selected     = (void *)ds4_gpu_tensor_ptr(g->comp_selected);
+            key.comp_kv_cur       = (void *)ds4_gpu_tensor_ptr(g->comp_kv_cur);
+            key.comp_sc_cur       = (void *)ds4_gpu_tensor_ptr(g->comp_sc_cur);
+            key.attn_state_kv     = (void *)ds4_gpu_tensor_ptr(g->layer_attn_state_kv[il]);
+            key.attn_state_score  = (void *)ds4_gpu_tensor_ptr(g->layer_attn_state_score[il]);
+            key.index_state_kv    = (void *)ds4_gpu_tensor_ptr(g->layer_index_state_kv[il]);
+            key.index_state_score = (void *)ds4_gpu_tensor_ptr(g->layer_index_state_score[il]);
+            rc = ds4_cuda_layer_graph_begin_or_replay(il, &key);
+        }
+
+        if (rc != 1) {
+            ok = metal_graph_encode_decode_layer(g,
+                                                 model,
+                                                 &weights->layer[il],
+                                                 il,
+                                                 pos,
+                                                 g->layer_raw_cache[il],
+                                                 g->raw_cap,
+                                                 raw_row,
+                                                 n_raw,
+                                                 token);
+            /* Even if encode returned false (ok=false), close the capture
+             * if begin_or_replay opened one -- otherwise the next layer's
+             * begin_or_replay refuses with "prior capture still in flight". */
+            if (rc == 0) ds4_cuda_layer_graph_end_or_commit(il);
+        }
+
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;

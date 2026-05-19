@@ -38,6 +38,11 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
+/* Step 6: opaque-pointer accessor for cache-key construction in ds4.c.
+ * Returns the backend buffer base address (CUDA: cudaMalloc result;
+ * Metal: id<MTLBuffer> contents).  Used only for pointer-identity
+ * comparisons in the layer-graph cache key; never dereferenced from C. */
+const void *ds4_gpu_tensor_ptr(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
@@ -205,6 +210,69 @@ void  ds4_gpu_decode_layer_scalars_set(
         uint32_t n_index_comp,
         uint32_t comp_row,
         uint32_t index_row);
+
+/* =========================================================================
+ * Step 5/6: per-layer cudaGraph capture-and-replay.
+ *
+ * Wraps each iteration of the per-layer decode loop in
+ * cudaStreamBeginCapture / EndCapture / GraphInstantiate, then replays the
+ * cached executable on subsequent tokens.  CUDA-only; Metal stubs all of
+ * these as no-ops (begin returns -1, end is a no-op, enabled returns 0).
+ *
+ * Opt-in via the DS4_CUDA_LAYER_GRAPHS env var; default OFF for Step 5/6/7,
+ * default ON at Step 8 after determinism + perf gates pass.
+ *
+ * Per-token scalars do NOT enter the key -- they ride on the token-stable
+ * and per-layer scalar substrates (see ds4_gpu_decode_scalars_*) which
+ * have stable device addresses baked into the captured kernel-node arg
+ * lists.  See plan doc sec 4.2 / 15 / 16.
+ * ========================================================================= */
+
+struct ds4_layer_graph_key {
+    uint32_t il;     /* layer index, 0..DS4_N_LAYER-1 */
+    uint32_t n_tok;  /* 1 for normal decode; 2 for MTP decode2-exact */
+    uint32_t flags;  /* bit 0: emit_this_step (ratio-4 emit token)
+                      * bit 1: indexed_active (n_comp > decode_top_k)
+                      * bit 2: compressed_layer (ratio != 0)
+                      * bit 3: ratio4 vs ratio1
+                      * bits 4..31: reserved */
+    uint32_t _pad;   /* align to 8 for the pointer block below */
+    /* Tensor base pointers referenced by the captured layer body.
+     * Reallocation (KV-cache regrow) invalidates the cached graph
+     * (eviction + recapture). */
+    void    *cur_hc;
+    void    *after_ffn_hc;
+    void    *raw_cache;
+    void    *comp_cache;
+    void    *index_comp_cache;
+    void    *q;
+    void    *kv;
+    void    *heads;
+    void    *indexer_q;
+    void    *indexer_weights;
+    void    *indexer_scores;
+    void    *comp_selected;
+    void    *comp_kv_cur;
+    void    *comp_sc_cur;
+    void    *attn_state_kv;
+    void    *attn_state_score;
+    void    *index_state_kv;
+    void    *index_state_score;
+};
+
+/* Returns 1 iff DS4_CUDA_LAYER_GRAPHS is set to an enable value.  Metal
+ * stub returns 0.  Callers use this to gate the per-token build_key cost
+ * and the R4 split-flush override. */
+int  ds4_cuda_layer_graphs_enabled(void);
+
+/* begin_or_replay return values:
+ *   1  -- cache hit; graph replayed; caller skips the layer body encoding.
+ *   0  -- capturing; caller encodes the body; close with end_or_commit.
+ *  -1  -- disabled / unavailable; caller proceeds eagerly.
+ * Metal backend always returns -1. */
+int  ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
+                                            const struct ds4_layer_graph_key *key);
+void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

@@ -401,6 +401,25 @@ void ds4_gpu_decode_layer_scalars_set(
     g_metal_layer_scalars[il].index_row    = index_row;
 }
 
+/* Step 6: per-layer graph capture/replay is CUDA-only.  Metal has no
+ * cudaGraph analogue (MTLIndirectCommandBuffer is a different model and
+ * the legacy MTLBlitCommandEncoder split-flush already pipelines).  These
+ * stubs let ds4.c call the API unconditionally; on Metal builds the
+ * caller path drops through to its eager encode every layer. */
+int ds4_cuda_layer_graphs_enabled(void) {
+    return 0;
+}
+
+int ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
+                                           const struct ds4_layer_graph_key *key) {
+    (void)il; (void)key;
+    return -1;  /* always "disabled" on Metal -> caller proceeds eagerly */
+}
+
+void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
+    (void)il;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
@@ -4004,6 +4023,15 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     if (!tensor) return 0;
     const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
     return obj.bytes;
+}
+
+const void *ds4_gpu_tensor_ptr(const ds4_gpu_tensor *tensor) {
+    /* Step 6: pointer-identity accessor for the cache key.  Returns the
+     * MTLBuffer contents pointer -- never dereferenced from C-side. */
+    if (!tensor) return NULL;
+    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+    id<MTLBuffer> buf = obj.buffer;
+    return buf ? buf.contents : NULL;
 }
 
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
