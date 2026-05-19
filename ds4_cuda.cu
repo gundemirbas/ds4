@@ -8861,6 +8861,66 @@ extern "C" void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint3
     ds4_cuda_dump_tag_kernel<<<1, 1, 0, ds4_current_stream()>>>(tag, slot);
 }
 
+/* Step 7 deep-narrowing: one-shot probe-slot handoff between TUs.
+ *
+ * Background: the routed-MoE intra-branch probes (slots 213-216) showed
+ * that under MMVQ-decode the FIRST divergent intermediate is routed_gate.
+ * That tensor is the output of ds4_mmq_<type>_moe_vec, which lives in
+ * cuda/mmq/ds4_mmq.cu (a separate TU).  Inside that function the work is
+ *   1. quantize_row_q8_1_cuda(X_f32 -> src1_q8_1)
+ *   2. mul_mat_vec_q_switch_type(W, src1_q8_1, ids -> dst)
+ * To bisect between (1) and (2) we need to hash src1_q8_1 between them.
+ * That buffer is a ggml_cuda_pool_alloc<char>, not a ds4_gpu_tensor, so
+ * the existing dump_hash_at_slot doesn't apply directly.
+ *
+ * Handoff protocol:
+ *   - ds4_cuda.cu (MMVQ-decode branch) sets the probe slot to a specific
+ *     value (217=gate, 218=up, 219=down) just before each moe_vec call
+ *     when the current layer is 0.
+ *   - ds4_mmq.cu, after step (1) above, consumes the slot (read + clear)
+ *     and if non-zero, hashes src1_q8_1 to that slot via the raw helper.
+ *   - The slot is one-shot to avoid stale probes carrying over into
+ *     subsequent calls.
+ *
+ * g_dump_current_layer is set host-side by ds4.c at the top of each
+ * layer body, so ds4_cuda.cu can gate the slot-set on layer == 0
+ * without needing the layer index threaded through the call signatures. */
+static volatile int      g_dump_current_layer = -1;
+static volatile uint32_t g_dump_probe_slot    = 0;
+
+extern "C" void ds4_cuda_dump_set_current_layer(int il) {
+    g_dump_current_layer = il;
+}
+
+extern "C" int ds4_cuda_dump_get_current_layer(void) {
+    return (int)g_dump_current_layer;
+}
+
+extern "C" void ds4_cuda_dump_probe_slot_set(uint32_t slot) {
+    g_dump_probe_slot = slot;
+}
+
+extern "C" uint32_t ds4_cuda_dump_probe_slot_consume(void) {
+    uint32_t s = g_dump_probe_slot;
+    g_dump_probe_slot = 0;
+    return s;
+}
+
+/* Variant of dump_hash_at_slot that accepts a raw pointer + n_floats
+ * instead of a ds4_gpu_tensor.  Used for buffers (e.g. pool-allocated
+ * Q8_1 scratch inside ds4_mmq.cu) that don't have a tensor wrapper.
+ * Treats the buffer as a sequence of floats; the FNV-1a is over the
+ * uint32 bit pattern, so any consistent byte layout will hash
+ * deterministically. */
+extern "C" void ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
+                                                const char *label, uint32_t slot) {
+    if (!ds4_cuda_dump_hash_enabled() || !buf) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_labels[slot] = label;
+    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            (const float *)buf, n_floats, slot);
+}
+
 extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
     if (!ds4_cuda_dump_hash_enabled()) return;
     /* Synchronize all pending captures + launches so device hashes are
@@ -14459,11 +14519,22 @@ static int routed_moe_launch(
             }
 
             int rc = -1;
+            /* Step 7 deep-narrowing: arm the probe slot before each moe_vec
+             * call when we're processing L0.  ds4_mmq.cu's moe_vec_impl
+             * consumes the slot after the internal Q8_1 quantize and dumps
+             * the post-quantize buffer hash there.  Used to bisect between
+             * Q8_1 quantize and MMVQ matvec as the source of capture-replay
+             * divergence at routed_gate (slot 213).
+             *   slot 217 = gate q81-after-quantize
+             *   slot 218 = up   q81-after-quantize
+             *   slot 219 = down q81-after-quantize */
+            const int probe_l0 = (g_dump_current_layer == 0);
             /* 1. Two separate gate/up matmuls through mmvq.  Each call
              *    re-quantizes the activation - acceptable for n_tokens=1
              *    (4KB Q8_1 buffer) and avoids needing a shared-buffer API
              *    in this first iteration. */
             if (q4k_path) {
+                if (probe_l0) g_dump_probe_slot = 217;
                 rc = ds4_mmq_q4_K_moe_vec(gate_w, (const float *)x->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)gate->ptr,
@@ -14474,6 +14545,7 @@ static int routed_moe_launch(
                     fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_vec (gate) returned %d; falling back\n", rc);
                     goto mmvq_decode_bail;
                 }
+                if (probe_l0) g_dump_probe_slot = 218;
                 rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)up->ptr,
@@ -14481,6 +14553,7 @@ static int routed_moe_launch(
                                           (int)n_tokens, (int)n_experts_total,
                                           (int)n_expert_used, moe_stream);
             } else {
+                if (probe_l0) g_dump_probe_slot = 217;
                 rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
                                              (const int32_t *)selected->ptr,
                                              (float *)gate->ptr,
@@ -14491,6 +14564,7 @@ static int routed_moe_launch(
                     fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
                     goto mmvq_decode_bail;
                 }
+                if (probe_l0) g_dump_probe_slot = 218;
                 rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
                                              (const int32_t *)selected->ptr,
                                              (float *)up->ptr,
@@ -14520,6 +14594,7 @@ static int routed_moe_launch(
              *    one expert.  Routes through mmvq's multi-token MoE kernel
              *    (mul_mat_vec_q_moe) at ncols_dst = n_assignments. */
             if (q4k_path) {
+                if (probe_l0) g_dump_probe_slot = 219;
                 rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)down->ptr,
@@ -14527,6 +14602,7 @@ static int routed_moe_launch(
                                           (int)n_assignments, (int)n_experts_total,
                                           /*n_expert_used=*/1, moe_stream);
             } else {
+                if (probe_l0) g_dump_probe_slot = 219;
                 rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)down->ptr,

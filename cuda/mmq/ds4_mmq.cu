@@ -769,6 +769,27 @@ int ds4_mmq_moe_vec_impl(
         return -2;
     }
 
+    // Step 7 deep-narrowing: consume the one-shot probe slot from
+    // ds4_cuda.cu's MMVQ-decode branch and hash the post-quantize Q8_1
+    // buffer to it.  No-op when slot is 0 (no probe armed) or when the
+    // hash dump env var is unset.  Hashes raw bytes as floats: identical
+    // byte content => identical hash, so divergence in the Q8_1 quantize
+    // shows up as a slot-value mismatch between OFF and ON runs.
+    {
+        extern uint32_t ds4_cuda_dump_probe_slot_consume(void);
+        extern void ds4_cuda_dump_hash_raw_at_slot(const void *buf,
+                                                    uint64_t n_floats,
+                                                    const char *label,
+                                                    uint32_t slot);
+        uint32_t probe_slot = ds4_cuda_dump_probe_slot_consume();
+        if (probe_slot) {
+            uint64_t n_floats = nbytes_q8_1 / sizeof(float);
+            ds4_cuda_dump_hash_raw_at_slot(src1_q8_1.get(), n_floats,
+                                            "MoE:q81-after-quantize",
+                                            probe_slot);
+        }
+    }
+
     // 2. mmvq stride setup. Mirror upstream's ggml_cuda_mul_mat_vec_q
     //    dispatch (mmvq.cu:1101-1136).
     //

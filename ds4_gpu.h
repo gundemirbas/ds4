@@ -306,6 +306,19 @@ int  ds4_cuda_dump_get_last_moe_branch(void);
 void ds4_cuda_dump_set_last_moe_branch(int b);
 void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot);
 
+/* Step 7 deep-narrowing: cross-TU one-shot probe-slot handoff.
+ * ds4.c sets the current layer; ds4_cuda.cu's MMVQ-decode branch sets
+ * the probe slot (only when current layer == 0); ds4_mmq.cu consumes
+ * it after the internal Q8_1 quantize and dumps src1_q8_1 to that slot.
+ * The raw helper accepts a raw void* + n_floats for buffers that don't
+ * have a ds4_gpu_tensor wrapper. */
+void     ds4_cuda_dump_set_current_layer(int il);
+int      ds4_cuda_dump_get_current_layer(void);
+void     ds4_cuda_dump_probe_slot_set(uint32_t slot);
+uint32_t ds4_cuda_dump_probe_slot_consume(void);
+void     ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
+                                          const char *label, uint32_t slot);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

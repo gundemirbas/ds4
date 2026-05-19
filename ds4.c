@@ -9339,6 +9339,10 @@ static bool metal_graph_encode_decode_layer_impl(
      * 200..206 so captured-graph writes don't collide with eager
      * post-capture L0n_out probes (which auto-number from slot 0). */
     const bool dump_this_layer = (il == 0);
+    /* Step 7 deep-narrowing: tell ds4_cuda.cu which layer we're on so its
+     * MMVQ-decode branch can arm one-shot probe slots only on L0.
+     * No-op when hash-dump env var is unset. */
+    ds4_cuda_dump_set_current_layer((int)il);
     ds4_cuda_layer_graph_debug_peek("dbg:enter-layer-body");
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_plain");

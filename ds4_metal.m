@@ -457,6 +457,27 @@ void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot) {
     (void)tag; (void)label; (void)slot;
 }
 
+void ds4_cuda_dump_set_current_layer(int il) {
+    (void)il;
+}
+
+int ds4_cuda_dump_get_current_layer(void) {
+    return -1;
+}
+
+void ds4_cuda_dump_probe_slot_set(uint32_t slot) {
+    (void)slot;
+}
+
+uint32_t ds4_cuda_dump_probe_slot_consume(void) {
+    return 0;
+}
+
+void ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
+                                      const char *label, uint32_t slot) {
+    (void)buf; (void)n_floats; (void)label; (void)slot;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
