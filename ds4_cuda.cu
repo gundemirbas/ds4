@@ -9351,7 +9351,21 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 
         struct dense_graph_entry *dslot = NULL;
         int dcapturing = 0;
-        cudaStream_t moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+        /* Step 7 stream-ordering fix (post-analyst review): when an outer
+         * layer-graph capture is active, the dense-vec mmq kernels MUST
+         * run on the outer capture stream so they're recorded as nodes
+         * of that graph and the surrounding probes/swiglu/sum kernels can
+         * declare proper data dependencies on their outputs.  The earlier
+         * code initialised moe_stream to 0 when DS4_CUDA_MOE_GRAPHS was
+         * not set, which left the mmq kernels on the legacy default stream
+         * while the rest of the layer ran on the capture stream -- a race
+         * the captured-replay scheduler resolved differently than eager. */
+        cudaStream_t moe_stream;
+        if (ds4_capture_active()) {
+            moe_stream = ds4_current_stream();
+        } else {
+            moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+        }
         /* R3 inner-bypass (Step 5, hardened in Step 6).  When an outer
          * per-layer capture is active, skip the inner dense-graph cache
          * entirely.  Both branches are unsafe under outer capture:
@@ -9359,9 +9373,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
          *     cross-stream dependency CUDA capture rejects with "operation
          *     failed due to a previous error during capture".
          *   - MISS path (cudaStreamBeginCapture) CUDA forbids as nested.
-         * The kernels in ds4_mmq_q8_0_dense_vec below already route
-         * through ds4_current_stream() (A2) which == moe_stream during
-         * outer capture, so they fold into the outer graph for free. */
+         * The kernels in ds4_mmq_q8_0_dense_vec below now run on
+         * moe_stream == ds4_current_stream() during outer capture (set
+         * just above), so they fold into the outer graph as proper nodes
+         * with explicit dependencies on the surrounding work. */
         if (ds4_cuda_moe_graphs_enabled() && moe_stream && !ds4_capture_active()) {
             struct dense_graph_key dkey;
             memset(&dkey, 0, sizeof(dkey));
@@ -14450,7 +14465,23 @@ static int routed_moe_launch(
              * kernel sequence below and store the exec for next time. */
             struct moe_graph_entry *graph_slot = NULL;
             int graph_capturing = 0;
-            cudaStream_t moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+            /* Step 7 stream-ordering fix (post-analyst review): under outer
+             * layer-graph capture, route mmq through the active capture
+             * stream so it's recorded as a graph node with proper
+             * dependencies on surrounding probes/swiglu/sum kernels.  The
+             * previous initialisation left moe_stream = 0 when
+             * DS4_CUDA_MOE_GRAPHS was not set, which left mmq running on
+             * the legacy default stream while the rest of the layer ran on
+             * the capture stream -- a race that the captured-replay
+             * scheduler resolved differently than eager, producing the
+             * routed_gate divergence at slot 213.  See plan-doc Step 7
+             * deep-narrowing entry for the diagnosis. */
+            cudaStream_t moe_stream;
+            if (ds4_capture_active()) {
+                moe_stream = ds4_current_stream();
+            } else {
+                moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+            }
             /* R3 inner-bypass (Step 5, hardened in Step 6).  When an outer
              * per-layer capture is active, skip the inner MoE-graph cache
              * entirely (both HIT path and MISS path are unsafe under outer
