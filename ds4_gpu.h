@@ -584,7 +584,13 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          row,
         uint32_t          head_dim,
-        uint32_t          n_rot);
+        uint32_t          n_rot,
+        /* PC4 (K0): optional device-scalars override.  Decode-time caller
+         * passes ds4_gpu_decode_scalars_device_ptr() so the raw-store
+         * kernel reads raw_row from g_decode_dev at execution time --
+         * capture-safe.  Decode2-exact path passes NULL (kernel uses
+         * inline row).  Metal backend ignores the argument. */
+        const void       *scalars);
 
 /* Reference/raw-cache primitive kept for prefill and diagnostics.  Decode uses
  * ds4_gpu_kv_fp8_store_raw_tensor unless a diagnostic reference path is
@@ -594,7 +600,9 @@ int ds4_gpu_store_raw_kv_tensor(
         const ds4_gpu_tensor *kv,
         uint32_t                raw_cap,
         uint32_t                row,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        /* PC4 (K0): same semantics as the _fp8_store_raw variant above. */
+        const void             *scalars);
 
 int ds4_gpu_store_raw_kv_batch_tensor(
         ds4_gpu_tensor       *raw_cache,

@@ -4887,13 +4887,27 @@ __global__ static void indexer_hadamard_fp4_row_kernel(
     xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
 }
 
-__global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+__global__ static void store_raw_kv_batch_kernel(
+        float *raw, const float *kv,
+        uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim,
+        const struct ds4_decode_scalars * __restrict__ s_override) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t t = gid / head_dim;
-    uint32_t row = (pos0 + t) % raw_cap;
+    /* PC4 (K0): decode1 single-row path reads raw_row from the token-stable
+     * substrate at execution time -- capture-safe.  Under layer-graph
+     * capture, `pos0` was baked into the kernel-node arg list at queue
+     * time and would replay the wrong slot.  Batch path (n_tokens > 1)
+     * is not capture-targeted (decode2-exact per plan doc sec 8.3) and
+     * keeps the inline arg. */
+    uint32_t row;
+    if (s_override != NULL && n_tokens == 1u) {
+        row = s_override->raw_row;
+    } else {
+        row = (pos0 + t) % raw_cap;
+    }
     raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
 }
 
@@ -9932,22 +9946,34 @@ extern "C" int ds4_gpu_rope_tail_scalars_tensor(
             beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail_scalars launch");
 }
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
+extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, const void *scalars);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
         uint32_t          raw_row,
         uint32_t          head_dim,
-        uint32_t          n_rot) {
+        uint32_t          n_rot,
+        /* PC4 (K0): optional device-scalars override.  Decode-time
+         * caller passes ds4_gpu_decode_scalars_device_ptr() so the
+         * raw-store kernel reads raw_row from g_decode_dev at execution
+         * time -- capture-safe.  Decode2-exact path passes NULL (kernel
+         * uses inline raw_row arg). */
+        const void       *scalars) {
     return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
-           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim);
+           ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim, scalars);
 }
-extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim) {
+extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, const void *scalars) {
     if (!raw_cache || !kv || raw_cap == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, row, 1, head_dim);
+    /* PC4 (K0): n_tokens=1 single-row path; scalars != NULL signals
+     * "read raw_row from substrate".  Decode1 callers pass
+     * ds4_gpu_decode_scalars_device_ptr(); decode2-exact passes NULL. */
+    store_raw_kv_batch_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
+            (float *)raw_cache->ptr, (const float *)kv->ptr,
+            raw_cap, row, 1, head_dim,
+            (const struct ds4_decode_scalars *)scalars);
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
@@ -9955,7 +9981,12 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
     uint64_t n = (uint64_t)n_tokens * head_dim;
-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
+    /* PC4 (K0): batch path (n_tokens > 1) not capture-targeted; pass
+     * NULL for scalars so the kernel uses the inline pos0 + per-thread
+     * mod. */
+    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256, 0, ds4_current_stream()>>>(
+            (float *)raw_cache->ptr, (const float *)kv->ptr,
+            raw_cap, pos0, n_tokens, head_dim, NULL);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
 }
 extern "C" int ds4_gpu_compressor_store_batch_tensor(

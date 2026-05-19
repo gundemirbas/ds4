@@ -9252,7 +9252,8 @@ static bool metal_graph_decode_kv_store(
         uint32_t          raw_row) {
     if (metal_graph_use_reference_kv_decode()) {
         return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0 &&
-               ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM) != 0;
+               ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM,
+                                             ds4_gpu_decode_scalars_device_ptr()  /* PC4 (K0): substrate raw_row at execution time */) != 0;
     }
 
     return ds4_gpu_kv_fp8_store_raw_tensor(kv,
@@ -9260,7 +9261,8 @@ static bool metal_graph_decode_kv_store(
                                              raw_cap,
                                              raw_row,
                                              DS4_N_HEAD_DIM,
-                                             DS4_N_ROT) != 0;
+                                             DS4_N_ROT,
+                                             ds4_gpu_decode_scalars_device_ptr()  /* PC4 (K0): substrate raw_row at execution time */) != 0;
 }
 
 /* Encode one DS4 decode layer on Metal.  This is the release single-token
@@ -14518,7 +14520,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        kv_cache_view,
                                                        g->raw_cap,
                                                        pos % g->raw_cap,
-                                                       DS4_N_HEAD_DIM) != 0;
+                                                       DS4_N_HEAD_DIM,
+                                                       NULL  /* PC4 (K0): decode2-exact, no substrate; inline row */) != 0;
                 }
                 if (ok && comp_mask != NULL && n_selected != 0) {
                     ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(heads_view,

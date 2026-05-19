@@ -6440,7 +6440,9 @@ int ds4_gpu_store_raw_kv_tensor(
         const ds4_gpu_tensor *kv,
         uint32_t                raw_cap,
         uint32_t                row,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        const void             *scalars) {
+    (void)scalars;  /* PC4: Metal reads inline row; no device-scalars substrate. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!raw_cache || !kv || raw_cap == 0 || row >= raw_cap || head_dim == 0 || raw_cap > INT32_MAX) return 0;
 
@@ -6482,7 +6484,9 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_cap,
         uint32_t          row,
         uint32_t          head_dim,
-        uint32_t          n_rot) {
+        uint32_t          n_rot,
+        const void       *scalars) {
+    (void)scalars;  /* PC4: Metal reads inline row; no device-scalars substrate. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv || !raw_cache || raw_cap == 0 || row >= raw_cap || head_dim == 0 ||
         n_rot > head_dim || raw_cap > INT32_MAX) {
