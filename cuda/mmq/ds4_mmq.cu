@@ -688,6 +688,16 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
 
 #include "mmvq.cuh"
 
+/* Step 7 deep-narrowing: cross-TU probe slot handoff from ds4_cuda.cu.
+ * Declared here at file scope (not inside the anonymous namespace below)
+ * so the C linkage is preserved and the linker can resolve them against
+ * the definitions in ds4_cuda.cu. */
+extern "C" uint32_t ds4_cuda_dump_probe_slot_consume(void);
+extern "C" void     ds4_cuda_dump_hash_raw_at_slot(const void *buf,
+                                                     uint64_t n_floats,
+                                                     const char *label,
+                                                     uint32_t slot);
+
 namespace {
 
 template <ggml_type type>
@@ -775,12 +785,8 @@ int ds4_mmq_moe_vec_impl(
     // hash dump env var is unset.  Hashes raw bytes as floats: identical
     // byte content => identical hash, so divergence in the Q8_1 quantize
     // shows up as a slot-value mismatch between OFF and ON runs.
+    // (Extern decls live at file scope above so C linkage is preserved.)
     {
-        extern uint32_t ds4_cuda_dump_probe_slot_consume(void);
-        extern void ds4_cuda_dump_hash_raw_at_slot(const void *buf,
-                                                    uint64_t n_floats,
-                                                    const char *label,
-                                                    uint32_t slot);
         uint32_t probe_slot = ds4_cuda_dump_probe_slot_consume();
         if (probe_slot) {
             uint64_t n_floats = nbytes_q8_1 / sizeof(float);
