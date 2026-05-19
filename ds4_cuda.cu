@@ -9221,7 +9221,16 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         }
 
         if (rc == 0) {
-            ds4_cuda_moe_stream_sync_post(moe_stream);
+            /* R3 inner-bypass (Step 6 hardening): when outer per-layer
+             * capture is active, the sync_post event would record on
+             * moe_stream (captured) and wait on stream=0 (legacy) --
+             * CUDA rejects this with "operation would make the legacy
+             * stream depend on a capturing blocking stream".  The outer
+             * end_or_commit handles cross-stream sync for the whole
+             * captured layer; skip the inner one. */
+            if (!ds4_capture_active()) {
+                ds4_cuda_moe_stream_sync_post(moe_stream);
+            }
             return 1;
         }
         fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_vec returned %d (label='%s' in=%llu out=%llu); falling back to mmq\n",
@@ -14413,7 +14422,12 @@ static int routed_moe_launch(
                             cudaGetErrorString(ge));
                 }
             }
-            ds4_cuda_moe_stream_sync_post(moe_stream);
+            /* R3 inner-bypass (Step 6 hardening): skip cross-stream sync
+             * when outer per-layer capture is active (outer end_or_commit
+             * handles it).  See matching guard at the dense Q8_0 site. */
+            if (!ds4_capture_active()) {
+                ds4_cuda_moe_stream_sync_post(moe_stream);
+            }
             return 1;
         mmvq_decode_bail:
             /* Failure inside the mmvq decode branch: end any in-flight
