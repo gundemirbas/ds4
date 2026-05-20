@@ -65,7 +65,7 @@ int ds4_gpu_synchronize(void);
  *
  *   1. TOKEN-STABLE struct (ds4_decode_scalars, 40 B device-side).  Carries
  *      scalars whose value is constant across all 43 layers within a token:
- *      pos0, raw_row, raw_start, n_raw, emit_phase, flags.  Single pinned
+ *      pos0, raw_row, raw_start, n_raw, emit_phase, flags, token.  Single pinned
  *      host buffer + single device address; one H2D memcpy per token,
  *      currently EAGER on ds4_current_stream() (outside any captured-graph
  *      scope).  Under Step 6's wider per-token graph the memcpy can become

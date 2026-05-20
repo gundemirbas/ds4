@@ -9084,24 +9084,31 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
     if (!s) return -1;
 
     struct layer_graph_entry *slot = layer_graph_slot(key);
-    /* Step 7 task #35: per-call L0 cache-decision probe.  Prints the
-     * action (replay / warm / capture), slot index, key hash, n_tok and
-     * flags for every begin_or_replay on layer 0.  Diffing the per-call
-     * sequence across processes shows whether pos=25's L0 replay picks a
-     * different captured graph (key non-determinism) in the two attractor
-     * states.  Gated on DS4_CUDA_LGRAPH_PROBE. */
-    if (il == 0 && getenv("DS4_CUDA_LGRAPH_PROBE") != NULL) {
-        static unsigned l0_call = 0;
+    /* Step 7 task #35/#37: per-call layer cache-decision + scalar probe.
+     * Prints action (replay/warm/capture), slot index, key hash, n_tok,
+     * flags, plus the token-stable decode_scalars for every begin_or_replay
+     * on layers 0..3.  Diffing the per-call sequence across runs localises
+     * which (il, pos) the captured graph first diverges and whether a
+     * scalar or the cache decision flips at that boundary.  Gated on
+     * DS4_CUDA_LGRAPH_PROBE. */
+    if (il <= 3u && getenv("DS4_CUDA_LGRAPH_PROBE") != NULL) {
         unsigned long long kh = layer_graph_hash(key);
         const char *act = (slot->valid && memcmp(&slot->key, key, sizeof(*key)) == 0)
                               ? "REPLAY"
                               : ((!slot->warmed || memcmp(&slot->key, key, sizeof(*key)) != 0)
                                      ? "WARM" : "CAPTURE");
+        const struct ds4_decode_scalars *ds = g_decode_host;
         fprintf(stderr,
-                "DS4_LGRAPH il=0 call=%u action=%s slotidx=%u keyhash=%016llx "
-                "n_tok=%u flags=%u valid=%d warmed=%d\n",
-                l0_call++, act, (unsigned)(kh % DS4_LAYER_GRAPH_CACHE_SIZE), kh,
-                key->n_tok, key->flags, slot->valid, slot->warmed);
+                "DS4_LGRAPH il=%u action=%-7s slotidx=%3u keyhash=%016llx "
+                "n_tok=%u flags=%u | pos0=%u raw_row=%u raw_start=%u n_raw=%u "
+                "n_comp=%u emit_phase=%u comp_row=%u index_row=%u token=%u\n",
+                il, act, (unsigned)(kh % DS4_LAYER_GRAPH_CACHE_SIZE), kh,
+                key->n_tok, key->flags,
+                ds ? ds->pos0 : 0u, ds ? ds->raw_row : 0u,
+                ds ? ds->raw_start : 0u, ds ? ds->n_raw : 0u,
+                ds ? ds->n_comp : 0u, ds ? ds->emit_phase : 0u,
+                ds ? ds->comp_row : 0u, ds ? ds->index_row : 0u,
+                ds ? ds->token : 0u);
         fflush(stderr);
     }
     if (slot->valid && memcmp(&slot->key, key, sizeof(*key)) == 0) {
