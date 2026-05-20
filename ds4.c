@@ -9639,8 +9639,12 @@ static bool metal_graph_encode_decode_layer_impl(
          * DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1. */
         if (ok && emit && il <= 2u) {
             const uint32_t coff_p = (ratio == 4u) ? 2u : 1u;
+            /* Constant n_elem (32 rows) so the dump kernel hashes the same
+             * fixed region whether the layer runs captured or eager -- a
+             * growing n_comp count would otherwise be baked at capture and
+             * make captured-vs-eager incomparable. */
             ds4_cuda_dump_hash_at_slot(g->layer_attn_comp_cache[il],
-                                       (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
+                                       (uint64_t)32u * DS4_N_HEAD_DIM,
                                        "emit:attn_comp_cache", 243u + il);
             ds4_cuda_dump_hash_at_slot(g->layer_attn_state_kv[il],
                                        (uint64_t)coff_p * ratio * coff_p * DS4_N_HEAD_DIM,
@@ -9725,7 +9729,7 @@ static bool metal_graph_encode_decode_layer_impl(
             /* Step 7 task #38: indexer emit-buffer probe (slots 249..251). */
             if (ok && emit && il <= 2u) {
                 ds4_cuda_dump_hash_at_slot(g->layer_index_comp_cache[il],
-                                           (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM,
+                                           (uint64_t)32u * DS4_N_INDEXER_HEAD_DIM,
                                            "emit:index_comp_cache", 249u + il);
             }
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
