@@ -310,10 +310,11 @@ void ds4_gpu_decode_scalars_set(
         uint32_t raw_window,
         uint32_t ratio,
         uint32_t n_comp,
-        uint32_t flags) {
+        uint32_t flags,
+        uint32_t token) {
     g_metal_decode_pos0 = pos0;
     (void)raw_cap; (void)raw_window;
-    (void)ratio; (void)n_comp; (void)flags;
+    (void)ratio; (void)n_comp; (void)flags; (void)token;
 }
 
 int ds4_gpu_decode_scalars_flush(void) {

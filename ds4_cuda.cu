@@ -217,7 +217,12 @@ struct ds4_decode_scalars {
                            * bit 1: indexed-attention path active
                            * bit 2: ratio4 compressor schedule
                            * bits 3..31: reserved (must be 0) */
-    uint32_t _pad;        /* align to 40 B */
+    uint32_t token;       /* decode token id this step.  Step 7 task #36:
+                           * the hash-mode router-select kernels read the
+                           * token from here (device buffer) instead of a
+                           * by-value kernel arg, so a captured layer graph
+                           * looks up the LIVE token on replay rather than
+                           * the frozen capture-time value. */
 };
 static_assert(sizeof(struct ds4_decode_scalars) == 40u,
               "ds4_decode_scalars must be exactly 40 bytes");
@@ -1061,6 +1066,8 @@ extern "C" const void *ds4_gpu_decode_scalars_device_ptr(void) {
  *   flags      -- bit 0: emit FP8 KV this step
  *                 bit 1: indexed-attention path
  *                 bit 2: ratio4 (reserved; informational)
+ *   token      -- decode token id this step (read by the hash-mode
+ *                 router-select kernels from the device mirror)
  *
  * Outside graph capture this just touches a pinned page; cost is one
  * 32-byte store + a uint32 divmod.  Inside replay it is invisible (the
@@ -1074,7 +1081,8 @@ extern "C" void ds4_gpu_decode_scalars_set(
         uint32_t raw_window,
         uint32_t ratio,
         uint32_t n_comp,
-        uint32_t flags) {
+        uint32_t flags,
+        uint32_t token) {
     if (g_decode_host == NULL) return;
     const uint32_t cap = raw_cap ? raw_cap : 1u;
     const uint32_t r   = ratio   ? ratio   : 1u;
@@ -1092,7 +1100,7 @@ extern "C" void ds4_gpu_decode_scalars_set(
      * ds4_gpu_decode_scalars_set_emit_rows() and remain valid across the
      * non-emit per-layer steps too (kernels just won't read them). */
     g_decode_host->flags      = flags;
-    g_decode_host->_pad       = 0;
+    g_decode_host->token      = token;
 }
 
 /* UNSAFE pending removal in Step 4c.  See plan doc local/docs/
@@ -6672,7 +6680,8 @@ __global__ static void router_select_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        const struct ds4_decode_scalars *scalars) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
     const float *log = logits + (uint64_t)t * 256;
@@ -6683,7 +6692,8 @@ __global__ static void router_select_kernel(
     for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
-        int32_t tok = tokens ? tokens[t] : token_scalar;
+        int32_t tok = tokens ? tokens[t]
+                             : (scalars ? (int32_t)scalars->token : token_scalar);
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
         const int32_t *row = hash + (uint64_t)tok * 6;
         for (int i = 0; i < 6; i++) sel[i] = row[i];
@@ -6724,7 +6734,8 @@ __global__ static void router_select_parallel_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        const struct ds4_decode_scalars *scalars) {
     uint32_t t = blockIdx.x;
     uint32_t i = threadIdx.x;
     if (t >= n_tokens || i >= 256u) return;
@@ -6741,7 +6752,8 @@ __global__ static void router_select_parallel_kernel(
 
     if (i != 0) return;
     if (hash_mode) {
-        int32_t tok = tokens ? tokens[t] : token_scalar;
+        int32_t tok = tokens ? tokens[t]
+                             : (scalars ? (int32_t)scalars->token : token_scalar);
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
         const int32_t *row = hash + (uint64_t)tok * 6;
         for (int j = 0; j < 6; j++) sel[j] = row[j];
@@ -6802,7 +6814,8 @@ __global__ static void router_select_warp_topk_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        const struct ds4_decode_scalars *scalars) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row_in_block = threadIdx.y;
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
@@ -6843,7 +6856,8 @@ __global__ static void router_select_warp_topk_kernel(
 
     if (hash_mode) {
         if (lane == 0) {
-            int32_t tok = tokens ? tokens[t] : token_scalar;
+            int32_t tok = tokens ? tokens[t]
+                                 : (scalars ? (int32_t)scalars->token : token_scalar);
             if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
             const int32_t *row = hash + (uint64_t)tok * 6u;
             float sum = 0.0f;
@@ -12121,15 +12135,15 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block, 0, ds4_current_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                         has_bias && !hash_mode, hash_mode);
+                                                         has_bias && !hash_mode, hash_mode, g_decode_dev);
         } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             router_select_parallel_kernel<<<1, 256, 0, ds4_current_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                      has_bias && !hash_mode, hash_mode);
+                                                      has_bias && !hash_mode, hash_mode, g_decode_dev);
         } else {
             router_select_kernel<<<1, 1, 0, ds4_current_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                           bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                          has_bias && !hash_mode, hash_mode);
+                                          has_bias && !hash_mode, hash_mode, g_decode_dev);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
         /* Step 7 task #32: on L0, dump the router-bias hash the kernel
@@ -12180,7 +12194,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         hash_rows,
                                                                         n_tokens,
                                                                         has_bias && !hash_mode,
-                                                                        hash_mode);
+                                                                        hash_mode,
+                                                                        /*scalars=*/NULL);
     } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
         router_select_parallel_kernel<<<n_tokens, 256, 0, ds4_current_stream()>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
@@ -12193,7 +12208,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                          hash_rows,
                                                          n_tokens,
                                                          has_bias && !hash_mode,
-                                                         hash_mode);
+                                                         hash_mode,
+                                                         /*scalars=*/NULL);
     } else {
         router_select_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((int32_t *)selected->ptr,
                                               (float *)weights->ptr,
@@ -12206,7 +12222,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                               hash_rows,
                                               n_tokens,
                                               has_bias && !hash_mode,
-                                              hash_mode);
+                                              hash_mode,
+                                              /*scalars=*/NULL);
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }

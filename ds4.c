@@ -12994,7 +12994,8 @@ static bool metal_graph_encode_token_raw_swa(
                                  g->raw_window ? g->raw_window : g->raw_cap,
                                  4u, /* ratio */
                                  0u, /* n_comp (rope_tail-only pilot) */
-                                 0u  /* flags */);
+                                 0u, /* flags */
+                                 (uint32_t)token /* decode token id */);
     ds4_gpu_decode_scalars_flush();
 
     /* Step 4c R1' + A1: populate the per-layer scalars substrate.

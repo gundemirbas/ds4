@@ -104,7 +104,8 @@ void  ds4_gpu_decode_scalars_set(
         uint32_t raw_window,
         uint32_t ratio,
         uint32_t n_comp,
-        uint32_t flags);
+        uint32_t flags,
+        uint32_t token);
 /* Push the most recent ds4_gpu_decode_scalars_set() values to the device-side
  * mirror.  Backends that don't use the graph-capture path implement this as
  * a no-op.  On CUDA this issues a single H2D memcpy on ds4_current_stream(),
