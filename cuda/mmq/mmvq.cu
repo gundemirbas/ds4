@@ -391,6 +391,56 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// ds4 Step 7 task #31: per-warp partial-sum probes inside mul_mat_vec_q.
+//
+// The decisive finding from task #30 is that mul_mat_vec_q for IQ2_XXS
+// at (ncols_dst=1, rows_per_cuda_block=1, nwarps=4) is BISTABLE under
+// outer layer-graph capture: identical inputs (slot 217 q81 hash matches)
+// produce one of exactly two stable outputs at slot 213.  Source
+// inspection ruled out atomics/races in the cross-warp reduction (it's
+// fixed-order with __syncthreads).  To localise the bug, capture the
+// per-thread tmp[0][0] value at three points for block (0,0,0):
+//
+//   pre_shared:  all 4 warps x 32 lanes, immediately after K-loop, before
+//                shared-mem write.  If different across MATCH and MISS
+//                runs at this point, the K-loop / vec_dot_iq2_xxs_q8_1
+//                produces different partials despite identical inputs.
+//   post_shared: warp 0's 32 lanes, after accumulating tmp_shared[0..nwarps-2]
+//                but before warp_reduce_sum.  If pre_shared matches but
+//                post_shared differs, the shared-mem reduction is the bug.
+//   post_shuffle: lane 0 of warp 0, after warp_reduce_sum.  If post_shared
+//                 matches but post_shuffle differs, the warp shuffle is
+//                 the bug.
+//
+// Globals are unconditionally overwritten for block (0,0,0) on each kernel
+// launch.  Host captures the values via cudaGetSymbolAddress + the existing
+// dump_hash_raw_at_slot mechanism, called right after the matvec dispatch
+// in ds4_mmq_moe_vec_impl.  Subsequent matvec invocations (up, down, next
+// layer) overwrite the globals, but the gate-call probe was already
+// captured.
+//
+// Only writes when ncols_dst==1 && rows_per_cuda_block==1 to avoid
+// touching the multi-token / multi-row paths used by MMQ-batch.
+__device__ float g_ds4_mmvq_probe_pre_shared[4 * 32];   // 4 warps x 32 lanes
+__device__ float g_ds4_mmvq_probe_post_shared[32];      // warp 0 lanes
+__device__ float g_ds4_mmvq_probe_post_shuffle[1];      // final value
+
+extern "C" const void *ds4_mmvq_get_probe_pre_shared_ptr(void) {
+    void *p = nullptr;
+    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_pre_shared);
+    return p;
+}
+extern "C" const void *ds4_mmvq_get_probe_post_shared_ptr(void) {
+    void *p = nullptr;
+    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_post_shared);
+    return p;
+}
+extern "C" const void *ds4_mmvq_get_probe_post_shuffle_ptr(void) {
+    void *p = nullptr;
+    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_post_shuffle);
+    return p;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -513,6 +563,15 @@ static __global__ void mul_mat_vec_q(
         (void) tmp_shared_gate;
     }
 
+    // ds4 Step 7 task #31 PROBE 1: per-thread tmp[0][0] just after K-loop,
+    // before any cross-warp communication.  Only block (0,0,0), only the
+    // ncols_dst=1, rows_per_cuda_block=1 case (IQ2_XXS decode).
+    if constexpr (ncols_dst == 1 && (calc_rows_per_block(ncols_dst, table_id, small_k, nwarps)) == 1) {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+            g_ds4_mmvq_probe_pre_shared[threadIdx.y * warp_size + threadIdx.x] = tmp[0][0];
+        }
+    }
+
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
@@ -548,7 +607,21 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+            // ds4 Step 7 task #31 PROBE 2: warp 0's tmp[0][0] after the
+            // cross-warp accumulator loop, BEFORE warp_reduce_sum.
+            if constexpr (ncols_dst == 1 && (calc_rows_per_block(ncols_dst, table_id, small_k, nwarps)) == 1) {
+                if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
+                    g_ds4_mmvq_probe_post_shared[threadIdx.x] = tmp[0][0];
+                }
+            }
             tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            // ds4 Step 7 task #31 PROBE 3: warp 0 lane 0 final value
+            // AFTER warp_reduce_sum, before the dst write / fusion.
+            if constexpr (ncols_dst == 1 && (calc_rows_per_block(ncols_dst, table_id, small_k, nwarps)) == 1) {
+                if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
+                    g_ds4_mmvq_probe_post_shuffle[0] = tmp[0][0];
+                }
+            }
             if constexpr (has_fusion) {
                 if (use_gate) {
                     tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);

@@ -757,6 +757,14 @@ extern "C" void     ds4_cuda_dump_hash_raw_at_slot(const void *buf,
                                                      const char *label,
                                                      uint32_t slot);
 
+/* Step 7 task #31: per-warp partial-sum probe pointers from mmvq.cu.
+ * Each returns a device pointer to a global buffer the kernel writes to
+ * for block (0,0,0).  Captured by moe_vec_impl AFTER the matvec dispatch,
+ * via the existing dump_hash_raw_at_slot mechanism, into slots 220/221/222. */
+extern "C" const void *ds4_mmvq_get_probe_pre_shared_ptr(void);
+extern "C" const void *ds4_mmvq_get_probe_post_shared_ptr(void);
+extern "C" const void *ds4_mmvq_get_probe_post_shuffle_ptr(void);
+
 namespace {
 
 template <ggml_type type>
@@ -873,8 +881,15 @@ int ds4_mmq_moe_vec_impl(
     // byte content => identical hash, so divergence in the Q8_1 quantize
     // shows up as a slot-value mismatch between OFF and ON runs.
     // (Extern decls live at file scope above so C linkage is preserved.)
+    //
+    // Task #31: save the consumed slot so we can also dump the per-warp
+    // partial-sum probes (slots 220/221/222) AFTER the matvec dispatch.
+    // Only fires for the gate call at L0 (probe_slot == 217 by convention
+    // in ds4_cuda.cu's MMVQ-decode branch).
+    uint32_t saved_probe_slot = 0;
     {
         uint32_t probe_slot = ds4_cuda_dump_probe_slot_consume();
+        saved_probe_slot = probe_slot;
         if (probe_slot) {
             uint64_t n_floats = nbytes_q8_1 / sizeof(float);
             ds4_cuda_dump_hash_raw_at_slot(src1_q8_1_ptr, n_floats,
@@ -934,6 +949,29 @@ int ds4_mmq_moe_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
+
+    // Step 7 task #31: dump per-warp partial-sum probes from block (0,0,0)
+    // of the matvec we just dispatched.  Only fires for the gate call at
+    // L0 (saved_probe_slot == 217), and only for the IQ2_XXS / Q4_K decode
+    // shape where the kernel writes to the probe globals.  Subsequent
+    // moe_vec_impl calls (up, down, next layer) will overwrite the device
+    // globals, but the hash kernels we launch HERE on the same stream are
+    // ordered before those overwrites, so they capture the gate values.
+    if (saved_probe_slot == 217u) {
+        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_pre_shared_ptr(),
+                                        /*n_floats=*/4u * 32u,
+                                        "MoE:warp-pre-shared",
+                                        /*slot=*/220u);
+        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_post_shared_ptr(),
+                                        /*n_floats=*/32u,
+                                        "MoE:warp0-post-shared",
+                                        /*slot=*/221u);
+        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_post_shuffle_ptr(),
+                                        /*n_floats=*/1u,
+                                        "MoE:warp0-post-shuffle",
+                                        /*slot=*/222u);
+    }
+
     return 0;
 }
 
