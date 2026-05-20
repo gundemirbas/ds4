@@ -13139,14 +13139,28 @@ static bool metal_graph_encode_token_raw_swa(
             const bool compressed   = il_ratio != 0u;
             const bool ratio4       = il_ratio == 4u;
             const bool indexed_act  = compressed && g->layer_n_comp[il] > decode_top_k;
+            /* Step 7 task #39: the raw-KV sliding window is in its
+             * "growing" regime (window base at row 0) until pos+1 exceeds
+             * raw_window, then it "slides" (raw_start advances 1,2,3...).
+             * The attention/KV path bakes a pre-saturation assumption when
+             * captured with raw_start==0, so a captured growing-regime
+             * graph replays wrong once the window slides (first divergence
+             * pos=128 == DS4_N_SWA).  Key the two regimes apart so each
+             * gets its own captured graph.  raw_start is read live from
+             * the device decode-scalars substrate, so the sliding-regime
+             * graph (captured at raw_start=1) is correct for all
+             * raw_start>0. */
+            const bool window_sliding =
+                metal_graph_raw_start_for_span(g, pos, n_raw) != 0u;
             struct ds4_layer_graph_key key;
             memset(&key, 0, sizeof(key));
             key.il    = il;
             key.n_tok = 1;
-            key.flags = (emit_il      ? 1u  : 0u)
-                      | (indexed_act  ? 2u  : 0u)
-                      | (compressed   ? 4u  : 0u)
-                      | (ratio4       ? 8u  : 0u);
+            key.flags = (emit_il        ? 1u  : 0u)
+                      | (indexed_act    ? 2u  : 0u)
+                      | (compressed     ? 4u  : 0u)
+                      | (ratio4         ? 8u  : 0u)
+                      | (window_sliding ? 16u : 0u);
             /* ds4_gpu_tensor is opaque to ds4.c -- use the accessor. */
             key.cur_hc            = (void *)ds4_gpu_tensor_ptr(g->cur_hc);
             key.after_ffn_hc      = (void *)ds4_gpu_tensor_ptr(g->after_ffn_hc);
