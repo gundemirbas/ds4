@@ -8725,7 +8725,14 @@ struct layer_graph_entry {
     uint64_t                   hits;
 };
 
-#define DS4_LAYER_GRAPH_CACHE_SIZE 256
+/* Deterministic cache: one fixed slot per (il, flags, ping-pong parity).
+ * flags is 5 bits (0..31); the cur_hc/after_ffn_hc double-buffer adds one
+ * parity bit -> 64 slots per layer.  No ASLR pointer hashing, so slot
+ * placement is reproducible run-to-run and the needed graph variants
+ * never collide. */
+#define DS4_LAYER_GRAPH_SLOTS_PER_LAYER 64u
+#define DS4_LAYER_GRAPH_CACHE_SIZE \
+    (DS4_LAYER_SCALARS_COUNT * DS4_LAYER_GRAPH_SLOTS_PER_LAYER)
 
 static struct layer_graph_entry g_layer_graphs[DS4_LAYER_GRAPH_CACHE_SIZE];
 
@@ -8751,19 +8758,23 @@ extern "C" int ds4_cuda_layer_graphs_enabled(void) {
     return enabled;
 }
 
-static uint64_t layer_graph_hash(const struct ds4_layer_graph_key *k) {
-    /* FNV-1a over the key bytes.  Matches moe_graph_hash / dense_graph_hash. */
-    uint64_t h = 0xcbf29ce484222325ULL;
-    const uint8_t *p = (const uint8_t *)k;
-    for (size_t i = 0; i < sizeof(*k); i++) {
-        h ^= p[i];
-        h *= 0x100000001b3ULL;
-    }
-    return h;
-}
-
 static struct layer_graph_entry *layer_graph_slot(const struct ds4_layer_graph_key *key) {
-    return &g_layer_graphs[layer_graph_hash(key) % DS4_LAYER_GRAPH_CACHE_SIZE];
+    /* Deterministic slot selection: il * 64 + flags*2 + parity.  The
+     * earlier FNV-1a-over-key-bytes hash folded in 18 ASLR-randomized
+     * workspace pointers, so the slot (and thus collisions) varied per
+     * process -- a "capture lottery" that produced run-to-run perf and
+     * (before the Step 7 fixes) determinism noise.  Slot placement is now
+     * a pure function of layer index, the 5-bit flags, and the
+     * cur_hc/after_ffn_hc double-buffer parity (the only key pointers
+     * that alternate token-to-token).  `cur_hc < after_ffn_hc` is a
+     * stable per-process boolean that always splits the two ping-pong
+     * states.  Every (il, flags, parity) maps to a distinct slot, so the
+     * graph variants never collide; the full-key memcmp in
+     * begin_or_replay still guards correctness. */
+    const uint32_t parity = (key->cur_hc < key->after_ffn_hc) ? 0u : 1u;
+    const uint32_t idx = key->il * DS4_LAYER_GRAPH_SLOTS_PER_LAYER
+                       + (key->flags & 31u) * 2u + parity;
+    return &g_layer_graphs[idx % DS4_LAYER_GRAPH_CACHE_SIZE];
 }
 
 /* In-flight capture tracking.  begin_or_replay sets these when it returns 0
