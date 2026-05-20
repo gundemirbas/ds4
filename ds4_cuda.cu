@@ -6755,6 +6755,22 @@ __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai
     return av > bv || (av == bv && ai < bi);
 }
 
+/* Step 7 task #32: router-bias probe.  router_selected (slot 227) diverges
+ * across processes while router_logits (225) and router_probs (226) are
+ * bit-identical.  The top-k operates on local_score = prob + bias[e], but
+ * slot 226 captures only `prob` (= sqrt(softplus(logit)), no bias).  If
+ * the bias (ffn_exp_probs_b) is read non-deterministically, the top-k
+ * picks different experts while probs stay identical.  This global holds
+ * an FNV-1a hash of bias[0..255], written by router_select_warp_topk_kernel
+ * and dumped to slot 230 by ds4_gpu_router_select_tensor when on L0. */
+__device__ unsigned long long g_ds4_router_bias_hash[1];
+
+extern "C" const void *ds4_cuda_get_router_bias_hash_ptr(void) {
+    void *p = nullptr;
+    cudaGetSymbolAddress(&p, g_ds4_router_bias_hash);
+    return p;
+}
+
 __global__ static void router_select_warp_topk_kernel(
         int32_t *selected,
         float *weights,
@@ -6791,6 +6807,20 @@ __global__ static void router_select_warp_topk_kernel(
         prob[e] = p;
     }
     __syncwarp();
+
+    /* Step 7 task #32: hash the router bias for token 0.  If this differs
+     * across MATCH/MISS processes, the non-deterministic top-k selection
+     * is caused by a non-deterministic bias read (ffn_exp_probs_b). */
+    if (t == 0u && lane == 0u && has_bias && bias) {
+        unsigned long long h = 0xcbf29ce484222325ULL;
+        for (uint32_t i = 0; i < 256u; ++i) {
+            union { float f; unsigned int u; } x;
+            x.f = bias[i];
+            h ^= (unsigned long long) x.u;
+            h *= 0x100000001b3ULL;
+        }
+        g_ds4_router_bias_hash[0] = h;
+    }
 
     if (hash_mode) {
         if (lane == 0) {
@@ -12047,6 +12077,15 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
                                           has_bias && !hash_mode, hash_mode);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
+        /* Step 7 task #32: on L0, dump the router-bias hash the kernel
+         * just computed (slot 230).  Same gating as the L0 hash probes
+         * in ds4.c -- g_dump_current_layer is set per-layer by ds4.c. */
+        if (ok && g_dump_current_layer == 0) {
+            ds4_cuda_dump_hash_raw_at_slot(ds4_cuda_get_router_bias_hash_ptr(),
+                                            /*n_floats=*/2u,
+                                            "L0:router-bias-hash",
+                                            /*slot=*/230u);
+        }
     }
     return ok;
 }
