@@ -10853,6 +10853,19 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             ? &g_layer_dev[il].index_row
             : &g_layer_dev[il].comp_row;
     }
+    /* Step 7 task #38: emit-path substrate probe.  Hash g_layer_dev[il]
+     * (n_comp, n_index_comp, comp_row, index_row -- 16 B) into slot 240+il.
+     * The dump kernel is recorded into the captured emit graph, so on
+     * replay slot 240+il reflects the comp_row the emit kernels actually
+     * read at replay time.  If it advances per emit -> substrate is live
+     * (bug is a stale consumer); if frozen -> ordering bug.  Gated by
+     * DS4_CUDA_LAYER_GRAPHS_HASH_DUMP (inside dump_hash_raw_at_slot) and
+     * the COMP row-field on layers 0..2. */
+    if (row_ptr_dev != NULL && row_field == DS4_COMPRESSOR_ROW_COMP &&
+        il <= 2u) {
+        ds4_cuda_dump_hash_raw_at_slot((const void *)&g_layer_dev[il], 4u,
+                                        "emit:layer_scalars", 240u + il);
+    }
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)comp_cache->ptr,
             (const float *)state_kv->ptr,
