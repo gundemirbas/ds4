@@ -13067,6 +13067,19 @@ static bool metal_graph_encode_token_raw_swa(
     const bool layer_graphs = ds4_cuda_layer_graphs_enabled() != 0;
     if (layer_graphs) allow_split_flush = false;
 
+    /* Step 7 task #33 diagnostic: DS4_CUDA_LAYER_GRAPHS_SKIP_LAYER0=1
+     * forces layer 0 to run eager (no capture) while layers 1..42 still
+     * use layer graphs.  Used to test whether capturing the L0 body is
+     * what makes router_selected (slot 227) bistable: if L0 becomes
+     * 8/8 stable with this flag, the divergence is introduced by the
+     * capture of that layer body, not by the router kernel's own math. */
+    static int skip_l0_init = 0;
+    static int skip_l0 = 0;
+    if (!skip_l0_init) {
+        skip_l0_init = 1;
+        skip_l0 = (getenv("DS4_CUDA_LAYER_GRAPHS_SKIP_LAYER0") != NULL) ? 1 : 0;
+    }
+
     /* PC5 metadata that the cache key consumes: decode_top_k is config-
      * stable per session (cheap to recompute each loop iteration but
      * hoisted here for clarity). */
@@ -13078,7 +13091,7 @@ static bool metal_graph_encode_token_raw_swa(
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         int rc = -1;
-        if (layer_graphs) {
+        if (layer_graphs && !(skip_l0 && il == 0u)) {
             const uint32_t il_ratio = ds4_layer_compress_ratio(il);
             const bool emit_il      = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
             const bool compressed   = il_ratio != 0u;
