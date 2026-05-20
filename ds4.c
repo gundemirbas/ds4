@@ -9630,6 +9630,23 @@ static bool metal_graph_encode_decode_layer_impl(
         }
         if (ok && emit) g->layer_n_comp[il]++;
 
+        /* Step 7 task #38: emit-buffer probe.  Hash the attn compressed-KV
+         * cache (used rows) + the compressor state ring right after the
+         * emit, for layers 0..2.  These dump calls are captured into the
+         * emit layer graph, so on replay the slots reflect what the
+         * captured emit body produced.  Diffing captured vs SKIP_EMIT
+         * isolates which buffer the captured emit corrupts.  No-op unless
+         * DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1. */
+        if (ok && emit && il <= 2u) {
+            const uint32_t coff_p = (ratio == 4u) ? 2u : 1u;
+            ds4_cuda_dump_hash_at_slot(g->layer_attn_comp_cache[il],
+                                       (uint64_t)g->layer_n_comp[il] * DS4_N_HEAD_DIM,
+                                       "emit:attn_comp_cache", 243u + il);
+            ds4_cuda_dump_hash_at_slot(g->layer_attn_state_kv[il],
+                                       (uint64_t)coff_p * ratio * coff_p * DS4_N_HEAD_DIM,
+                                       "emit:attn_state_ring", 246u + il);
+        }
+
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
@@ -9705,6 +9722,12 @@ static bool metal_graph_encode_decode_layer_impl(
                         il) != 0;
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
+            /* Step 7 task #38: indexer emit-buffer probe (slots 249..251). */
+            if (ok && emit && il <= 2u) {
+                ds4_cuda_dump_hash_at_slot(g->layer_index_comp_cache[il],
+                                           (uint64_t)g->layer_n_index_comp[il] * DS4_N_INDEXER_HEAD_DIM,
+                                           "emit:index_comp_cache", 249u + il);
+            }
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
             if (ok && g->layer_n_comp[il] > decode_top_k) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
