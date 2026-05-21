@@ -8742,7 +8742,13 @@ static struct layer_graph_entry g_layer_graphs[DS4_LAYER_GRAPH_CACHE_SIZE];
  * uplift and no prefill change.  Set DS4_CUDA_LAYER_GRAPHS=0 (also
  * off/OFF/no/NO/false/FALSE) to fall back to the eager decode path.
  * Any other value, including 1/on/yes/true, keeps the default ON.
- * extern "C" so ds4.c can gate the R4 split-flush + key build (Step 6). */
+ * extern "C" so ds4.c can gate the R4 split-flush + key build (Step 6).
+ *
+ * N2 guard: graphs are also forced OFF when DS4_CUDA_NO_MMVQ_DECODE is
+ * set.  That env selects the legacy non-MMVQ decode path, which is not
+ * capture-safe (it issues cudaMallocAsync that aborts an in-flight
+ * capture -- see cuda/mmq/ds4_ggml_stubs.cu).  The combination is
+ * diagnostic-only; guarding it off is crash defense, not a feature. */
 extern "C" int ds4_cuda_layer_graphs_enabled(void) {
     static int init = 0;
     static int enabled = 1;
@@ -8756,6 +8762,13 @@ extern "C" int ds4_cuda_layer_graphs_enabled(void) {
              strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0)) {
             enabled = 0;
             fprintf(stderr, "ds4: DS4_CUDA_LAYER_GRAPHS=%s - per-layer graph capture disabled (eager decode)\n", s);
+        } else if (getenv("DS4_CUDA_NO_MMVQ_DECODE") != NULL) {
+            /* Presence check -- mirrors the polarity at the two
+             * DS4_CUDA_NO_MMVQ_DECODE dispatch sites (ds4_cuda.cu:9186,
+             * 14280) so the guard engages exactly when the legacy
+             * decode path does. */
+            enabled = 0;
+            fprintf(stderr, "ds4: DS4_CUDA_NO_MMVQ_DECODE set - per-layer graph capture disabled (legacy decode path is not capture-safe)\n");
         }
     }
     return enabled;
