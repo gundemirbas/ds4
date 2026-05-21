@@ -3,8 +3,15 @@
 #
 # Runs the same DS4 greedy generation N times under both
 # DS4_CUDA_LAYER_GRAPHS=0 (eager) and =1 (per-layer CUDA-graph capture)
-# and compares MD5s.  PASS = all OFF runs equal, all ON runs equal, and
-# OFF == ON (the parity gate).
+# and compares the generated token-id dumps.  PASS = all OFF runs equal,
+# all ON runs equal, and OFF == ON (the parity gate).
+#
+# It compares the --dump-logprobs JSON, NOT the console output: greedy
+# argmax masks FP-tiny logit drift (a console of decoded text can look
+# identical while logits diverged), and the console also carries
+# mode-dependent perf lines (capture vs eager run at different tok/s), so
+# a console MD5 would both hide real divergences and fake false ones.
+# The --dump-logprobs dump is the authoritative per-token signal.
 #
 # Step 7 closed this gate: captured decode is bit-identical to eager
 # through n=256 on sm_120 (PRO 6000) and sm_121 (GB10).  This script is
@@ -49,12 +56,15 @@ run_one() {
     local mode_label="$1"
     local mode_env="$2"
     local i="$3"
-    local out="$TMPDIR/${mode_label}_${i}.txt"
+    local lp="$TMPDIR/${mode_label}_${i}.json"
+    local con="$TMPDIR/${mode_label}_${i}.con"
     pkill -9 -f "$DS4 --cuda" 2>/dev/null || true
     sleep 1
-    env $mode_env $DS4 --cuda --temp 0 -n "$NTOK" -p "$PROMPT" > "$out" 2>&1
-    # Strip ds4: housekeeping; MD5 the actual generation content
-    sed -E '/^ds4:/d' "$out" | md5sum | awk '{print $1}'
+    env $mode_env $DS4 --cuda --temp 0 -n "$NTOK" -p "$PROMPT" \
+        --dump-logprobs "$lp" --logprobs-top-k 1 > "$con" 2>&1
+    # MD5 the token-id / logprob dump -- the authoritative per-token
+    # signal (see the header for why the console is not compared).
+    md5sum < "$lp" | awk '{print $1}'
 }
 
 echo "==== DS4_CUDA_LAYER_GRAPHS=0 (baseline), n=$NTOK ===="
