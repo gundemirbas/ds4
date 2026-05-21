@@ -70,7 +70,22 @@ The bandwidth figure is informational; we don't tier on it.
   substrates so it never enters the graph key. Verified bit-identical
   to eager decode through n=256 on sm_120 (PRO 6000) and sm_121 (GB10);
   decode-only, prefill is untouched. Set to 0 (also `off`/`no`/`false`)
-  to fall back to the eager per-layer decode path.
+  to fall back to the eager per-layer decode path. Also forced off when
+  `DS4_CUDA_NO_MMVQ_DECODE` is set (the legacy non-MMVQ decode path is not
+  capture-safe).
+
+- `DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1` (default off). Arms the
+  captured-decode per-kernel hash-dump diagnostic. When set, the
+  `ds4_cuda_dump_hash_*` entry points FNV-1a a probed device buffer into a
+  slot table and print one `DS4_HASH pos=N slot=I hexhash label` line per
+  used slot at each token flush; when unset every entry point is a no-op,
+  so a normal build is unaffected. Used to localize a
+  captured-graph-vs-eager output divergence: probe the same prompt with
+  and without `DS4_CUDA_LAYER_GRAPHS=0` and diff the `DS4_HASH` lines — the
+  first `(pos,slot)` that differs is the divergent kernel. The probe call
+  sites are added temporarily by the investigator (see the comment block
+  above the implementation in `ds4_cuda.cu`); only the substrate is
+  permanent. See also `tests/cuda_layer_graph_determinism_probe.sh`.
 
 - `DS4_CUDA_MTP_VERIFIER_USE_MMQ` (default 0). Bisection switch. Normally
   `ds4.c` brackets every MTP verifier call with

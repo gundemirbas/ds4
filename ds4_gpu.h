@@ -281,6 +281,41 @@ void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
  * Used to bisect capture-mode incompatibilities by call site. */
 void ds4_cuda_layer_graph_debug_peek(const char *label);
 
+/* Captured-decode per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
+ * Permanent, env-gated, no-op-when-off diagnostic for localizing a
+ * captured-graph-vs-eager output divergence by hashing each shim's output
+ * buffer and printing a per-token table. See the comment block above the
+ * implementation in ds4_cuda.cu for the probe-placement recipe.
+ * - dump_hash_reset:    clear the auto-slot counter; call once per token.
+ * - dump_hash_after:    FNV-1a a tensor into the next auto slot + label it.
+ * - dump_hash_at_slot:  same, into a caller-chosen fixed slot (use inside
+ *                       captured regions to avoid auto-slot collisions).
+ * - dump_hash_flush:    sync, copy hashes to host, print one line per used
+ *                       slot ("DS4_HASH pos=N slot=I hexhash label").
+ * Metal stubs all four as no-ops. */
+void ds4_cuda_dump_hash_reset(void);
+void ds4_cuda_dump_hash_after(const ds4_gpu_tensor *tensor,
+                              uint64_t n_elem,
+                              const char *label);
+void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
+                                uint64_t n_elem,
+                                const char *label,
+                                uint32_t slot);
+void ds4_cuda_dump_hash_flush(uint32_t pos);
+
+/* Cross-TU one-shot probe-slot handoff for the hash dump. ds4.c sets the
+ * current layer at the top of each layer body; a probe site in ds4_cuda.cu
+ * arms a slot; the mmq TU (cuda/mmq) consumes it after an internal
+ * computation and hashes that buffer via the raw helper. The raw helper
+ * accepts a raw void* + n_floats for buffers with no ds4_gpu_tensor wrapper.
+ * Metal stubs all five as no-ops. */
+void     ds4_cuda_dump_set_current_layer(int il);
+int      ds4_cuda_dump_get_current_layer(void);
+void     ds4_cuda_dump_probe_slot_set(uint32_t slot);
+uint32_t ds4_cuda_dump_probe_slot_consume(void);
+void     ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
+                                        const char *label, uint32_t slot);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

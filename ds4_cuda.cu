@@ -8793,6 +8793,182 @@ static struct layer_graph_entry *layer_graph_slot(const struct ds4_layer_graph_k
     return &g_layer_graphs[idx % DS4_LAYER_GRAPH_CACHE_SIZE];
 }
 
+/* ------------------------------------------------------------------------ *
+ * Captured-decode per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
+ *
+ * Permanent, env-gated, no-op-when-off diagnostic for localizing a
+ * captured-graph-vs-eager output divergence -- the failure mode the Step 7
+ * determinism investigation chased. Computes an FNV-1a hash of a device
+ * buffer's float contents into a slot of a device-side array; once per
+ * token, ds4_cuda_dump_hash_flush() copies the array to host and prints one
+ * "DS4_HASH pos=N slot=I hex label" line per slot used.
+ *
+ * Every entry point early-returns when the env var is unset, so a normal
+ * build pays nothing. The investigation's *task-specific* probes (emit-chain,
+ * router-bias, decode-scalars, per-warp MMVQ) were stripped in bab610c;
+ * `git show bab610c` recovers them verbatim when a future bug needs that
+ * exact probe. What stays here is the reusable substrate.
+ *
+ * Using it on a new captured-decode divergence:
+ *   1. The dump is always compiled in; export DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1
+ *      to arm it.
+ *   2. Temporarily call ds4_cuda_dump_hash_reset() once at the top of the
+ *      per-token decode body and ds4_cuda_dump_hash_flush(pos) once at the
+ *      end (both in ds4.c's decode loop).
+ *   3. Temporarily call ds4_cuda_dump_hash_after(tensor, n_elem, "label")
+ *      after each shim whose output you want to probe. Use the fixed-slot
+ *      ds4_cuda_dump_hash_at_slot() for probes inside a captured region --
+ *      the auto-slot counter would collide with eager post-capture probes
+ *      on replay tokens. For a buffer inside the cuda/mmq TU use the
+ *      current-layer + probe-slot handoff (ds4.c sets the layer, a site here
+ *      arms a slot, the mmq TU consumes it and dumps via the raw helper).
+ *   4. Run the same prompt with DS4_CUDA_LAYER_GRAPHS=0 (eager, the
+ *      known-good reference -- always validate a probe against it) and
+ *      again without it (captured); diff the DS4_HASH lines. The first
+ *      (pos,slot) that differs is the divergent kernel.
+ *   5. Remove the temporary reset/flush/probe calls before committing.
+ *
+ * For repeated ON/OFF batches at low startup cost, drive runs through
+ * ds4_weight_server (VMM upload once, scope=base; clients import via
+ * DS4_CUDA_WEIGHT_IPC_MANIFEST) -- per-invocation startup ~40s -> ~14s --
+ * and see tests/cuda_layer_graph_determinism_probe.sh for the ON/OFF
+ * MD5-compare harness.
+ *
+ * The FNV-1a kernel launches on ds4_current_stream(), so the hash is
+ * recorded into the captured graph (or runs eagerly when capture is off),
+ * exactly mirroring the shim it probes. */
+#define DS4_CUDA_DUMP_HASH_SLOTS 1024
+__device__ static uint64_t g_dump_hashes_dev[DS4_CUDA_DUMP_HASH_SLOTS];
+static uint64_t g_dump_hashes_host[DS4_CUDA_DUMP_HASH_SLOTS];
+static const char *g_dump_labels[DS4_CUDA_DUMP_HASH_SLOTS];
+static uint32_t   g_dump_next = 0;
+
+__global__ static void ds4_cuda_dump_hash_fnv1a_kernel(
+        const float *buf, uint64_t n_elem, uint32_t slot) {
+    /* Single-thread FNV-1a over the float bit pattern. Slow (~few us for
+     * 7168 floats) but deterministic and capture-safe. */
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (uint64_t i = 0; i < n_elem; i++) {
+        union { float f; uint32_t u; } x;
+        x.f = buf[i];
+        h ^= (uint64_t)x.u;
+        h *= 0x100000001b3ULL;
+    }
+    g_dump_hashes_dev[slot] = h;
+}
+
+static int ds4_cuda_dump_hash_enabled(void) {
+    static int init = 0, en = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_LAYER_GRAPHS_HASH_DUMP");
+        en = (s && *s && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    return en;
+}
+
+extern "C" void ds4_cuda_dump_hash_reset(void) {
+    if (!ds4_cuda_dump_hash_enabled()) return;
+    g_dump_next = 0;
+    /* Labels persist across resets: fixed-slot probes are captured into
+     * layer-graph kernels that fire on replay without the CPU re-calling
+     * dump_hash_at_slot. Clearing labels here would make flush skip those
+     * slots on replay tokens even though their device hashes were written
+     * by the replay. Auto-slot probes rewrite their labels each token. */
+}
+
+extern "C" void ds4_cuda_dump_hash_after(
+        const struct ds4_gpu_tensor *tensor,
+        uint64_t n_elem,
+        const char *label) {
+    if (!ds4_cuda_dump_hash_enabled() || !tensor) return;
+    if (g_dump_next >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    const uint32_t slot = g_dump_next++;
+    g_dump_labels[slot] = label;
+    /* Launch on ds4_current_stream() so the hash is recorded into the
+     * captured graph (or runs eagerly when capture is off). */
+    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            (const float *)tensor->ptr, n_elem, slot);
+}
+
+extern "C" void ds4_cuda_dump_hash_at_slot(
+        const struct ds4_gpu_tensor *tensor,
+        uint64_t n_elem,
+        const char *label,
+        uint32_t slot) {
+    /* Fixed-slot variant. Use for probes inside captured regions where the
+     * auto-incrementing g_dump_next would collide with eager post-capture
+     * probes. Reserve a high range (e.g. 200..299) for fixed-slot probes;
+     * does NOT touch g_dump_next. */
+    if (!ds4_cuda_dump_hash_enabled() || !tensor) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_labels[slot] = label;
+    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            (const float *)tensor->ptr, n_elem, slot);
+}
+
+/* Cross-TU one-shot probe-slot handoff. ds4.c sets the current layer at the
+ * top of each layer body; a probe site in ds4_cuda.cu arms a slot; the mmq
+ * TU (cuda/mmq) consumes it (read + clear) and hashes its internal buffer
+ * to that slot via ds4_cuda_dump_hash_raw_at_slot. The slot is one-shot so a
+ * stale probe never carries into a later call. */
+static volatile int      g_dump_current_layer = -1;
+static volatile uint32_t g_dump_probe_slot    = 0;
+
+extern "C" void ds4_cuda_dump_set_current_layer(int il) {
+    g_dump_current_layer = il;
+}
+
+extern "C" int ds4_cuda_dump_get_current_layer(void) {
+    return (int)g_dump_current_layer;
+}
+
+extern "C" void ds4_cuda_dump_probe_slot_set(uint32_t slot) {
+    g_dump_probe_slot = slot;
+}
+
+extern "C" uint32_t ds4_cuda_dump_probe_slot_consume(void) {
+    uint32_t s = g_dump_probe_slot;
+    g_dump_probe_slot = 0;
+    return s;
+}
+
+/* Variant of dump_hash_at_slot that accepts a raw pointer + n_floats instead
+ * of a ds4_gpu_tensor. Used for buffers (e.g. pool-allocated Q8_1 scratch
+ * inside the cuda/mmq TU) that don't have a tensor wrapper. */
+extern "C" void ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
+                                                const char *label, uint32_t slot) {
+    if (!ds4_cuda_dump_hash_enabled() || !buf) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_labels[slot] = label;
+    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            (const float *)buf, n_floats, slot);
+}
+
+extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
+    if (!ds4_cuda_dump_hash_enabled()) return;
+    /* Synchronize all pending captures + launches so device hashes are
+     * stable, then copy to host and print every slot with a non-NULL label
+     * (catches both auto-slot and fixed-slot probes). */
+    cudaDeviceSynchronize();
+    cudaError_t e = cudaMemcpyFromSymbol(g_dump_hashes_host, g_dump_hashes_dev,
+                                          sizeof(g_dump_hashes_host),
+                                          0, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "ds4: dump_hash_flush memcpy failed: %s\n",
+                cudaGetErrorString(e));
+        return;
+    }
+    for (uint32_t i = 0; i < DS4_CUDA_DUMP_HASH_SLOTS; i++) {
+        if (g_dump_labels[i] == NULL) continue;
+        fprintf(stderr, "DS4_HASH pos=%u slot=%3u %016lx %s\n",
+                pos, i, (unsigned long)g_dump_hashes_host[i],
+                g_dump_labels[i]);
+    }
+}
+
 /* In-flight capture tracking.  begin_or_replay sets these when it returns 0
  * (capturing); end_or_commit reads them to find the slot to close.  Single-
  * threaded GPU work makes file-scope globals safe; if multi-threaded use
