@@ -588,6 +588,12 @@ static char *web_cdp_call(cdp_ws *ws, const char *method, const char *params,
     }
 }
 
+static void web_cdp_call_optional(cdp_ws *ws, const char *method, const char *params) {
+    char err[160] = {0};
+    char *resp = web_cdp_call(ws, method, params, err, sizeof(err));
+    free(resp);
+}
+
 static int web_hex4(const char *p) {
     int v = 0;
     for (int i = 0; i < 4; i++) {
@@ -815,6 +821,10 @@ static bool web_cdp_prepare_page(cdp_ws *ws, char *err, size_t err_len) {
     resp = web_cdp_call(ws, "Runtime.enable", "{}", err, err_len);
     if (!resp) return false;
     free(resp);
+    web_cdp_call_optional(ws, "Emulation.setFocusEmulationEnabled",
+                          "{\"enabled\":true}");
+    web_cdp_call_optional(ws, "Emulation.setDeviceMetricsOverride",
+                          "{\"width\":1365,\"height\":900,\"deviceScaleFactor\":1,\"mobile\":false}");
     return web_wait_ready(ws, err, err_len);
 }
 
@@ -822,13 +832,16 @@ static void web_scroll_dynamic_page(cdp_ws *ws) {
     const char *expr =
         "(() => new Promise(resolve => {"
         "let last=-1,same=0,steps=0;"
+        "const root=()=>document.scrollingElement||document.documentElement||document.body;"
         "const tick=()=>{"
         "const text=((document.body&&document.body.innerText)||'').length;"
         "if(text===last)same++;else same=0;last=text;"
-        "window.scrollBy(0,Math.max(700,Math.floor(innerHeight*0.85)));"
+        "const h=Math.max(700,Math.floor((innerHeight||900)*0.85));"
+        "const r=root();"
+        "window.scrollTo(0,Math.min(r.scrollHeight,steps*h));"
         "steps++;"
-        "if(steps>=14||same>=3){resolve('scrolled '+steps+' text='+text);return;}"
-        "setTimeout(tick,650);"
+        "if(steps>=28||same>=6){resolve('scrolled '+steps+' text='+text);return;}"
+        "setTimeout(tick,750);"
         "};"
         "tick();"
         "}))()";
@@ -886,6 +899,17 @@ static char *web_chrome_executable(void) {
     return web_xstrdup("google-chrome");
 }
 
+#ifdef __APPLE__
+static const char *web_macos_chrome_app_name(void) {
+    if (getenv("DS4_CHROME")) return NULL;
+    if (access("/Applications/Google Chrome.app", F_OK) == 0)
+        return "Google Chrome";
+    if (access("/Applications/Chromium.app", F_OK) == 0)
+        return "Chromium";
+    return NULL;
+}
+#endif
+
 static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     if (!web_mkdir_p(web->profile_dir)) {
         web_set_err(err, err_len, "failed to create Chrome profile dir %s: %s",
@@ -893,6 +917,12 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
         return false;
     }
     char *exe = web_chrome_executable();
+#ifdef __APPLE__
+    const char *mac_app_name = web_macos_chrome_app_name();
+    bool launched_via_open = mac_app_name != NULL && access("/usr/bin/open", X_OK) == 0;
+#else
+    bool launched_via_open = false;
+#endif
     char port_arg[64], profile_arg[PATH_MAX + 64];
     snprintf(port_arg, sizeof(port_arg), "--remote-debugging-port=%d", web->port);
     snprintf(profile_arg, sizeof(profile_arg), "--user-data-dir=%s", web->profile_dir);
@@ -910,10 +940,18 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
             if (nullfd > 2) close(nullfd);
         }
 #ifdef __APPLE__
-        execlp(exe, exe, port_arg, "--remote-allow-origins=*",
-               profile_arg, "--no-first-run", "--no-default-browser-check",
-               "--disable-sync", "--use-mock-keychain", "--password-store=basic",
-               "about:blank", (char *)NULL);
+        if (launched_via_open) {
+            execlp("/usr/bin/open", "open", "-g", "-na", mac_app_name,
+                   "--args", port_arg, "--remote-allow-origins=*",
+                   profile_arg, "--no-first-run", "--no-default-browser-check",
+                   "--disable-sync", "--use-mock-keychain", "--password-store=basic",
+                   "about:blank", (char *)NULL);
+        } else {
+            execlp(exe, exe, port_arg, "--remote-allow-origins=*",
+                   profile_arg, "--no-first-run", "--no-default-browser-check",
+                   "--disable-sync", "--use-mock-keychain", "--password-store=basic",
+                   "about:blank", (char *)NULL);
+        }
 #else
         if (geteuid() == 0) {
             execlp(exe, exe, port_arg, "--remote-allow-origins=*",
@@ -939,8 +977,9 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
         int status = 0;
         pid_t rc = waitpid(pid, &status, WNOHANG);
         if (rc == pid) {
-            web_set_err(err, err_len, "Chrome exited before CDP became ready");
             web->chrome_pid = 0;
+            if (launched_via_open) continue;
+            web_set_err(err, err_len, "Chrome exited before CDP became ready");
             return false;
         }
         usleep(250000);
@@ -982,26 +1021,53 @@ static void web_tab_free(web_tab *tab) {
     tab->ws_url = NULL;
 }
 
+static char *web_browser_ws_url(ds4_web *web, char *err, size_t err_len) {
+    char *body = web_http_request("GET", web->port, "/json/version", err, err_len);
+    if (!body) return NULL;
+    char *ws = web_json_get_string(body, "webSocketDebuggerUrl");
+    free(body);
+    if (!ws) web_set_err(err, err_len, "Chrome did not return a browser WebSocket URL");
+    return ws;
+}
+
 static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
                          char *err, size_t err_len) {
     memset(tab, 0, sizeof(*tab));
-    char *enc = web_url_encode(url);
-    web_buf path = {0};
-    web_buf_puts(&path, "/json/new?");
-    web_buf_puts(&path, enc);
-    free(enc);
-    char *path_s = web_buf_take(&path);
-    char *body = web_http_request("PUT", web->port, path_s, err, err_len);
-    free(path_s);
-    if (!body) return false;
-    tab->id = web_json_get_string(body, "id");
-    tab->ws_url = web_json_get_string(body, "webSocketDebuggerUrl");
-    free(body);
-    if (!tab->ws_url) {
-        web_tab_free(tab);
-        web_set_err(err, err_len, "Chrome did not return a page WebSocket URL");
+
+    char *browser_url = web_browser_ws_url(web, err, err_len);
+    if (!browser_url) return false;
+    cdp_ws browser = {.fd = -1};
+    if (web_ws_connect(browser_url, &browser, err, err_len) != 0) {
+        free(browser_url);
         return false;
     }
+    free(browser_url);
+
+    char *qurl = web_json_quote(url);
+    web_buf params = {0};
+    web_buf_puts(&params, "{\"url\":");
+    web_buf_puts(&params, qurl);
+    web_buf_puts(&params, ",\"background\":true,\"newWindow\":false}");
+    free(qurl);
+    char *params_s = web_buf_take(&params);
+    char *resp = web_cdp_call(&browser, "Target.createTarget",
+                              params_s, err, err_len);
+    free(params_s);
+    web_ws_close(&browser);
+    if (!resp) return false;
+
+    tab->id = web_json_get_string(resp, "targetId");
+    free(resp);
+    if (!tab->id) {
+        web_tab_free(tab);
+        web_set_err(err, err_len, "Chrome did not return a page target id");
+        return false;
+    }
+
+    char ws_url[PATH_MAX + 128];
+    snprintf(ws_url, sizeof(ws_url), "ws://127.0.0.1:%d/devtools/page/%s",
+             web->port, tab->id);
+    tab->ws_url = web_xstrdup(ws_url);
     return true;
 }
 
