@@ -110,8 +110,8 @@ typedef struct {
     bool stop;
     bool interrupt;
     bool initialized;
-    bool queued_user_pending;
     bool save_requested;
+    bool compact_requested;
     bool power_requested;
     int requested_power;
     int progress_base;
@@ -287,7 +287,6 @@ typedef struct {
 static volatile sig_atomic_t agent_sigint;
 static agent_worker *agent_completion_worker;
 
-static bool worker_has_queued_user_pending(agent_worker *w);
 static void worker_apply_pending_power(agent_worker *w);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
@@ -408,6 +407,7 @@ static bool agent_slash_command_with_args(const char *cmd, const char *name) {
 static bool agent_slash_command_known(const char *cmd) {
     return !strcmp(cmd, "/help") ||
            !strcmp(cmd, "/save") ||
+           !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
@@ -505,6 +505,7 @@ static void usage(FILE *fp) {
         "Commands:\n"
         "  /help                  Show runtime help.\n"
         "  /save                  Save the current agent session.\n"
+        "  /compact               Compact the current session context now.\n"
         "  /list                  List saved sessions in ~/.ds4/kvcache.\n"
         "  /switch SHA            Load a saved session and show recent history.\n"
         "  /del SHA               Delete a saved session.\n"
@@ -6968,39 +6969,6 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         char *tool_result;
-        if (worker_has_queued_user_pending(w)) {
-            /* The live KV is append-only: generated assistant text is already
-             * the current state, so user interjection must not rewind it.  Close
-             * the tool round with a synthetic tool result and let the queued
-             * user prompt append after this stable transcript point. */
-            if (malformed_tool) {
-                agent_buf b = {0};
-                agent_buf_puts(&b, "Tool error: invalid DSML tool call: ");
-                agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
-                agent_buf_puts(&b, "\n");
-                agent_buf_puts(&b, agent_dsml_syntax_reminder);
-                agent_buf_puts(&b, "Tool execution stopped because a queued user prompt is pending.\n");
-                tool_result = agent_buf_take(&b);
-            } else if (early_tool_error) {
-                agent_buf b = {0};
-                agent_buf_puts(&b, "Tool error: ");
-                agent_buf_puts(&b, stream.tool_preflight_error_msg[0] ?
-                               stream.tool_preflight_error_msg :
-                               "edit old selector failed before new was generated");
-                agent_buf_puts(&b, "\n");
-                agent_buf_puts(&b, "Tool execution stopped because a queued user prompt is pending.\n");
-                tool_result = agent_buf_take(&b);
-            } else {
-                tool_result = xstrdup(
-                    "Tool call not executed because a queued user prompt is pending.\n");
-            }
-            ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
-            free(tool_result);
-            agent_dsml_parser_free(&dsml);
-            agent_set_status(w, AGENT_WORKER_IDLE);
-            return 0;
-        }
-
         if (early_tool_error) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -7069,6 +7037,14 @@ static void worker_request_save(agent_worker *w) {
     pthread_mutex_unlock(&w->mu);
 }
 
+static void worker_request_compact(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->compact_requested = true;
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
 static void worker_request_power(agent_worker *w, int power) {
     pthread_mutex_lock(&w->mu);
     w->requested_power = power;
@@ -7083,6 +7059,14 @@ static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool requested = w->save_requested;
     w->save_requested = false;
+    pthread_mutex_unlock(&w->mu);
+    return requested;
+}
+
+static bool worker_take_compact_requested(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool requested = w->compact_requested;
+    w->compact_requested = false;
     pthread_mutex_unlock(&w->mu);
     return requested;
 }
@@ -7125,6 +7109,30 @@ static void worker_run_deferred_save(agent_worker *w) {
     agent_set_status(w, AGENT_WORKER_IDLE);
 }
 
+static void worker_run_deferred_compact(agent_worker *w) {
+    if (!worker_take_compact_requested(w)) return;
+    if (!agent_worker_has_user_session(w)) {
+        agent_publishf(w, "\ncompact skipped: nothing to compact\n");
+        return;
+    }
+
+    int before = w->transcript.len;
+    char err[160] = {0};
+    if (agent_worker_compact(w, "user requested compaction", err, sizeof(err))) {
+        if (w->transcript.len != before) {
+            pthread_mutex_lock(&w->mu);
+            w->session_dirty = true;
+            agent_wake_locked(w);
+            pthread_mutex_unlock(&w->mu);
+        } else {
+            agent_publishf(w, "\ncompact skipped: nothing to compact\n");
+        }
+        agent_set_status(w, AGENT_WORKER_IDLE);
+    } else {
+        agent_set_error(w, err[0] ? err : "context compaction failed");
+    }
+}
+
 /* Worker thread entry point.  The UI thread submits plain user text; this
  * thread owns all DS4 session mutation, tool execution, and compaction. */
 static void *worker_main(void *arg) {
@@ -7146,7 +7154,8 @@ static void *worker_main(void *arg) {
 
     while (true) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->cmd_text && !w->save_requested && !w->power_requested)
+        while (!w->stop && !w->cmd_text && !w->save_requested &&
+               !w->compact_requested && !w->power_requested)
             pthread_cond_wait(&w->cond, &w->mu);
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
@@ -7162,6 +7171,11 @@ static void *worker_main(void *arg) {
             worker_run_deferred_save(w);
             continue;
         }
+        if (!w->cmd_text && w->compact_requested) {
+            pthread_mutex_unlock(&w->mu);
+            worker_run_deferred_compact(w);
+            continue;
+        }
         char *cmd = w->cmd_text;
         w->cmd_text = NULL;
         pthread_mutex_unlock(&w->mu);
@@ -7169,6 +7183,7 @@ static void *worker_main(void *arg) {
         worker_run_turn(w, cmd);
         free(cmd);
         worker_apply_pending_power(w);
+        worker_run_deferred_compact(w);
         worker_run_deferred_save(w);
     }
 
@@ -7288,24 +7303,6 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
     return initialized;
-}
-
-/* The UI owns queued user text.  This flag tells the worker to stop at the next
- * stable append-only boundary: if the assistant emits a tool call, the worker
- * records a synthetic "not executed" tool result instead of running the tool,
- * then lets the queued user prompt append as the next turn. */
-static void worker_set_queued_user_pending(agent_worker *w, bool pending) {
-    pthread_mutex_lock(&w->mu);
-    w->queued_user_pending = pending;
-    agent_wake_locked(w);
-    pthread_mutex_unlock(&w->mu);
-}
-
-static bool worker_has_queued_user_pending(agent_worker *w) {
-    pthread_mutex_lock(&w->mu);
-    bool pending = w->queued_user_pending;
-    pthread_mutex_unlock(&w->mu);
-    return pending;
 }
 
 static bool stdout_is_tty(void) {
@@ -8347,6 +8344,7 @@ static void runtime_help(void) {
     puts("Commands:");
     puts("  /help        Show this help.");
     puts("  /save        Save the current session.");
+    puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -8566,13 +8564,11 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
 
         if (!one_shot && queue.len && idle) {
             char *queued = agent_prompt_queue_pop(&queue);
-            worker_set_queued_user_pending(&worker, queue.len > 0);
             if (worker_submit(&worker, queued)) {
                 idle = false;
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
                 queued = NULL;
-                worker_set_queued_user_pending(&worker, true);
             }
             free(queued);
         }
@@ -8642,15 +8638,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         {
             char *prompt = agent_input_buf_take(&input);
             if (worker_is_idle(&worker) && queue.len == 0) {
-                worker_set_queued_user_pending(&worker, false);
                 if (!worker_submit(&worker, prompt)) {
                     agent_prompt_queue_push(&queue, prompt);
-                    worker_set_queued_user_pending(&worker, true);
                     agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                 }
             } else {
                 agent_prompt_queue_push(&queue, prompt);
-                worker_set_queued_user_pending(&worker, true);
                 agent_noninteractive_marker("+DWARFSTAR_QUEUED");
             }
             free(prompt);
@@ -8779,7 +8772,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
         if (initial_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {
-                worker_set_queued_user_pending(&worker, queue.len > 0);
                 free(initial_pending);
                 initial_pending = NULL;
             }
@@ -8787,7 +8779,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
         if (!initial_pending && queue.len && worker_is_idle(&worker)) {
             char *queued = agent_prompt_queue_pop(&queue);
-            worker_set_queued_user_pending(&worker, queue.len > 0);
             if (worker_submit(&worker, queued)) {
                 linenoiseHistoryAdd(queued);
                 linenoiseHistorySave(hist);
@@ -8797,7 +8788,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 free(echo);
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
-                worker_set_queued_user_pending(&worker, true);
                 queued = NULL;
             }
             free(queued);
@@ -8807,7 +8797,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
         if (queue.len && editor_take_queued_byte(&editor, 24)) { /* Ctrl+X */
             char *queued = agent_prompt_queue_pop(&queue);
-            worker_set_queued_user_pending(&worker, queue.len > 0);
             editor_replace_input(&editor, queued);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
@@ -8869,6 +8858,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         if (!agent_worker_save_session(&worker, err, sizeof(err)))
                             printf("save failed: %s\n", err);
                     }
+                } else if (!strcmp(cmd, "/compact")) {
+                    worker_request_compact(&worker);
+                    if (busy)
+                        printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
                 } else if (!strncmp(cmd, "/power", 6) &&
@@ -8984,11 +8977,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("history failed: %s\n", err);
                 } else if (busy) {
                     agent_prompt_queue_push(&queue, cmd);
-                    worker_set_queued_user_pending(&worker, true);
                 } else {
                     linenoiseHistoryAdd(cmd);
                     linenoiseHistorySave(hist);
-                    worker_set_queued_user_pending(&worker, false);
                     if (worker_submit(&worker, cmd)) {
                         agent_echo_user_prompt(cmd);
                     } else {
