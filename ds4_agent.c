@@ -79,6 +79,7 @@ typedef struct {
     agent_worker_state state;
     int prefill_done;
     int prefill_total;
+    unsigned prefill_label;
     int generated;
     double gen_tps;
     int ctx_used;
@@ -139,6 +140,8 @@ typedef struct {
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
 } agent_worker;
+
+static unsigned agent_next_prefill_label(void);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -3928,10 +3931,13 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 
     if (publish_progress) {
         pthread_mutex_lock(&w->mu);
+        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
+            w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
+        w->status.prefill_label = prefill_label;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         agent_wake_locked(w);
@@ -7175,10 +7181,13 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_trace_tokens(w, "prefill_suffix", prompt_for_sync, cached);
 
         pthread_mutex_lock(&w->mu);
+        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
+            w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
+        w->status.prefill_label = prefill_label;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         agent_wake_locked(w);
@@ -7568,6 +7577,7 @@ static bool worker_submit(agent_worker *w, const char *text) {
         w->status.state = AGENT_WORKER_PREFILL;
         w->status.prefill_done = 0;
         w->status.prefill_total = 0;
+        w->status.prefill_label = agent_next_prefill_label();
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
         pthread_cond_signal(&w->cond);
@@ -7734,6 +7744,26 @@ static void agent_power_status_suffix(const agent_status *st,
         buf[0] = '\0';
 }
 
+static unsigned agent_next_prefill_label(void) {
+    static unsigned next;
+    return next++;
+}
+
+/* Keep each prefill operation on a single playful label so the footer does not
+ * visually churn while progress updates stream in. */
+static const char *agent_prefill_label(const agent_status *st) {
+    static const char *labels[] = {
+        "reading",
+        "absorbing",
+        "studying",
+        "gathering",
+        "crunching",
+        "scrutinizing",
+    };
+    size_t n = sizeof(labels) / sizeof(labels[0]);
+    return labels[(st ? st->prefill_label : 0u) % n];
+}
+
 /* Build the one-line footer shown below the prompt.  It is intentionally compact
  * because linenoise redraws it on every progress update. */
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
@@ -7751,8 +7781,9 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         double pct = 100.0 * (double)done / (double)total;
         char bar[AGENT_PROGRESS_BAR_MAX_BYTES];
         agent_progress_bar(done, total, bar, sizeof(bar), stdout_is_tty());
-        snprintf(buf, len, "ctx %s/%s | prefill %s %d/%d %.1f%%%s",
-                 used, total_ctx, bar, done, total, pct, power);
+        snprintf(buf, len, "ctx %s/%s | %s %s %d/%d %.1f%%%s",
+                 used, total_ctx, agent_prefill_label(st), bar,
+                 done, total, pct, power);
         break;
     }
     case AGENT_WORKER_GENERATING:
