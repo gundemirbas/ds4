@@ -30,11 +30,35 @@
 # per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1; see the comment
 # block above the implementation in ds4_cuda.cu).
 #
+# Long-context profile (added 2026-05-26 for Opp C Phase 1A.4):
+#   At long input context, baseline-eager decode is currently
+#   non-deterministic past roughly 32-64 decoded tokens -- 3x baseline-
+#   eager runs at long-prompt + n=128 produce 3 distinct token-id MD5s,
+#   while the same 3 runs truncated to the first 32 tokens match. This
+#   is unrelated to layer-graph capture or to the FP8 mirror (FP8 OFF +
+#   capture OFF reproduces it), and is tracked separately (see
+#   local/docs/ds4_long_context_nondeterminism_2026-05-26.md). Until
+#   that pre-existing noise source is fixed, the long-context gate is
+#   bounded at n=32 -- which still exercises the indexer-fires regime,
+#   thousands of compressed rows per layer, and (in FP8-on runs) tens of
+#   thousands of FP8 read-path blocks. See PROFILE below.
+#
 # Usage:  bash tests/cuda_layer_graph_determinism_probe.sh [N] [PROMPT] [NTOK]
 #         N      -- run count per mode.       Default 3.
 #         PROMPT -- one-shot prompt.          Default a short explainer.
+#                   Prefix with '@' to read from a file, e.g.
+#                   "@tests/long_context_story_prompt.txt".
 #         NTOK   -- generated tokens per run. Default 256 (do not lower
-#                   below 256 for a real gate -- see above).
+#                   below 256 for the SHORT-prompt gate -- see above).
+#
+# Recommended profiles:
+#   short (the default):
+#     bash tests/cuda_layer_graph_determinism_probe.sh
+#   long-context, deterministic regime (n=32):
+#     bash tests/cuda_layer_graph_determinism_probe.sh \
+#         3 "@tests/long_context_story_prompt.txt" 32
+#   long-context past n>=64 is currently KNOWN-FLAKY in baseline (not a
+#   gate); run it only to characterize the pre-existing noise.
 #
 # Repeated-batch tip: each ds4 invocation reloads the ~87 GB model
 # (~40 s).  For large N, bring up ds4_weight_server once (VMM upload,
@@ -54,6 +78,22 @@ TMPDIR=${TMPDIR:-/tmp}/ds4_determinism_probe.$$
 mkdir -p "$TMPDIR"
 trap "rm -rf $TMPDIR" EXIT
 
+# If PROMPT starts with '@', the remainder is a path to a file containing
+# the prompt -- routed through ds4's --prompt-file so prompts larger than
+# ARG_MAX (the long-context profiles) work.  Otherwise the prompt is
+# passed inline via -p.
+PROMPT_ARGS=(-p "$PROMPT")
+case "$PROMPT" in
+    @*)
+        PROMPT_FILE="${PROMPT#@}"
+        if [ ! -r "$PROMPT_FILE" ]; then
+            echo "probe: prompt file not readable: $PROMPT_FILE" >&2
+            exit 64
+        fi
+        PROMPT_ARGS=(--prompt-file "$PROMPT_FILE")
+        ;;
+esac
+
 run_one() {
     local mode_label="$1"
     local mode_env="$2"
@@ -62,7 +102,7 @@ run_one() {
     local con="$TMPDIR/${mode_label}_${i}.con"
     pkill -9 -f "$DS4 --cuda" 2>/dev/null || true
     sleep 1
-    env $mode_env $DS4 --cuda --temp 0 -n "$NTOK" -p "$PROMPT" \
+    env $mode_env $DS4 --cuda --temp 0 -n "$NTOK" "${PROMPT_ARGS[@]}" \
         --dump-logprobs "$lp" --logprobs-top-k 1 > "$con" 2>&1
     # MD5 the SELECTED token-id sequence only (see the header for why
     # neither the console nor the whole JSON file is compared).

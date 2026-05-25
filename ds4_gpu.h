@@ -1021,7 +1021,12 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const void             *scalars,
         /* Step 4c A1: per-layer index for ds4_layer_scalars substrate.
          * UINT32_MAX = no substrate. */
-        uint32_t                il_for_decode1);
+        uint32_t                il_for_decode1,
+        /* Opp C Phase 1A.4: optional packed FP8 mirror; see
+         * ds4_gpu_attention_decode_heads_tensor for semantics.  Only the
+         * gridX=1 dense indexed-decode branch consults it. */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

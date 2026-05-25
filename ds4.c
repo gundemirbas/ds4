@@ -9886,7 +9886,12 @@ static bool metal_graph_encode_decode_layer_impl(
                     DS4_N_HEAD,
                     DS4_N_HEAD_DIM,
                     ds4_gpu_decode_scalars_device_ptr(),
-                    il /* A1: per-layer substrate for n_comp */) != 0;
+                    il /* A1: per-layer substrate for n_comp */,
+                    /* Opp C Phase 1A.4: packed FP8 mirror for indexer
+                     * decode reads.  NULL when off; the kernel collapses
+                     * to FP32. */
+                    g->layer_comp_cache_fp8[il],
+                    g->layer_comp_scale[il]) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -14533,7 +14538,15 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
+                                                                              /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */,
+                                                                              /* Opp C Phase 1A.4: packed FP8 mirror.
+                                                                               * Batch path (n_tokens>1) takes the heads8
+                                                                               * branches inside the wrapper, which keep
+                                                                               * reading FP32; we pass the pointers anyway
+                                                                               * so the gridX=1 fallback (DS4_CUDA_NO_INDEXED_
+                                                                               * HEADS8) also benefits. */
+                                                                              g->layer_comp_cache_fp8[il],
+                                                                              g->layer_comp_scale[il]) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -14649,7 +14662,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           ratio,
                                                                           DS4_N_HEAD,
                                                                           DS4_N_HEAD_DIM,
-                                                                          /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
+                                                                          /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */,
+                                                                          /* Opp C Phase 1A.4: packed FP8 mirror. */
+                                                                          g->layer_comp_cache_fp8[il],
+                                                                          g->layer_comp_scale[il]) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -14778,7 +14794,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
+                                                                              /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */,
+                                                                              /* Opp C Phase 1A.4: packed FP8 mirror for
+                                                                               * decode2-exact indexer attention. */
+                                                                              cur_comp ? g->layer_comp_cache_fp8[il] : NULL,
+                                                                              cur_comp ? g->layer_comp_scale[il]    : NULL) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,
