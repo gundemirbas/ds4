@@ -259,6 +259,12 @@ struct ds4_layer_graph_key {
     void    *attn_state_score;
     void    *index_state_kv;
     void    *index_state_score;
+    /* Opp C Phase 1A: packed FP8 compressed-KV mirror buffers.  NULL
+     * unless DS4_CUDA_FP8_KV is enabled; a stable NULL keeps the key
+     * (hence the captured-graph cache) byte-identical when the feature
+     * is off. */
+    void    *comp_cache_fp8;
+    void    *comp_scale;
 };
 
 /* Returns 1 unless DS4_CUDA_LAYER_GRAPHS is set to a disable value
@@ -266,6 +272,12 @@ struct ds4_layer_graph_key {
  * Callers use this to gate the per-token build_key cost and the R4
  * split-flush override. */
 int  ds4_cuda_layer_graphs_enabled(void);
+
+/* Opp C Phase 1A: returns 1 only when DS4_CUDA_FP8_KV is set to an enable
+ * value (1/on/yes/true); default OFF.  Gates allocation of the packed FP8
+ * compressed-KV mirror buffers and (in later sub-commits) the FP8 emit /
+ * attention-read paths.  Metal stub returns 0. */
+int  ds4_cuda_fp8_kv_enabled(void);
 
 /* begin_or_replay return values:
  *   1  -- cache hit; graph replayed; caller skips the layer body encoding.

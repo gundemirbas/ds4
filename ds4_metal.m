@@ -411,6 +411,14 @@ int ds4_cuda_layer_graphs_enabled(void) {
     return 0;
 }
 
+/* Opp C Phase 1A: the packed FP8 compressed-KV mirror is a CUDA-only
+ * decode optimisation.  Metal builds always report it disabled, so the
+ * FP8 buffers are never allocated and ds4.c keeps its existing FP32
+ * compressed-KV path unchanged. */
+int ds4_cuda_fp8_kv_enabled(void) {
+    return 0;
+}
+
 int ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
                                            const struct ds4_layer_graph_key *key) {
     (void)il; (void)key;

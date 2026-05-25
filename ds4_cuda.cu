@@ -4691,6 +4691,19 @@ __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
     return sign * dsv4_e4m3fn_value_dev(best);
 }
 
+/* Opp C Phase 1A: E4M3FN decode table.  A packed compressed-KV lane is a
+ * 1-byte code -- bit 7 the sign, bits 0..6 the magnitude index (0..126,
+ * exactly the index dsv4_e4m3fn_dequant_dev's binary search settles on).
+ * The non-RoPE lanes are already E4M3-quantised by the model, so decoding
+ * a stored code is an exact table lookup, not a re-quantisation.  This
+ * __constant__ table maps the 7-bit magnitude index to its float value;
+ * the sign bit is applied at the read site.  Phase 1A.1 stands up the
+ * storage only -- it is left zero, and the population (cudaMemcpyToSymbol)
+ * plus the decode helper / attention-side reads land in Phase 1A.4 with
+ * their first caller.  An unreferenced __constant__ symbol emits no code,
+ * so this is byte-identical to today's build. */
+__constant__ float dsv4_e4m3fn_decode_table[128];
+
 __device__ static float dsv4_e2m1fn_value_dev(int i) {
     switch (i & 7) {
     case 0: return 0.0f;
@@ -8707,9 +8720,11 @@ struct ds4_layer_graph_key {
     void    *attn_state_score;
     void    *index_state_kv;
     void    *index_state_score;
+    void    *comp_cache_fp8;   /* Opp C Phase 1A FP8 mirror; NULL when off */
+    void    *comp_scale;       /* Opp C Phase 1A per-block scales; NULL when off */
 };
-static_assert(sizeof(struct ds4_layer_graph_key) == 160u,
-              "ds4_layer_graph_key must match ds4_gpu.h decl (16 B header + 18 ptrs)");
+static_assert(sizeof(struct ds4_layer_graph_key) == 176u,
+              "ds4_layer_graph_key must match ds4_gpu.h decl (16 B header + 20 ptrs)");
 
 struct layer_graph_entry {
     struct ds4_layer_graph_key key;
@@ -8769,6 +8784,30 @@ extern "C" int ds4_cuda_layer_graphs_enabled(void) {
              * decode path does. */
             enabled = 0;
             fprintf(stderr, "ds4: DS4_CUDA_NO_MMVQ_DECODE set - per-layer graph capture disabled (legacy decode path is not capture-safe)\n");
+        }
+    }
+    return enabled;
+}
+
+/* Opp C Phase 1A FP8 KV-cache gate.  Default OFF: the packed FP8
+ * compressed-KV mirror is a new, deliberately opt-in branch.  Returns 1
+ * only for an explicit enable value (1/on/ON/yes/YES/true/TRUE); any
+ * unset or other value keeps it OFF so the build stays byte-identical to
+ * today.  extern "C" so ds4.c can gate buffer allocation and the (later)
+ * emit / attention-read paths.  See local/docs/ds4_opp_c_fp8_kv_plan.html. */
+extern "C" int ds4_cuda_fp8_kv_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_FP8_KV");
+        if (s && *s &&
+            (strcmp(s, "1") == 0 ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
+            enabled = 1;
+            fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s - packed FP8 compressed-KV mirror enabled (Opp C Phase 1A)\n", s);
         }
     }
     return enabled;

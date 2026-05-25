@@ -8157,6 +8157,19 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #define DS4_OUTPUT_CERT_GROUPS_MAX 16u
 #define DS4_OUTPUT_CERT_GROUPS_DEFAULT 8u
 
+/* Opp C Phase 1A packed compressed-KV mirror geometry.  The 448 non-RoPE
+ * lanes are already E4M3-quantised by the model, so each is stored as a
+ * 1-byte code; the 64-lane rotary tail stays FP32 in Phase 1A.  Scales are
+ * per 64-lane block (7 per row).  Row sizes:
+ *   layer_comp_cache_fp8 row = 448 codes + 64*4 B tail            = 704 B
+ *   layer_comp_scale     row = 7 * 4 B                            =  28 B
+ * versus today's 2048 B FP32 compressed row.  See the plan doc. */
+#define DS4_OPP_C_FP8_NOPE        ((uint32_t)(DS4_N_HEAD_DIM - DS4_N_ROT))   /* 448 */
+#define DS4_OPP_C_FP8_BLOCKS      (DS4_OPP_C_FP8_NOPE / 64u)                 /* 7   */
+#define DS4_OPP_C_FP8_ROW_BYTES   ((uint64_t)DS4_OPP_C_FP8_NOPE \
+                                   + (uint64_t)DS4_N_ROT * sizeof(float))    /* 704 */
+#define DS4_OPP_C_FP8_SCALE_BYTES ((uint64_t)DS4_OPP_C_FP8_BLOCKS * sizeof(float)) /* 28 */
+
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -8183,6 +8196,16 @@ typedef struct {
      * the row counters whenever a checkpoint is saved or partially rewound. */
     ds4_gpu_tensor *layer_raw_cache[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_N_LAYER];
+    /* Opp C Phase 1A: packed FP8 mirror of the attention-compressed cache.
+     * layer_comp_cache_fp8 holds, per compressed row, DS4_OPP_C_FP8_NOPE
+     * 1-byte E4M3 codes followed by a still-FP32 rotary tail;
+     * layer_comp_scale holds the DS4_OPP_C_FP8_BLOCKS per-64-lane FP32
+     * block scales.  Both are allocated only when DS4_CUDA_FP8_KV is
+     * enabled (default OFF) and are NULL otherwise.  Phase 1A.1 stands the
+     * storage up structurally; emit (1A.2) and attention read (1A.3) wire
+     * it.  See local/docs/ds4_opp_c_fp8_kv_plan.html. */
+    ds4_gpu_tensor *layer_comp_cache_fp8[DS4_N_LAYER];
+    ds4_gpu_tensor *layer_comp_scale[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_state_kv[DS4_N_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_N_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_N_LAYER];
@@ -8436,6 +8459,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+    }
+    /* Opp C Phase 1A: NULL-safe -- these stay NULL when DS4_CUDA_FP8_KV is
+     * off, so an unconditional free is correct in both modes. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_comp_cache_fp8[il]);
+        ds4_gpu_tensor_free(g->layer_comp_scale[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
@@ -8824,6 +8853,10 @@ static bool metal_graph_alloc_raw_cap(
     g->q = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    /* Opp C Phase 1A: the FP8 compressed-KV mirror is allocated only when
+     * DS4_CUDA_FP8_KV is enabled.  Default OFF -> these buffers stay NULL
+     * (g was memset above) and the build is byte-identical to today. */
+    const bool fp8_kv = ds4_cuda_fp8_kv_enabled() != 0;
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
@@ -8839,6 +8872,14 @@ static bool metal_graph_alloc_raw_cap(
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float));
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+            if (fp8_kv) {
+                g->layer_comp_cache_fp8[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES);
+                g->layer_comp_scale[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES);
+            }
             if (enable_mtp) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
@@ -9004,6 +9045,13 @@ static bool metal_graph_alloc_raw_cap(
                                g->spec_prefix1_attn_state_score[il] != NULL &&
                                g->spec_prefix2_attn_state_kv[il] != NULL &&
                                g->spec_prefix2_attn_state_score[il] != NULL));
+            if (layer_cache_ok && fp8_kv) {
+                /* Opp C Phase 1A: when the FP8 mirror is enabled its two
+                 * per-layer buffers must have allocated for every
+                 * compressed layer. */
+                layer_cache_ok = g->layer_comp_cache_fp8[il] != NULL &&
+                                 g->layer_comp_scale[il] != NULL;
+            }
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
@@ -13047,6 +13095,13 @@ static bool metal_graph_encode_token_raw_swa(
             key.attn_state_score  = (void *)ds4_gpu_tensor_ptr(g->layer_attn_state_score[il]);
             key.index_state_kv    = (void *)ds4_gpu_tensor_ptr(g->layer_index_state_kv[il]);
             key.index_state_score = (void *)ds4_gpu_tensor_ptr(g->layer_index_state_score[il]);
+            /* Opp C Phase 1A: the FP8 mirror pointers enter the key so a
+             * KV-cache regrow invalidates the captured graph.  When
+             * DS4_CUDA_FP8_KV is off the buffers are NULL and these fields
+             * stay NULL -- a stable value that keeps the key (and thus the
+             * captured-graph cache) byte-identical to today. */
+            key.comp_cache_fp8    = (void *)ds4_gpu_tensor_ptr(g->layer_comp_cache_fp8[il]);
+            key.comp_scale        = (void *)ds4_gpu_tensor_ptr(g->layer_comp_scale[il]);
             rc = ds4_cuda_layer_graph_begin_or_replay(il, &key);
         }
 
