@@ -11859,10 +11859,15 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * substrate (decode2-exact / batch paths use inline n_comp). */
         uint32_t                il_for_decode1,
         /* Opp C Phase 1A.4: optional packed FP8 mirror of the compressed
-         * rows; only the gridX=1 dense indexed-decode branch consults it.
-         * The prefill/batch heads8 variants keep reading FP32 -- they
-         * never fire at decode (Phase 0 phase0_measurements doc), so a
-         * parallel rewrite is deferred. */
+         * rows.  Consumed by the generic attention_indexed_mixed_kernel
+         * launch below -- the one that fires for all decode
+         * (n_tokens==1) and also for the batch path (n_tokens>1) when
+         * DS4_CUDA_NO_INDEXED_HEADS8 disables the heads8 fast path
+         * above.  The two heads8 variants themselves keep reading FP32
+         * (they never fire at decode under default settings -- Phase 0
+         * phase0_measurements doc -- so a parallel rewrite is deferred);
+         * callers pass the pointers unconditionally so the env-gated
+         * fallback path benefits too. */
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale) {
     if (!heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||

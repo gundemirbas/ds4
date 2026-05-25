@@ -1023,8 +1023,12 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * UINT32_MAX = no substrate. */
         uint32_t                il_for_decode1,
         /* Opp C Phase 1A.4: optional packed FP8 mirror; see
-         * ds4_gpu_attention_decode_heads_tensor for semantics.  Only the
-         * gridX=1 dense indexed-decode branch consults it. */
+         * ds4_gpu_attention_decode_heads_tensor for semantics.  Read by
+         * the generic attention_indexed_mixed_kernel branch -- the one
+         * that fires for all decode (n_tokens==1) and also for the
+         * batch path (n_tokens>1) when DS4_CUDA_NO_INDEXED_HEADS8
+         * disables the heads8 fast path.  The heads8 variants
+         * themselves still read FP32. */
         const ds4_gpu_tensor *comp_fp8,
         const ds4_gpu_tensor *comp_scale);
 

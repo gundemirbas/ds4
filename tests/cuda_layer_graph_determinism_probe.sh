@@ -159,7 +159,30 @@ elif [ "$off_unique" -eq 1 ] && [ "$on_unique" -gt 1 ]; then
     echo "    ON values:"
     for m in "${on_md5s[@]}"; do echo "      $m"; done
     exit 2
+elif [ "$off_unique" -gt 1 ] && [ "$on_unique" -eq 1 ]; then
+    # Captured graphs deterministic, eager is not.  At long context this
+    # is the documented pre-existing baseline-eager noise (see the
+    # "Long-context profile" comment block at the top of this file and
+    # local/docs/ds4_long_context_nondeterminism_2026-05-26.md): the
+    # noise is not introduced by capture, so OFF varying while ON is
+    # stable is a baseline-noise signal, not a capture regression.
+    # Treated as a non-zero exit so the operator notices, but with a
+    # distinct code -- callers running this profile knowingly can ignore
+    # exit 4 while still failing on the other modes.
+    echo "  RESULT: BASELINE-NOISE -- OFF varies, ON deterministic (capture is NOT the regression source)"
+    echo "    OFF values:"
+    for m in "${off_md5s[@]}"; do echo "      $m"; done
+    echo "    ON:  ${on_md5s[0]}"
+    exit 4
 else
+    # Both modes varying.  Captured replay reuses one captured exec, so
+    # any noise that appears under ON also appears under OFF; the
+    # converse is also possible.  Treat as "noise of unknown source --
+    # bisect with the per-kernel hash dump."
     echo "  RESULT: UNEXPECTED -- both modes show variance"
+    echo "    OFF values:"
+    for m in "${off_md5s[@]}"; do echo "      $m"; done
+    echo "    ON values:"
+    for m in "${on_md5s[@]}"; do echo "      $m"; done
     exit 3
 fi
