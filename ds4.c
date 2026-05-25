@@ -9908,7 +9908,14 @@ static bool metal_graph_encode_decode_layer_impl(
                                                          0,
                                                          DS4_N_HEAD, DS4_N_HEAD_DIM,
                                                          ds4_gpu_decode_scalars_device_ptr(),
-                                                         il /* A1: per-layer substrate for n_comp */) != 0;
+                                                         il /* A1: per-layer substrate for n_comp */,
+                                                         /* Opp C Phase 1A.3: pass the packed FP8 mirror when
+                                                          * allocated; CUDA reads it for compressed-row lanes
+                                                          * and the FP32 cache stays the source of truth for
+                                                          * raw KV and the rotary tail.  NULL when off -- the
+                                                          * kernel collapses to the FP32 read path. */
+                                                         n_comp ? g->layer_comp_cache_fp8[il] : NULL,
+                                                         n_comp ? g->layer_comp_scale[il]    : NULL) != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
@@ -14554,7 +14561,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->raw_window,
                                                                              ratio,
                                                                              DS4_N_HEAD,
-                                                                             DS4_N_HEAD_DIM) != 0;
+                                                                             DS4_N_HEAD_DIM,
+                                                                             /* Opp C Phase 1A.3: packed FP8 mirror; NULL when off. */
+                                                                             g->layer_comp_cache_fp8[il],
+                                                                             g->layer_comp_scale[il]) != 0;
                 }
             }
             if (ok) batch_attention_done = true;
@@ -14785,7 +14795,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  n_selected,
                                                                  DS4_N_HEAD,
                                                                  DS4_N_HEAD_DIM,
-                                                                 /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
+                                                                 /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */,
+                                                                 /* Opp C Phase 1A.3: pass the packed FP8 mirror
+                                                                  * when there are compressed rows.  decode2-exact
+                                                                  * goes through this same shim with cur_comp>0. */
+                                                                 cur_comp ? g->layer_comp_cache_fp8[il] : NULL,
+                                                                 cur_comp ? g->layer_comp_scale[il]    : NULL) != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);

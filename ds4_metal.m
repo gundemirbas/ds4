@@ -11271,7 +11271,12 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
+    /* Opp C Phase 1A.3: Metal mirror lives in CUDA only today; ignore. */
+    (void)comp_fp8;
+    (void)comp_scale;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -11629,8 +11634,13 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         const void             *scalars,
-        uint32_t                il_for_decode1) {
+        uint32_t                il_for_decode1,
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
     (void)scalars; (void)il_for_decode1;  /* Metal stub ignores -- inline args carry the values */
+    /* Opp C Phase 1A.3: Metal mirror lives in CUDA only today; ignore. */
+    (void)comp_fp8;
+    (void)comp_scale;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||

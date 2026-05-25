@@ -931,7 +931,15 @@ int ds4_gpu_attention_decode_heads_tensor(
         /* Step 4c A1: per-layer index for the ds4_layer_scalars substrate.
          * Decode1 passes il (0..42) to lift n_comp off the inline arg;
          * decode2-exact + batch callers pass UINT32_MAX (no substrate). */
-        uint32_t                il_for_decode1);
+        uint32_t                il_for_decode1,
+        /* Opp C Phase 1A.3: optional packed FP8 mirror of the compressed
+         * rows (g->layer_comp_cache_fp8[il] / g->layer_comp_scale[il]).
+         * NULL/NULL when DS4_CUDA_FP8_KV is off; the dense kernel then
+         * keeps reading the FP32 cache bit-identically.  Only consulted
+         * by the gridX=1 dense decode branch -- the score-buffer / window
+         * fallbacks ignore it. */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -980,7 +988,11 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        /* Opp C Phase 1A.3: optional packed FP8 mirror; see
+         * ds4_gpu_attention_decode_heads_tensor for semantics. */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale);
 
 /* Decode-time indexed-attention shim.  See ds4_gpu_attention_decode_heads_
  * tensor for the `scalars` semantics.  Pass NULL for the batched/prefill
