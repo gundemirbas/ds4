@@ -6245,7 +6245,14 @@ int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        uint32_t          il) {
+        uint32_t          il,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror) {
+    /* Opp C Phase 1A: packed FP8 mirror is CUDA-only.  Metal keeps the
+     * FP32 cache and ignores the mirror tensors (the callers in ds4.c pass
+     * NULL on Metal builds because ds4_cuda_fp8_kv_enabled() returns 0). */
+    (void)codes_mirror;
+    (void)scale_mirror;
     if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
     const uint32_t comp_row = g_metal_layer_scalars[il].comp_row;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,

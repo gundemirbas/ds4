@@ -646,11 +646,20 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
  * ls pointer, not a per-token row pointer.  The shim computes the
  * per-layer ls = &g_layer_dev[il] internally.  See plan doc R1 + sec
  * 15.4. */
+/* Opp C Phase 1A: when DS4_CUDA_FP8_KV is enabled, `codes_mirror` and
+ * `scale_mirror` are the per-layer packed FP8 mirror tensors
+ * (g->layer_comp_cache_fp8[il] / g->layer_comp_scale[il]); the kernel
+ * writes the 1-byte E4M3 codes + per-64-lane scales + FP32 rotary tail to
+ * those buffers in addition to its existing in-place FP32 quantisation of
+ * `base`.  Pass NULL for both when the feature is disabled; the buffers
+ * stay NULL through the layer-graph key for stable capture/replay. */
 int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        uint32_t          il);
+        uint32_t          il,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror);
 
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,

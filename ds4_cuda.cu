@@ -4691,6 +4691,31 @@ __device__ static float dsv4_e4m3fn_dequant_dev(float x) {
     return sign * dsv4_e4m3fn_value_dev(best);
 }
 
+/* Opp C Phase 1A: return the 1-byte E4M3FN code for `x` -- bit 7 = sign,
+ * bits 0..6 = magnitude index (0..126).  The binary search is byte-for-byte
+ * the same one dsv4_e4m3fn_dequant_dev runs internally, so on the read side
+ *     decode_table[code & 0x7f] * ((code & 0x80) ? -1 : +1) * scale
+ * reconstructs dsv4_e4m3fn_dequant_dev(clamp) * scale bit-identically (see
+ * the Phase 0 numerics test in local/docs/ds4_opp_c_phase0_measurements.html).
+ * Used at compressor emit to populate the packed FP8 mirror. */
+__device__ static unsigned char dsv4_e4m3fn_encode_dev(float x) {
+    const unsigned int sign_bit = (x < 0.0f) ? 0x80u : 0x00u;
+    const float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value_dev(mid) <= ax) lo = mid;
+        else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float bd = fabsf(ax - dsv4_e4m3fn_value_dev(best));
+        const float nd = fabsf(ax - dsv4_e4m3fn_value_dev(best + 1));
+        if (nd < bd || (nd == bd && (((best + 1) & 1) == 0) && ((best & 1) != 0))) best++;
+    }
+    return (unsigned char)(sign_bit | (unsigned int)best);
+}
+
 /* Opp C Phase 1A: E4M3FN decode table.  A packed compressed-KV lane is a
  * 1-byte code -- bit 7 the sign, bits 0..6 the magnitude index (0..126,
  * exactly the index dsv4_e4m3fn_dequant_dev's binary search settles on).
@@ -4819,10 +4844,28 @@ __global__ static void fp8_kv_quantize_row_kernel(
         float *base,
         uint32_t head_dim,
         uint32_t n_rot,
-        const struct ds4_layer_scalars * __restrict__ ls) {
+        const struct ds4_layer_scalars * __restrict__ ls,
+        unsigned char * __restrict__ codes_base,
+        float * __restrict__ scale_base) {
     uint32_t tid = threadIdx.x;
     uint32_t n_nope = head_dim - n_rot;
+    /* Opp C Phase 1A: packed-mirror row layout (only used when both base
+     * pointers are non-null):
+     *   codes_row[0 .. n_nope)               -- 1-byte E4M3 codes
+     *   codes_row[n_nope .. n_nope+n_rot*4)  -- FP32 rotary tail
+     *   scale_row[0 .. n_nope/64)            -- per-64-lane block scales
+     * Pointers are captured once at session create and baked into the
+     * graph; NULL when DS4_CUDA_FP8_KV is disabled (kernel becomes a no-op
+     * for the mirror in that case). */
+    const uint64_t row_stride = (uint64_t)n_nope + (uint64_t)n_rot * sizeof(float);
+    const uint64_t scale_stride = (uint64_t)(n_nope / 64u);
     float *xr = base + (uint64_t)ls->comp_row * head_dim;
+    unsigned char *codes_row = codes_base
+        ? codes_base + (uint64_t)ls->comp_row * row_stride
+        : (unsigned char *)0;
+    float *scale_row = scale_base
+        ? scale_base + (uint64_t)ls->comp_row * scale_stride
+        : (float *)0;
     __shared__ float scratch[64];
     for (uint32_t off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
@@ -4835,10 +4878,20 @@ __global__ static void fp8_kv_quantize_row_kernel(
         }
         float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
         if (off + tid < n_nope) {
-            float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
-            xr[off + tid] = q;
+            float clamp = fminf(448.0f, fmaxf(-448.0f, v / scale));
+            xr[off + tid] = dsv4_e4m3fn_dequant_dev(clamp) * scale;
+            if (codes_row) codes_row[off + tid] = dsv4_e4m3fn_encode_dev(clamp);
         }
+        if (scale_row && tid == 0) scale_row[off / 64u] = scale;
         __syncthreads();
+    }
+    /* Opp C Phase 1A: copy the FP32 rotary tail into the mirror.  All 64
+     * threads cooperate; for DS4 n_rot == 64 so it is one float per thread.
+     * No __syncthreads needed -- the tail lanes were written by a separate
+     * rope kernel earlier in the stream, not by this kernel. */
+    if (codes_row && tid < n_rot) {
+        float *tail = (float *)(codes_row + (uint64_t)n_nope);
+        tail[tid] = xr[(uint64_t)n_nope + tid];
     }
 }
 
@@ -10546,13 +10599,20 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t head_dim,
         uint32_t n_rot,
-        uint32_t il) {
+        uint32_t il,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror) {
     if (!base || g_layer_dev == NULL || n_rot > head_dim ||
         il >= DS4_LAYER_SCALARS_COUNT ||
         base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    /* Opp C Phase 1A: mirror buffers are NULL when DS4_CUDA_FP8_KV is off
+     * (no allocation) and stable when on (one-shot allocation at session
+     * create).  Pass through unconditionally; the kernel branches itself. */
+    unsigned char *codes_ptr = codes_mirror ? (unsigned char *)codes_mirror->ptr : (unsigned char *)0;
+    float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
     fp8_kv_quantize_row_kernel<<<1, 64, 0, ds4_current_stream()>>>(
             (float *)base->ptr, head_dim, n_rot,
-            g_layer_dev + il);
+            g_layer_dev + il, codes_ptr, scale_ptr);
     int ok_fp8 = cuda_ok(cudaGetLastError(), "fp8_kv_quantize_row launch");
     return ok_fp8;
 }

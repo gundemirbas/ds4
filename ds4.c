@@ -9640,10 +9640,17 @@ static bool metal_graph_encode_decode_layer_impl(
              * metal_graph_encode_token_raw_swa).  Closes P1a -- the racy
              * set_emit_rows + flush pair is gone, and the per-layer host
              * source means no within-token CPU writes to the host buffer. */
+            /* Opp C Phase 1A: pass the per-layer packed FP8 mirror buffers
+             * through unconditionally.  They are NULL when DS4_CUDA_FP8_KV
+             * is off (no allocation in metal_graph_alloc_raw_cap), in which
+             * case the kernel skips the mirror writes; when on, the kernel
+             * also emits codes + per-block scales + FP32 rotary tail. */
             ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
                     g->layer_attn_comp_cache[il],
                     DS4_N_HEAD_DIM, DS4_N_ROT,
-                    il) != 0;
+                    il,
+                    g->layer_comp_cache_fp8[il],
+                    g->layer_comp_scale[il]) != 0;
             if (ok && metal_graph_debug_wants("KVcompress", il, pos)) {
                 /* Debug-only path (DS4_METAL_GRAPH_DUMP_PREFIX env-gated).
                  * The synchronize inside the dumper is incompatible with
