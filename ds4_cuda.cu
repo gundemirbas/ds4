@@ -2124,6 +2124,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
  * definition, so we don't forward-declare the symbol. */
 static int ds4_cuda_fp8_kv_decode_table_init(void);
 extern "C" int ds4_cuda_fp8_kv_enabled(void);
+extern "C" int ds4_cuda_fp8_kv_debug_enabled(void);
 extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
 
 extern "C" int ds4_gpu_init(void) {
@@ -2152,12 +2153,14 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
-    /* Opp C Phase 1A.3 tripwire: when the FP8 KV mirror is enabled, surface
+    /* Opp C Phase 1A tripwire: when DS4_CUDA_FP8_KV_DEBUG is set, surface
      * how many dense-decode blocks actually executed the FP8 read branch.
      * A nonzero count here is the evidence that a matching token-MD5
      * between FP8-on and baseline reflects bit-identical reconstruction
-     * rather than a NULL'd wiring that silently fell back to FP32. */
-    if (ds4_cuda_fp8_kv_enabled()) {
+     * rather than a NULL'd wiring that silently fell back to FP32.  The
+     * counter itself stays armed unconditionally -- this gate only
+     * controls the stderr print so a review-clean build stays quiet. */
+    if (ds4_cuda_fp8_kv_enabled() && ds4_cuda_fp8_kv_debug_enabled()) {
         const unsigned long long blocks = ds4_cuda_fp8_kv_read_path_blocks();
         fprintf(stderr, "ds4: DS4_CUDA_FP8_KV path stats -- dense decode blocks that read FP8: %llu\n", blocks);
     }
@@ -4783,14 +4786,13 @@ static int ds4_cuda_fp8_kv_decode_table_init(void) {
 #define DS4_OPP_C_FP8_BLOCKS_DEV     7u      /* 448 / 64  */
 #define DS4_OPP_C_FP8_ROW_BYTES_DEV  704u    /* 448 codes + 64 FP32 tail */
 
-/* Opp C Phase 1A.3: a *matching* token-MD5 between FP8-on and baseline is
- * only meaningful if the FP8 read branch actually executed.  This atomic
- * counter is incremented once per block that took the FP8 branch (thread 0
- * only -- one atomic per block, not per (block,row,dim), so the cost is in
- * the noise even when on).  Host-side getter exposes the count and
- * ds4_gpu_cleanup() prints it when DS4_CUDA_FP8_KV is enabled.  An always-
- * on tripwire: a future regression that NULLs the wiring will show as a
- * zero count even while the MD5 keeps matching. */
+/* Opp C Phase 1A.3 tripwire: a matching token-MD5 between FP8-on and
+ * baseline is only meaningful if the FP8 read branch actually executed.
+ * This counter is incremented once per block that took the FP8 branch
+ * (thread 0 only -- one atomic per block, not per (block,row,dim), so
+ * the cost is in the noise even when on).  Stays armed unconditionally
+ * so the symbol remains usable from the per-kernel hash-dump diagnostic;
+ * the cleanup-time stderr print is gated on DS4_CUDA_FP8_KV_DEBUG. */
 __device__ static unsigned long long g_fp8_kv_read_path_blocks = 0ull;
 
 /* Read one (row, dim) lane out of the packed FP8 mirror.  For d<448 the
@@ -9032,6 +9034,30 @@ extern "C" int ds4_cuda_fp8_kv_enabled(void) {
              strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
             enabled = 1;
             fprintf(stderr, "ds4: DS4_CUDA_FP8_KV=%s - packed FP8 compressed-KV mirror enabled (Opp C Phase 1A)\n", s);
+        }
+    }
+    return enabled;
+}
+
+/* Opp C Phase 1A debug gate.  When set, ds4_gpu_cleanup prints the
+ * tripwire counters at session end.  The counters themselves (and their
+ * extern "C" getters) stay live unconditionally -- they are cheap (one
+ * atomic per block per layer launch) and the symbols are also consumable
+ * from the per-kernel hash-dump diagnostic.  Only the cleanup chatter is
+ * gated, because an always-on stderr line should not survive into a
+ * branch intended for review. */
+extern "C" int ds4_cuda_fp8_kv_debug_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_FP8_KV_DEBUG");
+        if (s && *s &&
+            (strcmp(s, "1") == 0 ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
+            enabled = 1;
         }
     }
     return enabled;
