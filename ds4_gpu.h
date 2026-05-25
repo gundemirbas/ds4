@@ -632,11 +632,20 @@ int ds4_gpu_head_rms_norm_tensor(
         uint32_t          head_dim,
         float             eps);
 
+/* Opp C Phase 1A: batched form.  Same mirror semantics as the row variant
+ * below -- pass codes_mirror / scale_mirror NULL on Metal and at sites
+ * that do not feed the FP8 mirror (e.g. raw KV, working batch_kv,
+ * indexer cache).  When non-NULL the kernel writes packed codes + scales
+ * + FP32 rotary tail for rows [0..n_tok).  Callers that want to mirror
+ * into the MIDDLE of the per-layer mirror buffer pass tensor views at
+ * the matching row offsets. */
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          head_dim,
-        uint32_t          n_rot);
+        uint32_t          n_rot,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror);
 
 /* R1 row-variant (Step 4c R1' migration to layer-scalars substrate):
  * writes one row of `base` at the index taken from the per-layer device
@@ -852,7 +861,10 @@ int ds4_gpu_compressor_prefill_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps);
+        float                   rms_eps,
+        /* Opp C Phase 1A: see the ds4_gpu_dsv4_fp8_kv_quantize_tensor comment. */
+        ds4_gpu_tensor       *comp_cache_fp8,
+        ds4_gpu_tensor       *comp_scale);
 
 int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         ds4_gpu_tensor       *comp_cache,
@@ -878,7 +890,9 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps);
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_cache_fp8,
+        ds4_gpu_tensor       *comp_scale);
 
 int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         ds4_gpu_tensor       *state_kv,

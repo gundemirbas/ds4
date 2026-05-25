@@ -6188,7 +6188,13 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
         uint32_t          head_dim,
-        uint32_t          n_rot) {
+        uint32_t          n_rot,
+        ds4_gpu_tensor *codes_mirror,
+        ds4_gpu_tensor *scale_mirror) {
+    /* Opp C Phase 1A: Metal has no FP8 mirror; callers in ds4.c pass NULL
+     * because ds4_cuda_fp8_kv_enabled() returns 0 on Metal. */
+    (void)codes_mirror;
+    (void)scale_mirror;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!x || n_tok == 0 || head_dim == 0 || n_rot > head_dim) return 0;
     if (n_rot == head_dim) return 1;
@@ -6259,7 +6265,7 @@ int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         (uint64_t)comp_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
     if (!row_view) return 0;
-    int ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(row_view, 1, head_dim, n_rot);
+    int ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(row_view, 1, head_dim, n_rot, NULL, NULL);
     ds4_gpu_tensor_free(row_view);
     return ok;
 }
@@ -7542,7 +7548,12 @@ int ds4_gpu_compressor_prefill_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_cache_fp8,
+        ds4_gpu_tensor       *comp_scale) {
+    /* Opp C Phase 1A: Metal has no FP8 mirror.  Callers in ds4.c pass NULL. */
+    (void)comp_cache_fp8;
+    (void)comp_scale;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
@@ -7862,7 +7873,7 @@ int ds4_gpu_compressor_prefill_tensor(
                                                     ratio);
         }
         if (ok && n_comp != 0 && quantize_fp8) {
-            ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot) != 0;
+            ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot, NULL, NULL) != 0;
         }
 
         if (!had_batch) {
@@ -7897,7 +7908,11 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_cache_fp8,
+        ds4_gpu_tensor       *comp_scale) {
+    (void)comp_cache_fp8;
+    (void)comp_scale;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0 ||
@@ -8135,7 +8150,7 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                                                     ratio);
         }
         if (ok && quantize_fp8) {
-            ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot) != 0;
+            ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot, NULL, NULL) != 0;
         }
 
         if (ok) {

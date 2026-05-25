@@ -9299,7 +9299,8 @@ static bool metal_graph_decode_kv_store(
         uint32_t          raw_cap,
         uint32_t          raw_row) {
     if (metal_graph_use_reference_kv_decode()) {
-        return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0 &&
+        /* Opp C Phase 1A: raw KV stays FP32 in Phase 1; no mirror. */
+        return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, DS4_N_HEAD_DIM, DS4_N_ROT, NULL, NULL) != 0 &&
                ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, DS4_N_HEAD_DIM,
                                              ds4_gpu_decode_scalars_device_ptr()  /* PC4 (K0): substrate raw_row at execution time */) != 0;
     }
@@ -13712,10 +13713,13 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("KVrope", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
+    /* Opp C Phase 1A: batch_kv is a per-token working tensor, not the
+     * persistent compressed cache; no mirror. */
     if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(g->batch_kv,
                                                        n_tokens,
                                                        DS4_N_HEAD_DIM,
-                                                       DS4_N_ROT) != 0;
+                                                       DS4_N_ROT,
+                                                       NULL, NULL) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -13861,7 +13865,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          attn_factor,
                                                          DS4_ROPE_YARN_BETA_FAST,
                                                          DS4_ROPE_YARN_BETA_SLOW,
-                                                         DS4_RMS_EPS) != 0;
+                                                         DS4_RMS_EPS,
+                                                         /* Opp C Phase 1A: prefill writes rows
+                                                          * [0..n_comp); pass the whole mirror
+                                                          * buffers (NULL when feature is off). */
+                                                         g->layer_comp_cache_fp8[il],
+                                                         g->layer_comp_scale[il]) != 0;
                 if (ok && ratio == 4) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
@@ -13909,11 +13918,27 @@ static bool metal_graph_encode_layer_attention_batch(
                     ok = false;
                 }
                 ds4_gpu_tensor *comp_view = NULL;
+                ds4_gpu_tensor *comp_fp8_view = NULL;
+                ds4_gpu_tensor *comp_scale_view = NULL;
                 if (ok) {
                     comp_view = ds4_gpu_tensor_view(g->layer_attn_comp_cache[il],
                                                       (uint64_t)comp_before * DS4_N_HEAD_DIM * sizeof(float),
                                                       (uint64_t)comp_chunk * DS4_N_HEAD_DIM * sizeof(float));
                     ok = comp_view != NULL;
+                }
+                /* Opp C Phase 1A: matching mirror chunk views at the same
+                 * row offset.  When the feature is off the buffers are NULL
+                 * so we skip view creation and pass NULL through. */
+                if (ok && g->layer_comp_cache_fp8[il]) {
+                    comp_fp8_view = ds4_gpu_tensor_view(
+                            g->layer_comp_cache_fp8[il],
+                            (uint64_t)comp_before * DS4_OPP_C_FP8_ROW_BYTES,
+                            (uint64_t)comp_chunk * DS4_OPP_C_FP8_ROW_BYTES);
+                    comp_scale_view = ds4_gpu_tensor_view(
+                            g->layer_comp_scale[il],
+                            (uint64_t)comp_before * DS4_OPP_C_FP8_SCALE_BYTES,
+                            (uint64_t)comp_chunk * DS4_OPP_C_FP8_SCALE_BYTES);
+                    ok = comp_fp8_view != NULL && comp_scale_view != NULL;
                 }
                 if (ok && ratio == 4) {
                     ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
@@ -13940,7 +13965,9 @@ static bool metal_graph_encode_layer_attention_batch(
                             attn_factor,
                             DS4_ROPE_YARN_BETA_FAST,
                             DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS) != 0;
+                            DS4_RMS_EPS,
+                            comp_fp8_view,
+                            comp_scale_view) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_compressor_prefill_tensor(
                             comp_view,
@@ -13967,7 +13994,9 @@ static bool metal_graph_encode_layer_attention_batch(
                             attn_factor,
                             DS4_ROPE_YARN_BETA_FAST,
                             DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS) != 0;
+                            DS4_RMS_EPS,
+                            comp_fp8_view,
+                            comp_scale_view) != 0;
                 }
                 if (ok && ratio == 4) {
                     ok = metal_graph_refresh_ratio4_compressor_state(g,
@@ -14006,6 +14035,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
                 ds4_gpu_tensor_free(comp_view);
+                ds4_gpu_tensor_free(comp_fp8_view);
+                ds4_gpu_tensor_free(comp_scale_view);
             } else {
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
                     const uint32_t pos = pos0 + t;
@@ -14050,11 +14081,27 @@ static bool metal_graph_encode_layer_attention_batch(
                                 g->layer_attn_comp_cache[il],
                                 (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
                                 (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+                        /* Opp C Phase 1A: matching single-row mirror views
+                         * for this emit (decode2-exact, not under capture). */
+                        ds4_gpu_tensor *mirror_codes_row_view = NULL;
+                        ds4_gpu_tensor *mirror_scale_row_view = NULL;
+                        if (g->layer_comp_cache_fp8[il]) {
+                            mirror_codes_row_view = ds4_gpu_tensor_view(
+                                    g->layer_comp_cache_fp8[il],
+                                    (uint64_t)comp_row * DS4_OPP_C_FP8_ROW_BYTES,
+                                    (uint64_t)DS4_OPP_C_FP8_ROW_BYTES);
+                            mirror_scale_row_view = ds4_gpu_tensor_view(
+                                    g->layer_comp_scale[il],
+                                    (uint64_t)comp_row * DS4_OPP_C_FP8_SCALE_BYTES,
+                                    (uint64_t)DS4_OPP_C_FP8_SCALE_BYTES);
+                        }
                         ok = comp_row_view &&
                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
                                                                    1,
                                                                    DS4_N_HEAD_DIM,
-                                                                   DS4_N_ROT) != 0;
+                                                                   DS4_N_ROT,
+                                                                   mirror_codes_row_view,
+                                                                   mirror_scale_row_view) != 0;
                         if (ok) {
                             metal_graph_debug_dump_tensor("KVcompress",
                                                           comp_row_view,
@@ -14063,6 +14110,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           pos);
                         }
                         ds4_gpu_tensor_free(comp_row_view);
+                        ds4_gpu_tensor_free(mirror_codes_row_view);
+                        ds4_gpu_tensor_free(mirror_scale_row_view);
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
@@ -14173,7 +14222,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                              attn_factor,
                                                              DS4_ROPE_YARN_BETA_FAST,
                                                              DS4_ROPE_YARN_BETA_SLOW,
-                                                             DS4_RMS_EPS) != 0;
+                                                             DS4_RMS_EPS,
+                                                             /* Indexer cache stays FP32; no mirror. */
+                                                             NULL,
+                                                             NULL) != 0;
                 }
                 if (ok && n_comp != 0) {
                     ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
@@ -14258,7 +14310,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                 attn_factor,
                                 DS4_ROPE_YARN_BETA_FAST,
                                 DS4_ROPE_YARN_BETA_SLOW,
-                                DS4_RMS_EPS) != 0;
+                                DS4_RMS_EPS,
+                                /* Indexer cache stays FP32; no mirror. */
+                                NULL,
+                                NULL) != 0;
                     }
                     if (ok && index_chunk != 0) {
                         ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,

@@ -4795,11 +4795,26 @@ __device__ static DS4_CUDA_UNUSED void rope_tail_one_dev(float *x, uint32_t head
     }
 }
 
-__global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+__global__ static void fp8_kv_quantize_kernel(
+        float *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot,
+        unsigned char * __restrict__ codes_base,
+        float * __restrict__ scale_base) {
     uint32_t row = blockIdx.x;
     uint32_t tid = threadIdx.x;
     uint32_t n_nope = head_dim - n_rot;
+    /* Opp C Phase 1A: see the matching comment in fp8_kv_quantize_row_kernel
+     * for the packed mirror row layout (448 codes + FP32 rotary tail; 7
+     * per-block scales).  When both bases are NULL the kernel collapses to
+     * the original in-place FP32 quant. */
+    const uint64_t row_stride = (uint64_t)n_nope + (uint64_t)n_rot * sizeof(float);
+    const uint64_t scale_stride = (uint64_t)(n_nope / 64u);
     float *xr = x + (uint64_t)row * head_dim;
+    unsigned char *codes_row = codes_base
+        ? codes_base + (uint64_t)row * row_stride
+        : (unsigned char *)0;
+    float *scale_row = scale_base
+        ? scale_base + (uint64_t)row * scale_stride
+        : (float *)0;
     __shared__ float scratch[64];
     for (uint32_t off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
@@ -4812,10 +4827,17 @@ __global__ static void fp8_kv_quantize_kernel(float *x, uint32_t n_tok, uint32_t
         }
         float scale = exp2f(ceilf(log2f(fmaxf(scratch[0], 1.0e-4f) / 448.0f)));
         if (off + tid < n_nope) {
-            float q = dsv4_e4m3fn_dequant_dev(fminf(448.0f, fmaxf(-448.0f, v / scale))) * scale;
-            xr[off + tid] = q;
+            float clamp = fminf(448.0f, fmaxf(-448.0f, v / scale));
+            xr[off + tid] = dsv4_e4m3fn_dequant_dev(clamp) * scale;
+            if (codes_row) codes_row[off + tid] = dsv4_e4m3fn_encode_dev(clamp);
         }
+        if (scale_row && tid == 0) scale_row[off / 64u] = scale;
         __syncthreads();
+    }
+    /* Copy FP32 rotary tail into the mirror row (one float per thread). */
+    if (codes_row && tid < n_rot) {
+        float *tail = (float *)(codes_row + (uint64_t)n_nope);
+        tail[tid] = xr[(uint64_t)n_nope + tid];
     }
 }
 
@@ -10575,9 +10597,17 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_
     head_rms_norm_rope_tail_kernel<<<n_tok * n_head, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
     return cuda_ok(cudaGetLastError(), "head_rms_norm_rope_tail launch");
 }
-extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
+extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot,
+        ds4_gpu_tensor *codes_mirror, ds4_gpu_tensor *scale_mirror) {
     if (!x || n_rot > head_dim || x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
-    fp8_kv_quantize_kernel<<<n_tok, 64, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, head_dim, n_rot);
+    /* Opp C Phase 1A: same NULL-passthrough pattern as the row variant.
+     * When DS4_CUDA_FP8_KV is off the mirror tensors are NULL and the
+     * kernel skips the mirror writes. */
+    unsigned char *codes_ptr = codes_mirror ? (unsigned char *)codes_mirror->ptr : (unsigned char *)0;
+    float *scale_ptr = scale_mirror ? (float *)scale_mirror->ptr : (float *)0;
+    fp8_kv_quantize_kernel<<<n_tok, 64, 0, ds4_current_stream()>>>(
+            (float *)x->ptr, n_tok, head_dim, n_rot, codes_ptr, scale_ptr);
     return cuda_ok(cudaGetLastError(), "fp8_kv_quantize launch");
 }
 
@@ -10707,7 +10737,8 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
          * time -- capture-safe.  Decode2-exact path passes NULL (kernel
          * uses inline raw_row arg). */
         const void       *scalars) {
-    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
+    /* Opp C Phase 1A: raw KV is not packed in Phase 1; no mirror. */
+    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot, NULL, NULL) &&
            ds4_gpu_store_raw_kv_tensor(raw_cache, kv, raw_cap, raw_row, head_dim, scalars);
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim, const void *scalars) {
@@ -10982,7 +11013,14 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        /* Opp C Phase 1A: when quantize_fp8 is true and these mirror
+         * tensors are non-NULL, the inner FP8 quantize call also writes
+         * the packed FP8 codes + per-block scales + FP32 rotary tail to
+         * them.  Indexer-cache callers and the entire Metal backend pass
+         * NULL/NULL (no mirror). */
+        ds4_gpu_tensor       *comp_cache_fp8,
+        ds4_gpu_tensor       *comp_scale) {
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -11069,7 +11107,9 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
                     ext_factor, attn_factor, beta_fast, beta_slow);
             if (!cuda_ok(cudaGetLastError(), "compressor prefill rope launch")) return 0;
         }
-        if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
+        if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+                comp_cache, n_comp, head_dim, n_rot,
+                comp_cache_fp8, comp_scale)) return 0;
     }
     return 1;
 }
@@ -11097,7 +11137,9 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_cache_fp8,
+        ds4_gpu_tensor       *comp_scale) {
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -11144,7 +11186,9 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                 ext_factor, attn_factor, beta_fast, beta_slow);
         if (!cuda_ok(cudaGetLastError(), "compressor replay rope launch")) return 0;
     }
-    if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
+    if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+            comp_cache, n_comp, head_dim, n_rot,
+            comp_cache_fp8, comp_scale)) return 0;
 
     uint64_t state_n = (uint64_t)state_rows * width;
     if (!cuda_ok(cudaMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float)), ds4_current_stream()),
