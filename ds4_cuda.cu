@@ -5743,16 +5743,30 @@ __global__ static void attention_indexed_mixed_kernel(
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
     }
-    for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
-        int32_t c = topk[(uint64_t)t * top_k + i];
-        if (c >= 0 && (uint32_t)c < visible_comp) {
-            uint32_t slot = atomicAdd(&comp_count, 1u);
-            if (slot < 512u) comp_rows[slot] = (uint32_t)c;
-        }
-    }
-    __syncthreads();
+    /* Determinism fix (2026-05-26 long-context nondeterminism postmortem):
+     * the prior parallel `atomicAdd(&comp_count, 1u)` compaction produced an
+     * order-nondeterministic comp_rows[] across runs (CUDA does not specify
+     * the order in which racing atomicAdds win), which in turn shuffled the
+     * FP accumulation order in the score / output reductions below.  At long
+     * input context (indexer-fires regime, n_comp > top_k) that 1 ULP per row
+     * snowballs into different argmax tokens within ~32-64 decoded positions
+     * -- see local/docs/ds4_long_context_nondeterminism_2026-05-26.md.
+     *
+     * Single-threaded sequential fill (matches the sibling
+     * attention_indexed_mixed_heads8_rb4_kernel pattern at line 5935) keeps
+     * comp_rows[] in the same order as the input topk every run, restoring
+     * bit-identical decode output past the indexer-firing boundary.  The
+     * extra single-thread loop costs ~top_k iterations of one-int reads per
+     * block; at decode (top_k=512, ~64 blocks per layer call, ~21 ratio-4
+     * layers, ~100 tok/s) this is a few percent of attention time -- a clear
+     * win over keeping the bug. */
     if (threadIdx.x == 0) {
-        if (comp_count > 512u) comp_count = 512u;
+        for (uint32_t i = 0; i < top_k && comp_count < 512u; i++) {
+            int32_t c = topk[(uint64_t)t * top_k + i];
+            if (c >= 0 && (uint32_t)c < visible_comp) {
+                comp_rows[comp_count++] = (uint32_t)c;
+            }
+        }
     }
     __syncthreads();
     uint32_t n_score = raw_count + comp_count;
