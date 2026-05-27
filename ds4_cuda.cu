@@ -7797,13 +7797,16 @@ __global__ static void indexer_scores_wmma128_kernel(
 #endif
 }
 
-__global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+__global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
+        /* PC5 substrate override (see indexer_topk_8192_cub_kernel docstring). */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const float *row = scores + (uint64_t)t * n_comp;
     uint32_t *sel = selected + (uint64_t)t * top_k;
     for (uint32_t k = 0; k < top_k; k++) sel[k] = 0;
-    for (uint32_t c = 0; c < n_comp; c++) {
+    for (uint32_t c = 0; c < n_actual; c++) {
         float v = row[c];
         for (uint32_t k = 0; k < top_k; k++) {
             if ((k >= c) || v > row[sel[k]]) {
@@ -7833,7 +7836,15 @@ __global__ static void indexer_topk_8192_cub_kernel(
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        /* PC5: optional per-layer substrate override.  When non-NULL the
+         * kernel reads the live count from ls_override->n_index_comp at
+         * execute time (capture-safe) instead of the inline n_comp arg
+         * baked at capture.  Row stride remains n_comp because the
+         * scores buffer's layout was written by the producer kernel with
+         * that stride; only the data-vs-padding boundary uses n_actual.
+         * See "live score producer, stale top-k consumer" notes. */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     constexpr uint32_t BLOCK_THREADS = 512u;
     constexpr uint32_t ITEMS_PER_THREAD = 16u;
     using BlockSort = cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
@@ -7845,12 +7856,13 @@ __global__ static void indexer_topk_8192_cub_kernel(
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= BLOCK_THREADS) return;
 
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const float *row = scores + (uint64_t)t * n_comp;
     uint64_t keys[ITEMS_PER_THREAD];
 #pragma unroll
     for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
         const uint32_t i = tid * ITEMS_PER_THREAD + item;
-        if (i < n_comp) {
+        if (i < n_actual) {
             keys[item] = topk_pack_key(row[i], i);
         } else {
             keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
@@ -7873,15 +7885,18 @@ __global__ static void indexer_topk_1024_kernel(
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        /* PC5 substrate override; see indexer_topk_8192_cub_kernel docstring. */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens || tid >= 1024u) return;
     __shared__ float vals[1024];
     __shared__ uint32_t idxs[1024];
 
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const float *row = scores + (uint64_t)t * n_comp;
-    if (tid < n_comp) {
+    if (tid < n_actual) {
         vals[tid] = row[tid];
         idxs[tid] = tid;
     } else {
@@ -7922,16 +7937,19 @@ __global__ static void indexer_topk_pow2_kernel(
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        /* PC5 substrate override; see indexer_topk_8192_cub_kernel docstring. */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const float *row = scores + (uint64_t)t * n_comp;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
+        if (i < n_actual) {
             vals[i] = row[i];
             idxs[i] = i;
         } else {
@@ -7977,16 +7995,19 @@ __global__ static void indexer_topk_pow2_u16_kernel(
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        /* PC5 substrate override; see indexer_topk_8192_cub_kernel docstring. */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
     __shared__ float vals[SORT_N];
     __shared__ uint16_t idxs[SORT_N];
 
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const float *row = scores + (uint64_t)t * n_comp;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
+        if (i < n_actual) {
             vals[i] = row[i];
             idxs[i] = (uint16_t)i;
         } else {
@@ -8033,15 +8054,31 @@ __global__ static void indexer_topk_chunk_pow2_kernel(
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k,
-        uint32_t candidate_stride) {
+        uint32_t candidate_stride,
+        /* PC5 substrate override; see indexer_topk_8192_cub_kernel docstring.
+         * Chunk count (gridDim.y) must be sized off n_comp_max in the host
+         * shim so a captured grid covers any future live n_index_comp; this
+         * kernel then early-returns chunks fully past n_actual and partially
+         * masks the boundary chunk. */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     uint32_t t = blockIdx.x;
     uint32_t chunk = blockIdx.y;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
 
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const uint32_t chunk_start = chunk * SORT_N;
-    if (chunk_start >= n_comp) return;
-    const uint32_t chunk_n = n_comp - chunk_start < SORT_N ? n_comp - chunk_start : SORT_N;
+    if (chunk_start >= n_actual) {
+        /* Whole chunk past the live count: emit -INFINITY sentinels so the
+         * merge stage sees a deterministic empty set rather than stale data
+         * left over from a previous-token's captured replay. */
+        uint32_t *out_pad = candidates + (uint64_t)t * candidate_stride + chunk * top_k;
+        for (uint32_t i = tid; i < top_k; i += blockDim.x) {
+            out_pad[i] = UINT32_MAX;
+        }
+        return;
+    }
+    const uint32_t chunk_n = n_actual - chunk_start < SORT_N ? n_actual - chunk_start : SORT_N;
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
@@ -8097,13 +8134,16 @@ __global__ static void indexer_topk_merge_pow2_kernel(
         uint32_t n_tokens,
         uint32_t top_k,
         uint32_t candidate_count,
-        uint32_t candidate_stride) {
+        uint32_t candidate_stride,
+        /* PC5 substrate override; see indexer_topk_8192_cub_kernel docstring. */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const float *row = scores + (uint64_t)t * n_comp;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
@@ -8111,7 +8151,7 @@ __global__ static void indexer_topk_merge_pow2_kernel(
         float v = -INFINITY;
         if (i < candidate_count) {
             idx = cand[i];
-            if (idx < n_comp) v = row[idx];
+            if (idx < n_actual) v = row[idx];
         }
         vals[i] = v;
         idxs[i] = idx;
@@ -8159,7 +8199,9 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
         uint32_t n_sets,
         uint32_t merge_group,
         uint32_t candidate_stride,
-        uint32_t out_stride) {
+        uint32_t out_stride,
+        /* PC5 substrate override; see indexer_topk_8192_cub_kernel docstring. */
+        const struct ds4_layer_scalars * __restrict__ ls_override) {
     uint32_t t = blockIdx.x;
     uint32_t group = blockIdx.y;
     uint32_t tid = threadIdx.x;
@@ -8174,6 +8216,7 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
     __shared__ float vals[SORT_N];
     __shared__ uint32_t idxs[SORT_N];
 
+    const uint32_t n_actual = ls_override ? ls_override->n_index_comp : n_comp;
     const float *row = scores + (uint64_t)t * n_comp;
     const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
@@ -8181,7 +8224,7 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
         float v = -INFINITY;
         if (i < candidate_count) {
             idx = cand[i];
-            if (idx < n_comp) v = row[idx];
+            if (idx < n_actual) v = row[idx];
         }
         vals[i] = v;
         idxs[i] = idx;
@@ -8473,30 +8516,62 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
-        uint32_t                top_k) {
+        uint32_t                top_k,
+        /* PC5: max-grid + substrate params for captured-decode safety.
+         * When il_for_decode1 < DS4_LAYER_SCALARS_COUNT and the substrate
+         * is allocated, the shim picks kernel specialization by n_comp_max
+         * (session-stable per-layer comp_cap) instead of n_comp (which
+         * varies per token across replays), and the chosen kernel reads
+         * the live count from ls->n_index_comp at execute time.  This
+         * closes the "live score producer, stale top-k consumer" capture
+         * bug class: the captured graph node bakes n_comp at capture, so
+         * every later replay would otherwise scan a stale prefix of
+         * scores while indexer_score_one_direct extends the live count.
+         *
+         * Pass (0, UINT32_MAX) for legacy fixed-n_comp behavior; that is
+         * what every non-decode-body and multi-token caller (prefill,
+         * decode2-exact, output-head vocab top-k) does. */
+        uint32_t                n_comp_max,
+        uint32_t                il_for_decode1) {
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
         top_k > n_comp ||
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
-    if (top_k == 512u && n_comp <= 1024u &&
+    /* PC5 activation: substrate present, valid il, non-zero max, not opted
+     * out via env.  Specialization basis becomes n_comp_max (capture-stable)
+     * and the kernel reads n_actual from g_layer_dev[il].n_index_comp at
+     * execute time.  Otherwise legacy: n_comp drives both grid and kernel. */
+    const bool pc5_active =
+        (g_layer_dev != NULL) &&
+        (il_for_decode1 < DS4_LAYER_SCALARS_COUNT) &&
+        (n_comp_max != 0u) &&
+        (getenv("DS4_CUDA_PC5_LEGACY_GRID") == NULL);
+    const struct ds4_layer_scalars *ls = pc5_active
+        ? (g_layer_dev + il_for_decode1) : NULL;
+    /* Use max(n_comp, n_comp_max) so the captured specialization is large
+     * enough to hold any future n_index_comp this layer reaches. */
+    const uint32_t n_spec = pc5_active
+        ? (n_comp >= n_comp_max ? n_comp : n_comp_max)
+        : n_comp;
+    if (top_k == 512u && n_spec <= 1024u &&
         getenv("DS4_CUDA_NO_TOPK1024") == NULL) {
         indexer_topk_1024_kernel<<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                      (const float *)scores->ptr,
-                                                     n_comp, n_tokens, top_k);
+                                                     n_comp, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 1024 launch");
     }
-    if (top_k == 512u && n_comp <= 2048u &&
+    if (top_k == 512u && n_spec <= 2048u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
         indexer_topk_pow2_kernel<2048><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
+                                                           n_comp, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 2048 launch");
     }
-    if (top_k == 512u && n_comp <= 4096u &&
+    if (top_k == 512u && n_spec <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL) {
-        if (n_comp == 4096u) {
+        if (n_spec == 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
             int dev = 0;
@@ -8514,20 +8589,20 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
+                                                                                 n_comp, n_tokens, top_k, ls);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
                 }
             }
         }
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                            (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
+                                                           n_comp, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 4096 launch");
     }
-    if (top_k == 512u && n_comp <= 8192u &&
+    if (top_k == 512u && n_spec <= 8192u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK8192") == NULL) {
-        if (n_comp > 4096u) {
+        if (n_spec > 4096u) {
             using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
             const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
             int dev = 0;
@@ -8545,20 +8620,22 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                 if (attr_err == cudaSuccess) {
                     indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
+                                                                                 n_comp, n_tokens, top_k, ls);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
                 }
             }
         }
         indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                                                (const float *)scores->ptr,
-                                                               n_comp, n_tokens, top_k);
+                                                               n_comp, n_tokens, top_k, ls);
         return cuda_ok(cudaGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 512u && getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_CHUNKED") == NULL) {
         const uint32_t chunk_n = 4096u;
-        const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
+        /* Chunk count sized off n_spec so captured grid covers any future
+         * n_actual; chunk_pow2 kernel early-returns/masks past n_actual. */
+        const uint32_t n_chunks = (n_spec + chunk_n - 1u) / chunk_n;
         const uint32_t candidate_stride = n_chunks * top_k;
         uint32_t n_sets = n_chunks;
         uint64_t scratch_u32_per_token = candidate_stride;
@@ -8580,7 +8657,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                     n_comp,
                                                                     n_tokens,
                                                                     top_k,
-                                                                    candidate_stride);
+                                                                    candidate_stride,
+                                                                    ls);
         if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
 
         while (n_sets > DS4_CUDA_TOPK_MERGE_GROUP) {
@@ -8598,7 +8676,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                     n_sets,
                     DS4_CUDA_TOPK_MERGE_GROUP,
                     cur_stride,
-                    next_stride);
+                    next_stride,
+                    ls);
             if (!cuda_ok(cudaGetLastError(), "indexer topk tree merge launch")) return 0;
             cur = next;
             n_sets = next_sets;
@@ -8612,12 +8691,13 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                                  n_tokens,
                                                                  top_k,
                                                                  n_sets * top_k,
-                                                                 cur_stride);
+                                                                 cur_stride,
+                                                                 ls);
         return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
     }
     indexer_topk_kernel<<<n_tokens, 1, 0, ds4_current_stream()>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
-                                         n_comp, n_tokens, top_k);
+                                         n_comp, n_tokens, top_k, ls);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
 }
 

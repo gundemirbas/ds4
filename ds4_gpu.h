@@ -429,7 +429,17 @@ int ds4_gpu_indexer_topk_tensor(
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
-        uint32_t                top_k);
+        uint32_t                top_k,
+        /* PC5: max-grid + substrate params for captured-decode safety.
+         * When il_for_decode1 < DS4_LAYER_SCALARS_COUNT, the CUDA backend
+         * picks kernel specialization by n_comp_max (capture-stable) and
+         * the kernel reads the live count from g_layer_dev[il].n_index_comp
+         * at execute time -- closes the "live score producer, stale top-k
+         * consumer" capture bug.  Decode-body caller passes (g->layer_comp_cap[il],
+         * il); every other caller (prefill, decode2-exact, output-head
+         * vocab top-k, Metal stub) passes (0, UINT32_MAX) for legacy. */
+        uint32_t                n_comp_max,
+        uint32_t                il_for_decode1);
 
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,

@@ -9821,7 +9821,9 @@ static bool metal_graph_encode_decode_layer_impl(
                                                            g->indexer_scores,
                                                            g->layer_n_index_comp[il],
                                                            1,
-                                                           decode_top_k) != 0;
+                                                           decode_top_k,
+                                                           g->layer_comp_cap[il],  /* PC5: per-layer max stabilizes specialization */
+                                                           il                      /* PC5: substrate index for ls_override */) != 0;
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_topk",
                                                                     il,
@@ -14492,7 +14494,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        g->indexer_scores,
                                                        n_comp,
                                                        n_tokens,
-                                                       DS4_N_INDEXER_TOP_K) != 0;
+                                                       DS4_N_INDEXER_TOP_K,
+                                                       0u,           /* PC5: prefill/batch, legacy n_comp grid */
+                                                       UINT32_MAX    /* PC5: no substrate */) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("topk",
                                                                         il,
@@ -14625,7 +14629,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                    g->indexer_scores,
                                                    n_comp,
                                                    n_tokens,
-                                                   DS4_N_INDEXER_TOP_K) != 0;
+                                                   DS4_N_INDEXER_TOP_K,
+                                                   0u,           /* PC5: prefill/batch, legacy n_comp grid */
+                                                   UINT32_MAX    /* PC5: no substrate */) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("topk",
                                                                     il,
@@ -14746,7 +14752,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                        g->indexer_scores,
                                                        cur_index,
                                                        1,
-                                                       DS4_N_INDEXER_TOP_K) != 0 &&
+                                                       DS4_N_INDEXER_TOP_K,
+                                                       0u,           /* PC5: decode2-exact, legacy n_comp grid */
+                                                       UINT32_MAX    /* PC5: no substrate */) != 0 &&
                          ds4_gpu_dsv4_topk_mask_tensor(g->comp_mask,
                                                          g->comp_selected,
                                                          cur_index,
@@ -15260,7 +15268,9 @@ static bool metal_graph_eval_token_raw_swa_top(
                                            g->logits,
                                            DS4_N_VOCAB,
                                            1,
-                                           1) != 0;
+                                           1,
+                                           0u,           /* PC5: output-head vocab argmax, legacy */
+                                           UINT32_MAX    /* PC5: no substrate */) != 0;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
@@ -15375,7 +15385,9 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                            g->logits,
                                            DS4_N_VOCAB,
                                            1,
-                                           1) != 0;
+                                           1,
+                                           0u,           /* PC5: MTP output-head vocab argmax, legacy */
+                                           UINT32_MAX    /* PC5: no substrate */) != 0;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     g->cur_hc = saved_cur;
@@ -16221,7 +16233,9 @@ static bool metal_graph_verify_suffix_tops(
                                                g->spec_logits,
                                                DS4_N_VOCAB,
                                                1,
-                                               top_rows) != 0;
+                                               top_rows,
+                                               0u,           /* PC5: spec output-head vocab top-k, legacy */
+                                               UINT32_MAX    /* PC5: no substrate */) != 0;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -16812,7 +16826,9 @@ static bool metal_graph_verify_decode2_exact(
                                                    g->logits,
                                                    DS4_N_VOCAB,
                                                    1,
-                                                   1) != 0;
+                                                   1,
+                                                   0u,           /* PC5: cert output-head vocab argmax, legacy */
+                                                   UINT32_MAX    /* PC5: no substrate */) != 0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
         g->cur_hc = saved_cur;

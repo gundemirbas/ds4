@@ -4983,7 +4983,12 @@ int ds4_gpu_indexer_topk_tensor(
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
-        uint32_t                top_k) {
+        uint32_t                top_k,
+        /* PC5: max-grid + substrate params (CUDA-only; Metal stub ignores). */
+        uint32_t                n_comp_max,
+        uint32_t                il_for_decode1) {
+    (void)n_comp_max;
+    (void)il_for_decode1;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 || top_k > n_comp) return 0;
 
@@ -13071,7 +13076,8 @@ static int ds4_gpu_encode_router_select(
             score_tensor = (__bridge ds4_gpu_tensor *)selection_view;
         }
 
-        ok = ds4_gpu_indexer_topk_tensor(selected, score_tensor, 256, n_tokens, 6) != 0;
+        ok = ds4_gpu_indexer_topk_tensor(selected, score_tensor, 256, n_tokens, 6,
+                                         0u, UINT32_MAX) != 0;
     }
     if (!ok) return 0;
 
