@@ -9385,6 +9385,13 @@ static bool metal_graph_encode_decode_layer_impl(
         } \
     } while (0)
     ds4_cuda_layer_graph_debug_peek("dbg:enter-layer-body");
+    /* TEMPORARY DIAGNOSTIC: capture cur_hc going INTO this layer.  Slot
+     * 500+il, no-op when DS4_CUDA_LAYER_GRAPHS_HASH_DUMP is unset.  The
+     * hash kernel runs on ds4_current_stream() so it gets captured into
+     * the per-layer graph and re-dereferences cur_hc->ptr at replay
+     * time -- comparing BE vs BC at the same pos tells us whether the
+     * captured replay sees stale upstream data. */
+    ds4_cuda_dump_hash_at_slot(g->cur_hc, hc_dim, "decode_layer.cur_hc.in", 500u + il);
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_plain");
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
@@ -9673,6 +9680,13 @@ static bool metal_graph_encode_decode_layer_impl(
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+            /* TEMPORARY DIAGNOSTIC: probe attn_norm going INTO the indexer
+             * compressor matmul.  Slot 50+il.  attn_norm is computed earlier
+             * (in the attention path) and is the source of comp_kv_cur /
+             * comp_sc_cur via the matmul that follows. */
+            ds4_cuda_dump_hash_at_slot(g->attn_norm,
+                (uint64_t)DS4_N_EMBD,
+                "decode_layer.attn_norm.in_indexer", 50u + il);
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
                 !layer->indexer_compressor_ape || !layer->indexer_compressor_norm ||
                 layer->indexer_compressor_kv->type != DS4_TENSOR_F16 ||
@@ -9736,6 +9750,30 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_RMS_EPS,
                                                             il,                          /* PC2: per-layer substrate index for emit-row */
                                                             DS4_COMPRESSOR_ROW_INDEX     /* PC2: indexer compressor -> ls->index_row */) != 0;
+            /* TEMPORARY DIAGNOSTIC: state_kv AFTER compressor_update_tensor
+             * returns (post compressor_store_batch + post update_pool +
+             * shift).  Slot 230+il.  If this matches BE vs BC but the cache
+             * hash later doesn't, the emit-chain inside compressor_update_pool
+             * is suspect.  If state_kv ALREADY differs, the matmul or
+             * compressor_store_batch is the bug. */
+            ds4_cuda_dump_hash_at_slot(g->layer_index_state_kv[il],
+                (uint64_t)2u * (uint64_t)ratio * (uint64_t)2u * (uint64_t)DS4_N_INDEXER_HEAD_DIM,
+                "decode_layer.state_kv.after_update", 230u + il);
+            /* And the comp_cache state RIGHT AFTER compressor_update returns
+             * (before the qat row).  Slot 350+il.  If THIS matches BE vs BC
+             * but the post-qat cache (the existing slot 720+il probe inside
+             * indexer_scores_launch) doesn't, the qat kernel is the bug. */
+            ds4_cuda_dump_hash_at_slot(g->layer_index_comp_cache[il],
+                (uint64_t)(g->layer_n_index_comp[il] + (emit ? 1u : 0u)) * (uint64_t)DS4_N_INDEXER_HEAD_DIM,
+                "decode_layer.index_comp.after_update", 350u + il);
+            /* Fixed-size variant: hash the SAME 3000 rows × 128 floats every
+             * time, regardless of the live host-counter value.  Removes the
+             * "different N rows hashed in BC vs BE" probe artifact so the
+             * hash is comparable across capture/replay and across modes.
+             * Slot 0+il (free range). */
+            ds4_cuda_dump_hash_at_slot(g->layer_index_comp_cache[il],
+                (uint64_t)3000u * (uint64_t)DS4_N_INDEXER_HEAD_DIM,
+                "decode_layer.index_comp.after_update.fixed3000", 0u + il);
             if (ok && emit) {
                 /* Step 4c R1': index emit reads index_row from
                  * g_layer_dev[il].index_row in the per-layer substrate.
@@ -9745,6 +9783,12 @@ static bool metal_graph_encode_decode_layer_impl(
                         DS4_N_INDEXER_HEAD_DIM,
                         il) != 0;
             }
+            /* Fixed-size post-qat cache hash, slot 60+il.  Same 3000 rows.
+             * Comparing slot 0+il (post-update) vs 60+il (post-qat) tells
+             * us whether qat is the bug (60 differs while 0 matches). */
+            ds4_cuda_dump_hash_at_slot(g->layer_index_comp_cache[il],
+                (uint64_t)3000u * (uint64_t)DS4_N_INDEXER_HEAD_DIM,
+                "decode_layer.index_comp.after_qat.fixed3000", 60u + il);
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
             if (ok && g->layer_n_comp[il] > decode_top_k) {
@@ -9867,6 +9911,29 @@ static bool metal_graph_encode_decode_layer_impl(
             /* Step 4: in-decode-body caller passes the device-side scalars
              * pointer so the kernel reads n_raw/raw_start/n_comp from there
              * at execution time (capture-safe). */
+            /* TEMPORARY DIAGNOSTIC: probe all four direct inputs to
+             * attention_indexed_mixed_kernel at layer 2 (the first
+             * ratio=4-emit-yes captured graph where heads first diverges
+             * on replay #2).  Fixed n_elem so no baked-arg artifact:
+             *   slot 273: g->q                  (1 * 64 * 512 = 32768 floats)
+             *   slot 274: raw_cache             (128 * 512   = 65536 floats)
+             *   slot 275: attn_comp_cache       (3000 * 512  = 1.5M floats, slow but acceptable for one-shot)
+             *   slot 276: comp_selected         (512 int32_t hashed as 512 floats)
+             * First-divergent input localizes the upstream producer. */
+            if (il == 2u) {
+                ds4_cuda_dump_hash_at_slot(g->q,
+                    (uint64_t)1u * (uint64_t)DS4_N_HEAD * (uint64_t)DS4_N_HEAD_DIM,
+                    "decode_layer.attn_input.q.L2", 273u);
+                ds4_cuda_dump_hash_at_slot(raw_cache,
+                    (uint64_t)DS4_N_SWA * (uint64_t)DS4_N_HEAD_DIM,
+                    "decode_layer.attn_input.raw_cache.L2", 274u);
+                ds4_cuda_dump_hash_at_slot(comp_cache,
+                    (uint64_t)3000u * (uint64_t)DS4_N_HEAD_DIM,
+                    "decode_layer.attn_input.attn_comp_cache.L2", 275u);
+                ds4_cuda_dump_hash_at_slot(comp_selected,
+                    (uint64_t)n_selected,
+                    "decode_layer.attn_input.comp_selected.L2", 276u);
+            }
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     g->heads,
                     model->map,
@@ -9947,6 +10014,15 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
     }
+    /* TEMPORARY DIAGNOSTIC: g->heads after attention + inverse rope.
+     * q_dim is a compile-time constant (DS4_N_HEAD * DS4_N_HEAD_DIM) so
+     * the baked n_elem is identical in BE and BC -- no probe artifact.
+     * If this matches BE vs BC, attention_indexed_mixed_kernel produced
+     * identical heads and the CvE divergence is downstream of attention
+     * (the attn_out matmul, MoE, or later layers).  If it differs, the
+     * attention kernel itself is the suspect despite the 7c4b84d fix. */
+    ds4_cuda_dump_hash_at_slot(g->heads, q_dim,
+        "decode_layer.heads.after_rope_back", 180u + il);
     if (stop_at == METAL_GRAPH_DECODE_LAYER_BEFORE_ATTN_OUTPUT) return ok;
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
@@ -13027,6 +13103,26 @@ static bool metal_graph_encode_token_raw_swa(
     }
     ds4_gpu_decode_layer_scalars_flush();
 
+    /* TEMPORARY DIAGNOSTIC (captured-vs-eager substrate probe).
+     * When DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1 AND DS4_HASH_DUMP_POS matches
+     * the current pos, arm the auto-slot counter and (post-layer-loop) flush
+     * the dump.  Restricted to a single position so the flush's
+     * cudaDeviceSynchronize doesn't serialize every token and mask the
+     * captured-replay race (the failure mode this probe is hunting).  When
+     * the env var is unset every call is a no-op. */
+    int hash_dump_active = 0;
+    {
+        const char *hp = getenv("DS4_HASH_DUMP_POS");
+        if (hp && hp[0]) {
+            char *end = NULL;
+            unsigned long target = strtoul(hp, &end, 10);
+            if (end != hp && (uint32_t)target == pos) {
+                hash_dump_active = 1;
+                ds4_cuda_dump_hash_reset();
+            }
+        }
+    }
+
     bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                               model->map,
                                               model->size,
@@ -13170,6 +13266,12 @@ static bool metal_graph_encode_token_raw_swa(
 
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    }
+    /* TEMPORARY DIAGNOSTIC: flush the hash dump at the target position only.
+     * The flush issues a cudaDeviceSynchronize, so doing it every token would
+     * serialize GPU work and hide the captured-replay race we're hunting. */
+    if (hash_dump_active) {
+        ds4_cuda_dump_hash_flush(pos);
     }
     return ok;
 }

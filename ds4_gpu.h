@@ -328,6 +328,20 @@ uint32_t ds4_cuda_dump_probe_slot_consume(void);
 void     ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
                                         const char *label, uint32_t slot);
 
+/* TEMPORARY DIAGNOSTIC: captured-vs-eager substrate probe.  Launches a
+ * tiny single-thread kernel on ds4_current_stream() that reads
+ * g_layer_dev[il] (n_index_comp, n_comp) and writes the packed value into
+ * g_dump_hashes_dev[slot].  No-op when the hash-dump env gate is off.
+ * Used to detect a stale-substrate race in captured-graph replays. */
+void     ds4_cuda_probe_layer_substrate_at_slot(uint32_t il,
+                                                const char *label,
+                                                uint32_t slot);
+/* Same shape, but packs PRE-emit (comp_row << 32) | index_row instead of
+ * POST-emit (n_index_comp, n_comp).  Complementary diagnostic. */
+void     ds4_cuda_probe_layer_rows_at_slot(uint32_t il,
+                                           const char *label,
+                                           uint32_t slot);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

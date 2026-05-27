@@ -8353,6 +8353,26 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
     return cuda_ok(cudaGetLastError(), "embed tokens launch");
 }
 
+/* Forward decl for the captured-vs-eager substrate probe (definition near
+ * the hash-dump infra below). Lets indexer_scores_launch invoke it without
+ * pulling in ds4_gpu.h (this TU intentionally carries its own extern "C"
+ * signatures -- see comment block at ~line 8990). */
+extern "C" void ds4_cuda_probe_layer_substrate_at_slot(uint32_t il,
+                                                       const char *label,
+                                                       uint32_t slot);
+extern "C" void ds4_cuda_probe_layer_rows_at_slot(uint32_t il,
+                                                  const char *label,
+                                                  uint32_t slot);
+/* Forward decls for the per-input bisection (FNV-1a over each input buffer
+ * to indexer_score_one_direct_kernel, captured on the same stream so the
+ * replay reads what the science kernel will then read). */
+extern "C" void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
+                                           uint64_t n_elem,
+                                           const char *label,
+                                           uint32_t slot);
+extern "C" void ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
+                                               const char *label, uint32_t slot);
+
 static int indexer_scores_launch(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -8397,6 +8417,46 @@ static int indexer_scores_launch(
         const uint32_t grid_dim = pc5_active ? n_comp_max : n_comp;
         const struct ds4_layer_scalars *ls = pc5_active
             ? (g_layer_dev + il) : NULL;
+        /* TEMPORARY DIAGNOSTIC: probe-before to capture the substrate value
+         * (n_index_comp, n_comp) seen by the kernel at execute time.  Slot
+         * 900+il in g_dump_hashes_dev; no-op when DS4_CUDA_LAYER_GRAPHS_HASH_DUMP
+         * is unset.  Compare BE vs BC: if probe-before differs across the two
+         * runs, the captured replay is seeing a different substrate value than
+         * eager (stale-substrate race).
+         *
+         * Per-input bisection: FNV-1a each of the kernel's input buffers
+         * (q, weights, index_comp, scores-before) at the same point in the
+         * captured stream.  Verified 2026-05-26 that the substrate is
+         * bit-identical BE vs BC; if one of these input hashes differs,
+         * that upstream producer is the divergence source. */
+        if (il < DS4_LAYER_SCALARS_COUNT) {
+            ds4_cuda_probe_layer_substrate_at_slot(
+                il, "indexer_score_one_direct.subst.before", 900u + il);
+            /* Also dump the PRE-emit row indices (comp_row, index_row) packed
+             * as (comp_row << 32) | index_row.  If captured replays freeze
+             * these while substrate.n_index_comp advances, the emit kernel's
+             * row-index read is broken on replay. */
+            ds4_cuda_probe_layer_rows_at_slot(
+                il, "indexer_score_one_direct.rows.before", 840u + il);
+            /* q: n_tokens * n_head * head_dim floats (== 1*64*128 = 8192 for decode). */
+            ds4_cuda_dump_hash_at_slot(q,
+                (uint64_t)n_tokens * n_head * head_dim,
+                "indexer_score_one_direct.input.q", 600u + il);
+            /* weights: n_tokens * n_head floats (== 1*64 = 64 for decode). */
+            ds4_cuda_dump_hash_at_slot(weights,
+                (uint64_t)n_tokens * n_head,
+                "indexer_score_one_direct.input.weights", 660u + il);
+            /* index_comp: n_comp * head_dim floats (large; FNV-1a is fine). */
+            ds4_cuda_dump_hash_at_slot(index_comp,
+                (uint64_t)n_comp * head_dim,
+                "indexer_score_one_direct.input.index_comp", 720u + il);
+            /* scores BEFORE kernel: n_tokens * n_comp floats.  If the
+             * captured replay sees stale data in [n_actual, n_comp_max)
+             * that an eager run would overwrite, this catches it. */
+            ds4_cuda_dump_hash_at_slot(scores,
+                (uint64_t)n_tokens * n_comp,
+                "indexer_score_one_direct.output.scores_before", 780u + il);
+        }
         indexer_score_one_direct_kernel<<<grid_dim, 128, 0, ds4_current_stream()>>>(
                 (float *)scores->ptr,
                 (const float *)q->ptr,
@@ -8404,6 +8464,27 @@ static int indexer_scores_launch(
                 (const float *)index_comp->ptr,
                 n_comp, pos0, ratio,
                 scale, causal ? 1 : 0, ls);
+        /* TEMPORARY DIAGNOSTIC: scores AFTER the science kernel writes.
+         * Fixed-size 3000 floats (well past any realistic n_comp).  If this
+         * matches BE vs BC, the science kernel produced identical output and
+         * the CvE divergence is downstream of indexer_score_one_direct.  If
+         * it differs, the kernel itself or one of its inputs (index_comp,
+         * q, weights, substrate) is the bug. */
+        if (il < DS4_LAYER_SCALARS_COUNT) {
+            ds4_cuda_dump_hash_at_slot(scores,
+                3000u,
+                "indexer_score_one_direct.output.scores_after.fixed3000",
+                120u + il);
+        }
+        /* TEMPORARY DIAGNOSTIC: probe-after.  Equal to probe-before means the
+         * substrate is stable across the science kernel (no intra-graph
+         * mutation).  If probe-before==probe-after but they differ between BE
+         * and BC, the bug is NOT the substrate read; suspect cross-stream
+         * hazard on a different buffer or stale data inside scores/k/q. */
+        if (il < DS4_LAYER_SCALARS_COUNT) {
+            ds4_cuda_probe_layer_substrate_at_slot(
+                il, "indexer_score_one_direct.subst.after", 960u + il);
+        }
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
@@ -9388,6 +9469,65 @@ extern "C" void ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_float
     g_dump_labels[slot] = label;
     ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
             (const float *)buf, n_floats, slot);
+}
+
+/* TEMPORARY DIAGNOSTIC (captured-vs-eager substrate probe).
+ *
+ * Reads the per-layer ds4_layer_scalars substrate at execute time and writes
+ * a packed (n_index_comp << 32) | n_comp value into g_dump_hashes_dev[slot].
+ * Unlike the FNV-1a kernel this stores the substrate values verbatim -- the
+ * flush prints `%016lx`, so the high 8 hex digits decode directly to
+ * n_index_comp and the low 8 to n_comp. Launching on ds4_current_stream()
+ * means the read is captured into the per-layer graph and re-executes on
+ * replay, dereferencing whatever value g_layer_dev[il] holds at replay time.
+ * Compare BE (eager) vs BC (captured) to detect a stale-substrate race. */
+__global__ static void ds4_cuda_probe_layer_substrate_kernel(
+        const struct ds4_layer_scalars * __restrict__ ls, uint32_t slot) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    if (ls == NULL) {
+        g_dump_hashes_dev[slot] = 0xffffffffffffffffULL;
+        return;
+    }
+    uint64_t v = ((uint64_t)ls->n_index_comp << 32) | (uint64_t)ls->n_comp;
+    g_dump_hashes_dev[slot] = v;
+}
+
+/* Variant: probe the PRE-emit row indices (comp_row, index_row).  Same
+ * mechanism, different fields.  Used to verify whether captured-replay
+ * emit kernels see the live pre-emit row index at replay time. */
+__global__ static void ds4_cuda_probe_layer_rows_kernel(
+        const struct ds4_layer_scalars * __restrict__ ls, uint32_t slot) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    if (ls == NULL) {
+        g_dump_hashes_dev[slot] = 0xffffffffffffffffULL;
+        return;
+    }
+    uint64_t v = ((uint64_t)ls->comp_row << 32) | (uint64_t)ls->index_row;
+    g_dump_hashes_dev[slot] = v;
+}
+
+extern "C" void ds4_cuda_probe_layer_substrate_at_slot(
+        uint32_t il, const char *label, uint32_t slot) {
+    if (!ds4_cuda_dump_hash_enabled()) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    if (il >= DS4_LAYER_SCALARS_COUNT) return;
+    if (g_layer_dev == NULL) return;
+    g_dump_labels[slot] = label;
+    ds4_cuda_probe_layer_substrate_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            g_layer_dev + il, slot);
+}
+
+extern "C" void ds4_cuda_probe_layer_rows_at_slot(
+        uint32_t il, const char *label, uint32_t slot) {
+    if (!ds4_cuda_dump_hash_enabled()) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    if (il >= DS4_LAYER_SCALARS_COUNT) return;
+    if (g_layer_dev == NULL) return;
+    g_dump_labels[slot] = label;
+    ds4_cuda_probe_layer_rows_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            g_layer_dev + il, slot);
 }
 
 extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
