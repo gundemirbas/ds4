@@ -39,7 +39,8 @@ METAL_LDLIBS := $(LDLIBS)
 CUDA_EXTRA_BINS := ds4_weight_server
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression \
+        proof-cuda-smoke proof-cuda-long proof-cuda-opp-c
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval
@@ -71,6 +72,9 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o linenoise.o r
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
+
+proof-cuda-smoke proof-cuda-long proof-cuda-opp-c:
+	@echo "$@ requires a CUDA build"
 else
 all: help
 
@@ -117,6 +121,26 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o linenoise.o r
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
+
+# Proof-harness scenarios. Each is a thin wrapper around tests/ds4_proof.py
+# --scenario <name>. They expect DS4_PROOF_BASE (and, for MTP scenarios,
+# DS4_PROOF_MTP) in the environment; ds4 must already be built. The harness
+# materializes the (canonical x overlay) matrix, writes work_dir/expanded-plan.json,
+# runs every cell, and reports per-cell selected-token-id MD5s with vs-canonical-
+# counterpart parity contracts.
+DS4_PROOF_REQUIRE_BASE := @if [ -z "$$DS4_PROOF_BASE" ]; then echo "$@: set DS4_PROOF_BASE to a base model gguf path" >&2; exit 2; fi
+
+proof-cuda-smoke: ds4
+	$(DS4_PROOF_REQUIRE_BASE)
+	tests/ds4_proof.py --scenario cuda-capture-smoke --work-dir /tmp/ds4_proof/$@
+
+proof-cuda-long: ds4
+	$(DS4_PROOF_REQUIRE_BASE)
+	tests/ds4_proof.py --scenario cuda-long-context-full --work-dir /tmp/ds4_proof/$@
+
+proof-cuda-opp-c: ds4
+	$(DS4_PROOF_REQUIRE_BASE)
+	tests/ds4_proof.py --scenario cuda-opp-c-full --work-dir /tmp/ds4_proof/$@
 endif
 
 ds4.o: ds4.c ds4.h ds4_gpu.h

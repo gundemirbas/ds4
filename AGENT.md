@@ -57,6 +57,20 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   reference docs are force-added (`cuda-env-vars.md`, `cuda-mtp/`,
   `proof-harness/`, `ANTHROPIC_LIVE_CONTINUATION.md`, `RESPONSE_API.md`).
 
+## CUDA captured-decode rules
+
+- Captured decode kernels that consume `pos0`, `n_comp`, `n_index_comp`,
+  `raw_start` / `raw_row`, `n_raw`, selected-row counts, or scratch pointers
+  MUST read live substrate state (`g_decode_dev` / `g_layer_dev[il]`) or be
+  keyed by regime into the graph cache. By-value kernel arguments are baked at
+  graph queue time and replay stale. Reference: 7c4b84d, a1cff19, 8fb3c54.
+- Long-context captured-vs-eager parity (essay prompt, n=1024, FP32, every
+  enabled overlay) is a release gate, not a smoke test. See `make proof-cuda-long`.
+- Optimization commits land with a correctness proof AND a speed proof. The
+  proof harness records both: `tests/ds4_proof.py --scenario ...`. Skipping the
+  correctness proof on the grounds that "we already had it before" is how the
+  pos0 regression slipped past three previous commits.
+
 ## Testing
 
 Use `make` for build validation. Use `make test` for unit/regression tests when a
