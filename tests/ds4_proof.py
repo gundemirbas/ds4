@@ -146,12 +146,239 @@ class EngineProfile:
     use_mtp: bool = False
     mtp_draft: int = 2
     baseline: bool = False
+    # Composition trail (set by compose_profile, optional for legacy plan-file
+    # profiles). canonical + overlay_stack are what scenario contract policies
+    # key on -- e.g. vs-canonical-counterpart pairs cells that differ only in
+    # canonical while sharing the same overlay stack.
+    canonical: str = ""
+    overlay_stack: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CanonicalProfile:
+    """A canonical execution skeleton: backend, baseline env, defaults.
+
+    Canonicals describe the run shape (eager vs capture, backend choice). They
+    do NOT carry feature-flag env bundles -- those are overlays. Overlay stacks
+    compose with a canonical to yield a concrete EngineProfile.
+    """
+    name: str
+    backend: str = "cuda"
+    env: dict[str, str] = field(default_factory=dict)
+    args: list[str] = field(default_factory=list)
+    use_mtp: bool = False
+    mtp_draft: int = 2
+
+
+@dataclass(frozen=True)
+class Overlay:
+    """An env/argument overlay applied on top of a canonical profile.
+
+    Overlays compose by ordered application: later overlays override earlier
+    ones for env keys. `requires` names overlays that MUST appear earlier in
+    the stack; `conflicts` names overlays that MUST NOT appear in the stack at
+    all. `use_mtp` / `mtp_draft` are None to inherit, otherwise they set the
+    value for the composed profile.
+    """
+    name: str
+    env: dict[str, str] = field(default_factory=dict)
+    args: list[str] = field(default_factory=list)
+    use_mtp: bool | None = None
+    mtp_draft: int | None = None
+    requires: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+
+
+CANONICAL_PROFILES: dict[str, CanonicalProfile] = {
+    "cuda-default": CanonicalProfile("cuda-default"),
+    "cuda-eager":   CanonicalProfile("cuda-eager",   env={"DS4_CUDA_LAYER_GRAPHS": "0"}),
+    "cuda-capture": CanonicalProfile("cuda-capture", env={"DS4_CUDA_LAYER_GRAPHS": "1"}),
+}
+
+
+# Overlay registry.
+#
+# Two structural classes here:
+#
+#   1. MTP base bundles (mtp-off, mtp-fast, mtp-no-opt-output, mtp-no-verify-top2).
+#      These are atomic env sets -- you pick exactly one. They pairwise conflict
+#      because each represents a different combination of MTP fast-path env
+#      vars that cannot be modeled additively (the "no-*" variants omit env
+#      keys that mtp-fast sets, which isn't expressible as an env add).
+#
+#   2. Composable feature overlays. These add env on top of an existing base.
+#      Most MTP diagnostics require mtp-fast. fp8-kv-predecode requires fp8-kv.
+#      The composition is straightforward dict-merge.
+#
+# Adding a new overlay: pick the class, declare requires/conflicts, and (if
+# it's a new base bundle) extend the pairwise-conflict list of every existing
+# base bundle. Scenario authors then reference the overlay name in their stack.
+_MTP_BASE_CONFLICTS = ("mtp-off", "mtp-fast", "mtp-no-opt-output", "mtp-no-verify-top2")
+
+
+def _mtp_base_conflicts_for(name: str) -> tuple[str, ...]:
+    return tuple(n for n in _MTP_BASE_CONFLICTS if n != name)
+
+
+OVERLAYS: dict[str, Overlay] = {
+    "mtp-off": Overlay(
+        "mtp-off",
+        use_mtp=False,
+        conflicts=_mtp_base_conflicts_for("mtp-off"),
+    ),
+    "mtp-fast": Overlay(
+        "mtp-fast",
+        env=dict(FAST_MTP_ENV),
+        use_mtp=True,
+        conflicts=_mtp_base_conflicts_for("mtp-fast"),
+    ),
+    "mtp-no-opt-output": Overlay(
+        "mtp-no-opt-output",
+        env={"DS4_CUDA_MTP_TOP2": "1", "DS4_CUDA_MTP_VERIFY_TOP2": "1"},
+        use_mtp=True,
+        conflicts=_mtp_base_conflicts_for("mtp-no-opt-output"),
+    ),
+    "mtp-no-verify-top2": Overlay(
+        "mtp-no-verify-top2",
+        env={"DS4_CUDA_MTP_TOP2": "1"},
+        use_mtp=True,
+        conflicts=_mtp_base_conflicts_for("mtp-no-verify-top2"),
+    ),
+    "mtp-shadow-b": Overlay(
+        "mtp-shadow-b",
+        env={"DS4_CUDA_MTP_SHADOW_B_N2_Q8": "1", "DS4_MTP_TIMING": "1"},
+        requires=("mtp-fast",),
+    ),
+    "mtp-verify-v2-shadow": Overlay(
+        "mtp-verify-v2-shadow",
+        env={"DS4_MTP_VERIFY_V2_SHADOW": "1", "DS4_MTP_TIMING": "1"},
+        mtp_draft=3,
+        requires=("mtp-fast",),
+        conflicts=("mtp-verify-v2-active",),
+    ),
+    "mtp-verify-v2-active": Overlay(
+        "mtp-verify-v2-active",
+        env={"DS4_MTP_VERIFY_V2": "1", "DS4_MTP_TIMING": "1"},
+        mtp_draft=3,
+        requires=("mtp-fast",),
+        conflicts=("mtp-verify-v2-shadow",),
+    ),
+    "mtp-batch-first": Overlay(
+        "mtp-batch-first",
+        env={"DS4_MTP_BATCH_FIRST": "1", "DS4_MTP_TIMING": "1"},
+        mtp_draft=3,
+        requires=("mtp-fast",),
+    ),
+    "mtp-opt-output": Overlay(
+        "mtp-opt-output",
+        env={"DS4_CUDA_MTP_VERIFY_OPT_OUTPUT": "1"},
+        requires=("mtp-fast",),
+    ),
+    "mtp-rollback-structural": Overlay(
+        "mtp-rollback-structural",
+        env={
+            "DS4_CUDA_NO_BATCH_Q8_PAIR": "1",
+            "DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6_N2": "1",
+            "DS4_CUDA_NO_DECODE_Q8_PAIR": "1",
+        },
+        requires=("mtp-fast",),
+    ),
+    "mtp-exact-replay": Overlay(
+        "mtp-exact-replay",
+        env={"DS4_MTP_EXACT_REPLAY": "1"},
+        requires=("mtp-fast",),
+    ),
+    "mtp-strict": Overlay(
+        "mtp-strict",
+        env={"DS4_MTP_STRICT": "1"},
+        requires=("mtp-fast",),
+    ),
+    "fp8-kv": Overlay(
+        "fp8-kv",
+        env={"DS4_CUDA_FP8_KV": "1"},
+    ),
+    "fp8-kv-predecode": Overlay(
+        "fp8-kv-predecode",
+        env={"DS4_CUDA_FP8_KV_PREDECODE": "1"},
+        requires=("fp8-kv",),
+    ),
+}
+
+
+def compose_profile(
+    canonical: str,
+    overlay_stack: list[str] | tuple[str, ...] = (),
+    *,
+    baseline: bool = False,
+) -> EngineProfile:
+    """Build an EngineProfile from a canonical + ordered overlay stack.
+
+    Profile name is "{canonical}+{overlay}+..." with canonical=="cuda-default"
+    elided to keep the short overlay names like "mtp-fast" stable across the
+    common CUDA case. Validates requires/conflicts and raises with a precise
+    diagnostic if the stack is invalid.
+    """
+    if canonical not in CANONICAL_PROFILES:
+        raise KeyError(f"unknown canonical profile {canonical!r}")
+    base = CANONICAL_PROFILES[canonical]
+    env = dict(base.env)
+    args = list(base.args)
+    use_mtp = base.use_mtp
+    mtp_draft = base.mtp_draft
+
+    stack = tuple(overlay_stack)
+    seen: set[str] = set()
+    for ov_name in stack:
+        if ov_name not in OVERLAYS:
+            raise KeyError(f"unknown overlay {ov_name!r}")
+        ov = OVERLAYS[ov_name]
+        for req in ov.requires:
+            if req not in seen:
+                raise ValueError(
+                    f"overlay {ov_name!r} requires {req!r} earlier in the stack "
+                    f"(stack={list(stack)!r})"
+                )
+        for conf in ov.conflicts:
+            if conf in seen:
+                raise ValueError(
+                    f"overlay {ov_name!r} conflicts with {conf!r} "
+                    f"(stack={list(stack)!r})"
+                )
+        env.update(ov.env)
+        args.extend(ov.args)
+        if ov.use_mtp is not None:
+            use_mtp = ov.use_mtp
+        if ov.mtp_draft is not None:
+            mtp_draft = ov.mtp_draft
+        seen.add(ov_name)
+
+    name_parts: list[str] = []
+    if canonical != "cuda-default":
+        name_parts.append(canonical)
+    name_parts.extend(stack)
+    name = "+".join(name_parts) if name_parts else canonical
+
+    return EngineProfile(
+        name=name,
+        env=env,
+        args=args,
+        backend=base.backend,
+        use_mtp=use_mtp,
+        mtp_draft=mtp_draft,
+        baseline=baseline,
+        canonical=canonical,
+        overlay_stack=stack,
+    )
 
 
 @dataclass(frozen=True)
 class PromptCase:
     id: str
     prompt: str
+    # When set, the prompt body was loaded from this path. The harness passes
+    # --prompt-file directly to ds4 in that case, avoiding ARG_MAX on long-
+    # context fixtures (the OS rejects inline -p above ~128 KiB on Linux).
+    source_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -176,6 +403,13 @@ class RunResult:
     wall_ms: float = 0.0
     timing: dict[str, Any] = field(default_factory=dict)
     shadow: dict[str, Any] = field(default_factory=dict)
+    # Populated when --dump-logprobs PATH was passed (i.e. when a scenario or
+    # contract needs the per-token decoded id sequence). selected_token_ids_md5
+    # is the MD5 of "<id>,<id>,...,<id>," -- the same digest the determinism
+    # probe shell script computes, kept byte-for-byte compatible.
+    logprobs_path: str = ""
+    selected_token_ids_md5: str | None = None
+    gen_token_count: int = 0
 
 
 @dataclass
@@ -457,6 +691,31 @@ def sha256_file(path: Path) -> tuple[str, int]:
             h.update(chunk)
             total += len(chunk)
     return h.hexdigest(), total
+
+
+# Regex shared with tests/cuda_layer_graph_determinism_probe.sh. Keeping the
+# extraction identical means the proof harness and the standalone shell probe
+# produce the same MD5 over the same logprobs dump, so a digest from either
+# tool can be cross-checked against the other.
+SELECTED_TOKEN_ID_RE = re.compile(r'"selected":\{"id":(-?\d+)')
+
+
+def selected_token_ids_md5(path: Path) -> tuple[str | None, int]:
+    """Return (md5, count) for the selected token-id sequence in a logprobs dump.
+
+    The digest is computed over "<id>,<id>,...,<id>," (trailing comma) to match
+    the shell probe byte-for-byte. Returns (None, 0) if the dump file is empty
+    or absent -- caller decides whether that's a failure.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, 0
+    ids = SELECTED_TOKEN_ID_RE.findall(text)
+    if not ids:
+        return None, 0
+    content = "".join(f"{i}," for i in ids)
+    return hashlib.md5(content.encode("utf-8")).hexdigest(), len(ids)
 
 
 def parse_accept_traces(log_text: str) -> list[dict[str, Any]]:
@@ -994,103 +1253,199 @@ def contract_from_json(raw: dict[str, Any]) -> Contract:
     )
 
 
+@dataclass(frozen=True)
+class Scenario:
+    """A named macro for a multi-cell proof matrix.
+
+    The materialized matrix is the cross-product canonicals X overlay_stacks.
+    Each (canonical, overlay_stack) pair becomes one EngineProfile cell.
+
+    Contracts are generated with vs-canonical-counterpart pairing: for each
+    overlay_stack column X and each contract kind k, pair every non-baseline
+    canonical against canonicals[0] at the same X. That isolates "capture vs
+    eager" (or any other canonical-axis change) as the regression class,
+    keeping overlay-axis differences out of the comparison.
+
+    expected_gen_tokens_min flags EOS-truncation regressions: if a cell
+    produces fewer than this many decoded tokens, the harness fails it even if
+    the digest matches another short run. (A scenario that wants exactly
+    `tokens`, set this to roughly `0.95 * tokens` to allow tiny variance.)
+    """
+    name: str
+    canonicals: tuple[str, ...]
+    overlay_stacks: tuple[tuple[str, ...], ...]
+    prompts: tuple[str, ...]
+    budget: str
+    contracts: tuple[str, ...] = ("selected_token_ids_md5",)
+    expected_gen_tokens_min: int = 0
+    description: str = ""
+
+
+SCENARIOS: dict[str, Scenario] = {
+    "cuda-capture-smoke": Scenario(
+        name="cuda-capture-smoke",
+        canonicals=("cuda-eager", "cuda-capture"),
+        overlay_stacks=((),),
+        prompts=("builtin:1",),
+        budget="smoke",
+        contracts=("selected_token_ids_md5",),
+        expected_gen_tokens_min=60,
+        description="Fast capture-vs-eager parity check, no overlays. ~30 s on PRO 6000.",
+    ),
+    "cuda-long-context-full": Scenario(
+        name="cuda-long-context-full",
+        canonicals=("cuda-eager", "cuda-capture"),
+        overlay_stacks=(
+            (),
+            ("fp8-kv",),
+            ("fp8-kv", "fp8-kv-predecode"),
+        ),
+        prompts=("@tests/long_context_essay_prompt.txt",),
+        budget="default-on",
+        contracts=("selected_token_ids_md5",),
+        # default-on budget is n=1024; require >=1000 to catch unexpected EOS.
+        expected_gen_tokens_min=1000,
+        description=(
+            "Long-context (essay prompt, ~10k input tokens, n=1024 decode) "
+            "capture-vs-eager parity across the FP8 KV mirror progression. "
+            "This is the regression backstop for the pos0 substrate-fix class "
+            "of bugs (8fb3c54, a1cff19)."
+        ),
+    ),
+    "cuda-opp-c-full": Scenario(
+        name="cuda-opp-c-full",
+        canonicals=("cuda-default",),
+        overlay_stacks=(
+            (),
+            ("fp8-kv",),
+            ("fp8-kv", "fp8-kv-predecode"),
+        ),
+        prompts=("builtin:0", "builtin:1", "@tests/long_context_story_prompt.txt"),
+        budget="candidate",
+        # cuda-default is the only canonical, so vs-canonical-counterpart
+        # generates zero contracts. The selected_token_ids_md5 contract here is
+        # used in --check-expected mode against tests/proof/expected/ snapshots.
+        contracts=("selected_token_ids_md5",),
+        expected_gen_tokens_min=480,
+        description=(
+            "Opp C FP8 KV mirror progression sweep across baseline / read path / "
+            "predecode at candidate budget (n=512). Snapshot-anchored: changes "
+            "to expected token-id MD5s indicate semantic drift, not just perf."
+        ),
+    ),
+}
+
+
+def resolve_prompt_ref(ref: str, *, ds4_root: Path) -> PromptCase:
+    """Resolve a scenario prompt reference into a PromptCase.
+
+    Accepted forms:
+      - "@PATH"      file path, relative to ds4_root if not absolute. The
+                     source_path is preserved so run_profile passes
+                     --prompt-file to ds4 (ARG_MAX safe for ~10k token prompts).
+      - "builtin:N"  index into DEFAULT_PROOF_PROMPTS. id="builtin-{N}".
+    """
+    if ref.startswith("@"):
+        rel = ref[1:]
+        path = Path(rel)
+        if not path.is_absolute():
+            path = ds4_root / rel
+        body = path.read_text(encoding="utf-8")
+        return PromptCase(id=path.stem or "prompt", prompt=body, source_path=str(path))
+    if ref.startswith("builtin:"):
+        idx = int(ref.split(":", 1)[1])
+        if idx < 0 or idx >= len(DEFAULT_PROOF_PROMPTS):
+            raise ValueError(f"builtin prompt index {idx} out of range")
+        return PromptCase(id=f"builtin-{idx}", prompt=DEFAULT_PROOF_PROMPTS[idx])
+    raise ValueError(f"unknown prompt ref {ref!r} (expected '@PATH' or 'builtin:N')")
+
+
+def materialize_scenario(
+    scenario: Scenario,
+    *,
+    ds4_root: Path,
+) -> tuple[list[EngineProfile], list[PromptCase], list[Contract]]:
+    """Expand a Scenario into concrete (profiles, prompts, contracts).
+
+    Contract policy: vs-canonical-counterpart. canonicals[0] is the baseline
+    canonical. For each overlay_stack X and each contract kind k, pair every
+    canonical c (c != canonicals[0]) at X against canonicals[0] at X.
+
+    A single-canonical scenario (e.g. cuda-opp-c-full) produces zero contracts
+    here. Use --check-expected to anchor those cells against a snapshot.
+    """
+    if not scenario.canonicals:
+        raise ValueError(f"scenario {scenario.name!r} has no canonicals")
+    if not scenario.overlay_stacks:
+        raise ValueError(f"scenario {scenario.name!r} has no overlay_stacks")
+
+    profiles: list[EngineProfile] = []
+    profile_by_axis: dict[tuple[str, tuple[str, ...]], EngineProfile] = {}
+    baseline_canonical = scenario.canonicals[0]
+    for canon in scenario.canonicals:
+        for stack in scenario.overlay_stacks:
+            is_baseline = canon == baseline_canonical and not profiles
+            profile = compose_profile(canon, list(stack), baseline=is_baseline)
+            profiles.append(profile)
+            profile_by_axis[(canon, stack)] = profile
+
+    prompts = [resolve_prompt_ref(ref, ds4_root=ds4_root) for ref in scenario.prompts]
+
+    contracts: list[Contract] = []
+    for stack in scenario.overlay_stacks:
+        base_profile = profile_by_axis[(baseline_canonical, stack)]
+        for canon in scenario.canonicals[1:]:
+            cand_profile = profile_by_axis[(canon, stack)]
+            stack_tag = "+".join(stack) if stack else "no-overlays"
+            for kind in scenario.contracts:
+                contracts.append(Contract(
+                    name=f"{base_profile.name}_vs_{cand_profile.name}@{stack_tag}/{kind}",
+                    baseline=base_profile.name,
+                    candidate=cand_profile.name,
+                    kind=kind,
+                ))
+    return profiles, prompts, contracts
+
+
+# The default MTP suite is the historical 12-cell matrix expressed as
+# (canonical, overlay-stack) tuples against the overlay registry. The first
+# entry is the baseline (cuda-default with no overlays). Renames vs. the
+# previous flat names:
+#   nomtp                   -> cuda-default
+#   mtp-fast-shadow-b       -> mtp-fast+mtp-shadow-b
+#   mtp-v2-shadow           -> mtp-fast+mtp-verify-v2-shadow
+#   mtp-v2-active           -> mtp-fast+mtp-verify-v2-active
+#   mtp-batch-first         -> mtp-fast+mtp-batch-first
+#   mtp-opt-output          -> mtp-fast+mtp-opt-output
+#   mtp-rollback-structural -> mtp-fast+mtp-rollback-structural
+#   mtp-exact-replay        -> mtp-fast+mtp-exact-replay
+#   mtp-strict              -> mtp-fast+mtp-strict
+# (mtp-fast, mtp-no-opt-output, mtp-no-verify-top2 keep their names.)
+DEFAULT_MTP_OVERLAY_STACKS: list[tuple[list[str], bool]] = [
+    ([], True),                                   # cuda-default (baseline)
+    (["mtp-fast"], False),
+    (["mtp-fast", "mtp-shadow-b"], False),
+    (["mtp-fast", "mtp-verify-v2-shadow"], False),
+    (["mtp-fast", "mtp-verify-v2-active"], False),
+    (["mtp-fast", "mtp-batch-first"], False),
+    (["mtp-no-opt-output"], False),
+    (["mtp-fast", "mtp-opt-output"], False),
+    (["mtp-no-verify-top2"], False),
+    (["mtp-fast", "mtp-rollback-structural"], False),
+    (["mtp-fast", "mtp-exact-replay"], False),
+    (["mtp-fast", "mtp-strict"], False),
+]
+
+
 def default_mtp_profiles() -> list[EngineProfile]:
     return [
-        EngineProfile("nomtp", {}, use_mtp=False, baseline=True),
-        EngineProfile("mtp-fast", dict(FAST_MTP_ENV), use_mtp=True),
-        EngineProfile(
-            "mtp-fast-shadow-b",
-            {
-                **FAST_MTP_ENV,
-                "DS4_CUDA_MTP_SHADOW_B_N2_Q8": "1",
-                "DS4_MTP_TIMING": "1",
-            },
-            use_mtp=True,
-        ),
-        EngineProfile(
-            "mtp-v2-shadow",
-            {
-                **FAST_MTP_ENV,
-                "DS4_MTP_VERIFY_V2_SHADOW": "1",
-                "DS4_MTP_TIMING": "1",
-            },
-            use_mtp=True,
-            mtp_draft=3,
-        ),
-        EngineProfile(
-            "mtp-v2-active",
-            {
-                **FAST_MTP_ENV,
-                "DS4_MTP_VERIFY_V2": "1",
-                "DS4_MTP_TIMING": "1",
-            },
-            use_mtp=True,
-            mtp_draft=3,
-        ),
-        EngineProfile(
-            "mtp-batch-first",
-            {
-                **FAST_MTP_ENV,
-                "DS4_MTP_BATCH_FIRST": "1",
-                "DS4_MTP_TIMING": "1",
-            },
-            use_mtp=True,
-            mtp_draft=3,
-        ),
-        EngineProfile(
-            "mtp-no-opt-output",
-            {
-                "DS4_CUDA_MTP_TOP2": "1",
-                "DS4_CUDA_MTP_VERIFY_TOP2": "1",
-            },
-            use_mtp=True,
-        ),
-        EngineProfile(
-            "mtp-opt-output",
-            {
-                **FAST_MTP_ENV,
-                "DS4_CUDA_MTP_VERIFY_OPT_OUTPUT": "1",
-            },
-            use_mtp=True,
-        ),
-        EngineProfile(
-            "mtp-no-verify-top2",
-            {
-                "DS4_CUDA_MTP_TOP2": "1",
-            },
-            use_mtp=True,
-        ),
-        EngineProfile(
-            "mtp-rollback-structural",
-            {
-                **FAST_MTP_ENV,
-                "DS4_CUDA_NO_BATCH_Q8_PAIR": "1",
-                "DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6_N2": "1",
-                "DS4_CUDA_NO_DECODE_Q8_PAIR": "1",
-            },
-            use_mtp=True,
-        ),
-        EngineProfile(
-            "mtp-exact-replay",
-            {
-                **FAST_MTP_ENV,
-                "DS4_MTP_EXACT_REPLAY": "1",
-            },
-            use_mtp=True,
-        ),
-        EngineProfile(
-            "mtp-strict",
-            {
-                **FAST_MTP_ENV,
-                "DS4_MTP_STRICT": "1",
-            },
-            use_mtp=True,
-        ),
+        compose_profile("cuda-default", stack, baseline=baseline)
+        for stack, baseline in DEFAULT_MTP_OVERLAY_STACKS
     ]
 
 
 def default_engine_profiles() -> list[EngineProfile]:
-    return [EngineProfile("baseline", {}, use_mtp=False, baseline=True)]
+    return [compose_profile("cuda-default", [], baseline=True)]
 
 
 def default_contracts(profiles: list[EngineProfile], suite: str) -> list[Contract]:
@@ -1128,10 +1483,12 @@ def build_command(
     base_model: str,
     mtp_model: str | None,
     profile: EngineProfile,
-    prompt: str,
+    prompt: str | None,
+    prompt_file: Path | None,
     tokens: int,
     temperature: float,
     nothink: bool,
+    dump_logprobs_path: Path | None = None,
 ) -> list[str]:
     cmd = [
         bin_path,
@@ -1150,7 +1507,20 @@ def build_command(
             raise ValueError(f"profile {profile.name} requires an MTP model")
         cmd[4:4] = ["--mtp", mtp_model, "--mtp-draft", str(profile.mtp_draft)]
     cmd.extend(profile.args)
-    cmd.extend(["-p", prompt])
+    # --dump-logprobs is appended before the prompt so the latter is the last
+    # positional surface area; --logprobs-top-k 1 keeps the file lean since the
+    # MD5 contract only needs the selected id.
+    if dump_logprobs_path is not None:
+        cmd.extend(["--dump-logprobs", str(dump_logprobs_path), "--logprobs-top-k", "1"])
+    # Long-context fixtures exceed ARG_MAX on Linux when passed via -p, so
+    # callers should pass --prompt-file for them. Inline -p stays the default
+    # for short builtin prompts.
+    if prompt_file is not None:
+        cmd.extend(["--prompt-file", str(prompt_file)])
+    elif prompt is not None:
+        cmd.extend(["-p", prompt])
+    else:
+        raise ValueError("build_command requires prompt or prompt_file")
     return cmd
 
 
@@ -1168,20 +1538,25 @@ def run_profile(
     work_dir: Path,
     weight_ipc_manifest: str | None,
     weight_ipc_scope: str,
+    dump_token_ids: bool = False,
 ) -> RunResult:
     safe_prompt = re.sub(r"[^A-Za-z0-9_.-]+", "_", prompt_case.id)
     safe_profile = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile.name)
     out_path = work_dir / f"{safe_prompt}_{safe_profile}.out"
     log_path = work_dir / f"{safe_prompt}_{safe_profile}.log"
+    logprobs_path = work_dir / f"{safe_prompt}_{safe_profile}.logprobs.json" if dump_token_ids else None
+    prompt_file = Path(prompt_case.source_path) if prompt_case.source_path else None
     cmd = build_command(
         bin_path=bin_path,
         base_model=base_model,
         mtp_model=mtp_model,
         profile=profile,
-        prompt=prompt_case.prompt,
+        prompt=None if prompt_file is not None else prompt_case.prompt,
+        prompt_file=prompt_file,
         tokens=tokens,
         temperature=temperature,
         nothink=nothink,
+        dump_logprobs_path=logprobs_path,
     )
     env = os.environ.copy()
     env.update(profile.env)
@@ -1207,6 +1582,11 @@ def run_profile(
     if log_path.exists():
         result.shadow = parse_shadow(log_path.read_text(errors="replace"))
     result.timing = profile_timing_summary(wall_ms=result.wall_ms, shadow=result.shadow)
+    if logprobs_path is not None:
+        result.logprobs_path = str(logprobs_path)
+        md5, count = selected_token_ids_md5(logprobs_path)
+        result.selected_token_ids_md5 = md5
+        result.gen_token_count = count
     return result
 
 
@@ -1242,6 +1622,60 @@ def compare_exact_bytes(
     )
 
 
+def compare_selected_token_ids_md5(
+    contract: Contract,
+    prompt_id: str,
+    baseline: RunResult,
+    candidate: RunResult,
+) -> ComparisonResult:
+    """Selected-token-id parity. The decode-level analogue of exact_bytes that
+    survives floating-point reduction-order noise: as long as the argmax tokens
+    agree, the contract passes even if logprob floats drift in the last bit."""
+    if baseline.rc != 0 or candidate.rc != 0:
+        return ComparisonResult(
+            prompt_id=prompt_id,
+            contract=contract.name,
+            baseline=contract.baseline,
+            candidate=contract.candidate,
+            kind=contract.kind,
+            passed=False,
+            reason=f"nonzero rc baseline={baseline.rc} candidate={candidate.rc}",
+        )
+    b_md5 = baseline.selected_token_ids_md5
+    c_md5 = candidate.selected_token_ids_md5
+    if b_md5 is None or c_md5 is None:
+        return ComparisonResult(
+            prompt_id=prompt_id,
+            contract=contract.name,
+            baseline=contract.baseline,
+            candidate=contract.candidate,
+            kind=contract.kind,
+            passed=False,
+            reason=(
+                f"missing logprobs dump baseline_md5={b_md5!r} candidate_md5={c_md5!r} "
+                f"(harness must request --dump-logprobs for this contract)"
+            ),
+        )
+    passed = b_md5 == c_md5
+    reason = ""
+    if not passed:
+        reason = (
+            f"baseline_md5={b_md5} ({baseline.gen_token_count} tokens) != "
+            f"candidate_md5={c_md5} ({candidate.gen_token_count} tokens)"
+        )
+    return ComparisonResult(
+        prompt_id=prompt_id,
+        contract=contract.name,
+        baseline=contract.baseline,
+        candidate=contract.candidate,
+        kind=contract.kind,
+        passed=passed,
+        reason=reason,
+        baseline_snippet=b_md5,
+        candidate_snippet=c_md5,
+    )
+
+
 def evaluate_contract(
     contract: Contract,
     prompt_id: str,
@@ -1259,17 +1693,19 @@ def evaluate_contract(
             passed=False,
             reason="missing profile result",
         )
-    if contract.kind != "exact_bytes":
-        return ComparisonResult(
-            prompt_id=prompt_id,
-            contract=contract.name,
-            baseline=contract.baseline,
-            candidate=contract.candidate,
-            kind=contract.kind,
-            passed=False,
-            reason=f"unsupported contract kind: {contract.kind}",
-        )
-    return compare_exact_bytes(contract, prompt_id, baseline, candidate)
+    if contract.kind == "exact_bytes":
+        return compare_exact_bytes(contract, prompt_id, baseline, candidate)
+    if contract.kind == "selected_token_ids_md5":
+        return compare_selected_token_ids_md5(contract, prompt_id, baseline, candidate)
+    return ComparisonResult(
+        prompt_id=prompt_id,
+        contract=contract.name,
+        baseline=contract.baseline,
+        candidate=contract.candidate,
+        kind=contract.kind,
+        passed=False,
+        reason=f"unsupported contract kind: {contract.kind}",
+    )
 
 
 def dataclass_dict(obj: Any) -> Any:
@@ -1479,6 +1915,125 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
     }
 
 
+def prompt_body_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_expanded_plan(
+    *,
+    scenario_name: str,
+    suite: str,
+    tokens: int,
+    budget: str,
+    profiles: list[EngineProfile],
+    prompts: list[PromptCase],
+    contracts: list[Contract],
+    expected_gen_tokens_min: int,
+    bin_path: str,
+    base_model: str,
+    mtp_model: str | None,
+    temperature: float,
+    nothink: bool,
+) -> dict[str, Any]:
+    """The deterministic input record: every cell with its full env, prompt
+    SHA256, budget, contracts. Same fields across scenarios so two runs of the
+    same scenario at the same commit produce byte-identical plans."""
+    prompt_records = []
+    for p in prompts:
+        prompt_records.append({
+            "id": p.id,
+            "source_path": p.source_path,
+            "body_sha256": prompt_body_sha256(p.prompt),
+            "body_bytes": len(p.prompt.encode("utf-8")),
+        })
+    return {
+        "schema": "ds4-proof-expanded-plan-v1",
+        "scenario": scenario_name,
+        "suite": suite,
+        "budget": budget,
+        "tokens": tokens,
+        "temperature": temperature,
+        "nothink": nothink,
+        "bin_path": bin_path,
+        "base_model": base_model,
+        "mtp_model": mtp_model or "",
+        "expected_gen_tokens_min": expected_gen_tokens_min,
+        "profiles": [dataclass_dict(p) for p in profiles],
+        "prompts": prompt_records,
+        "contracts": [dataclass_dict(c) for c in contracts],
+    }
+
+
+def expanded_plan_sha256(plan: dict[str, Any]) -> str:
+    """Stable SHA256 over the expanded plan. Snapshot files store this so a
+    plan-input drift between snapshot and run is detected before token-id
+    comparisons are even attempted."""
+    return hashlib.sha256(
+        json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def load_expected_snapshot(path: Path) -> dict[str, Any]:
+    """Read tests/proof/expected/<scenario>.json.
+
+    Snapshot schema (ds4-proof-expected-v1):
+      {
+        "schema": "ds4-proof-expected-v1",
+        "scenario": "<name>",
+        "expanded_plan_sha256": "<hex>",   # plan-input fingerprint
+        "cells": [
+          { "prompt_id": "...", "profile": "...",
+            "selected_token_ids_md5": "<hex>", "gen_token_count": N },
+          ...
+        ]
+      }
+    """
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("schema") != "ds4-proof-expected-v1":
+        raise ValueError(
+            f"unexpected snapshot schema {raw.get('schema')!r} in {path} "
+            "(expected ds4-proof-expected-v1)"
+        )
+    return raw
+
+
+def validate_against_expected(
+    expected: dict[str, Any],
+    expanded_plan: dict[str, Any],
+    results: dict[tuple[str, str], RunResult],
+) -> tuple[bool, list[str]]:
+    """Compare run results against a snapshot. Returns (passed, reasons)."""
+    reasons: list[str] = []
+    plan_sha = expanded_plan_sha256(expanded_plan)
+    expected_sha = expected.get("expanded_plan_sha256", "")
+    if expected_sha and expected_sha != plan_sha:
+        reasons.append(
+            f"expanded-plan SHA256 mismatch: expected {expected_sha} run {plan_sha} "
+            "(plan inputs drifted from snapshot; refresh snapshot or revert input change)"
+        )
+    by_cell = {
+        (c["prompt_id"], c["profile"]): c
+        for c in expected.get("cells", [])
+    }
+    for (prompt_id, profile_name), result in results.items():
+        cell = by_cell.get((prompt_id, profile_name))
+        if cell is None:
+            reasons.append(f"snapshot has no expected entry for ({prompt_id}, {profile_name})")
+            continue
+        if cell.get("selected_token_ids_md5") != result.selected_token_ids_md5:
+            reasons.append(
+                f"token-ids MD5 mismatch ({prompt_id}, {profile_name}): "
+                f"expected {cell.get('selected_token_ids_md5')!r} "
+                f"got {result.selected_token_ids_md5!r}"
+            )
+        if int(cell.get("gen_token_count", 0)) != result.gen_token_count:
+            reasons.append(
+                f"gen_token_count mismatch ({prompt_id}, {profile_name}): "
+                f"expected {cell.get('gen_token_count')} got {result.gen_token_count}"
+            )
+    return (not reasons, reasons)
+
+
 def print_run_line(result: RunResult) -> None:
     shadow = result.shadow
     shadow_text = ""
@@ -1515,10 +2070,16 @@ def print_run_line(result: RunResult) -> None:
             f" skip32tok={skip32['tps']:.2f}t/s"
         )
     status = "OK" if result.rc == 0 else f"FAILED rc={result.rc}"
+    token_text = ""
+    if result.selected_token_ids_md5 is not None or result.gen_token_count > 0:
+        token_text = (
+            f" tok_md5={result.selected_token_ids_md5 or '-'} "
+            f"gen={result.gen_token_count}"
+        )
     print(
-        f"{result.profile:28s} {status:12s} sha={result.stdout_sha256 or '-'} "
+        f"{result.profile:42s} {status:12s} sha={result.stdout_sha256 or '-'} "
         f"bytes={result.stdout_bytes} wall={result.wall_ms:.0f}ms "
-        f"out={result.out_path} log={result.log_path}{shadow_text}"
+        f"out={result.out_path} log={result.log_path}{token_text}{shadow_text}"
     )
 
 
@@ -1540,6 +2101,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--suite", default="mtp_speculative",
                     choices=["argmax_generation", "mtp_speculative"])
     ap.add_argument("--plan", type=Path, help="JSON proof plan with profiles, prompts, and contracts.")
+    ap.add_argument("--scenario", choices=sorted(SCENARIOS),
+                    help="Named proof scenario. Materializes profiles/prompts/contracts "
+                    "via the overlay registry; sets --suite to argmax_generation and selects "
+                    "the scenario's budget. Mutually exclusive with --plan.")
+    ap.add_argument("--ds4-root", type=Path, default=Path(__file__).resolve().parent.parent,
+                    help="Repo root for scenario @PATH prompt references. Defaults to two dirs up from this script.")
+    ap.add_argument("--emit-token-ids", action="store_true",
+                    help="Force ds4 to write --dump-logprobs FILE --logprobs-top-k 1 for every "
+                    "run. Used for token-id MD5 contracts and EOS-truncation checks. Implied "
+                    "when contracts include selected_token_ids_md5 or scenario sets a token "
+                    "floor.")
+    ap.add_argument("--expanded-plan", type=Path,
+                    help="Write the deterministic expanded plan (one record per cell, with prompt "
+                    "SHA256 and full env) to this path before subprocess runs. Defaults to "
+                    "<work-dir>/expanded-plan.json when --scenario is set.")
+    ap.add_argument("--check-expected", type=Path,
+                    help="Validate the run against an expected-hash snapshot (tests/proof/expected/"
+                    "<scenario>.json). Fails the proof if any cell's token-ids MD5 or gen-token "
+                    "count drifts from the snapshot.")
     ap.add_argument("--bin", default=os.environ.get("DS4_PROOF_BIN", "./ds4"))
     ap.add_argument("--base", default=os.environ.get("DS4_PROOF_BASE"))
     ap.add_argument("--mtp", default=os.environ.get("DS4_PROOF_MTP"))
@@ -1607,6 +2187,25 @@ def main(argv: list[str] | None = None) -> int:
         if plan_suite:
             args.suite = plan_suite
 
+    scenario: Scenario | None = None
+    scenario_profiles: list[EngineProfile] = []
+    scenario_prompts: list[PromptCase] = []
+    scenario_contracts: list[Contract] = []
+    if args.scenario:
+        if args.plan:
+            ap.error("--scenario and --plan are mutually exclusive")
+        scenario = SCENARIOS[args.scenario]
+        scenario_profiles, scenario_prompts, scenario_contracts = materialize_scenario(
+            scenario, ds4_root=args.ds4_root
+        )
+        # Scenarios in this registry are all argmax_generation. If a future
+        # scenario carries MTP overlays, set args.suite explicitly before
+        # passing --scenario.
+        if args.suite == ap.get_default("suite"):
+            args.suite = "argmax_generation"
+        if not args.budget:
+            args.budget = scenario.budget
+
     if not args.base:
         ap.error("provide --base or DS4_PROOF_BASE")
     if args.suite == "mtp_speculative" and not args.mtp:
@@ -1620,9 +2219,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.weight_server_scope == "both":
             weight_server_scope = "base"
 
-    profiles = plan_profiles or (
-        default_mtp_profiles() if args.suite == "mtp_speculative" else default_engine_profiles()
+    profiles = (
+        scenario_profiles or plan_profiles or (
+            default_mtp_profiles() if args.suite == "mtp_speculative" else default_engine_profiles()
+        )
     )
+    # --custom / --custom-profile are user-side extensions; they stack on top of
+    # whichever profile source was selected. Custom additions skip the overlay
+    # validator on purpose -- they're ad-hoc env bundles, not registered
+    # overlays.
     profiles.extend(
         EngineProfile(name, {**FAST_MTP_ENV, **env}, use_mtp=True)
         for name, env in args.custom
@@ -1650,8 +2255,15 @@ def main(argv: list[str] | None = None) -> int:
             prompts.append(PromptCase(f"p{i:02d}", prompt))
         base_i = len(prompts)
         for j, path in enumerate(args.prompt_files or []):
-            prompts.append(PromptCase(path.stem or f"p{base_i + j:02d}", path.read_text()))
+            prompts.append(PromptCase(
+                path.stem or f"p{base_i + j:02d}",
+                path.read_text(),
+                source_path=str(path),
+            ))
         prompt_source = "cli"
+    elif scenario_prompts:
+        prompts = scenario_prompts
+        prompt_source = f"scenario:{scenario.name}" if scenario else "scenario"
     elif plan_prompts:
         prompts = plan_prompts
         prompt_source = "plan"
@@ -1674,12 +2286,53 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("no profiles selected")
 
     contracts = [
-        c for c in (plan_contracts or default_contracts(profiles, args.suite))
+        c for c in (
+            scenario_contracts
+            or plan_contracts
+            or default_contracts(profiles, args.suite)
+        )
         if c.baseline in selected and c.candidate in selected
     ]
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Token-ids dumping is on when (a) any contract is selected_token_ids_md5,
+    # (b) the scenario sets a token floor (we need the count), or (c) the user
+    # asked for it. The dump cost is small relative to a 1024-token decode and
+    # lets us always cross-check digests against the determinism shell probe.
+    expected_gen_tokens_min = scenario.expected_gen_tokens_min if scenario else 0
+    dump_token_ids = (
+        args.emit_token_ids
+        or expected_gen_tokens_min > 0
+        or any(c.kind == "selected_token_ids_md5" for c in contracts)
+    )
+
+    expanded_plan: dict[str, Any] | None = None
+    expanded_plan_path = args.expanded_plan
+    if expanded_plan_path is None and scenario is not None:
+        expanded_plan_path = work_dir / "expanded-plan.json"
+    if expanded_plan_path is not None:
+        expanded_plan = build_expanded_plan(
+            scenario_name=scenario.name if scenario else "",
+            suite=args.suite,
+            tokens=tokens,
+            budget=args.budget or "",
+            profiles=profiles,
+            prompts=prompts,
+            contracts=contracts,
+            expected_gen_tokens_min=expected_gen_tokens_min,
+            bin_path=args.bin,
+            base_model=args.base,
+            mtp_model=args.mtp,
+            temperature=args.temperature,
+            nothink=not args.no_nothink,
+        )
+        expanded_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        expanded_plan_path.write_text(
+            json.dumps(expanded_plan, indent=2, sort_keys=True) + "\n"
+        )
+        print(f"expanded_plan={expanded_plan_path} sha256={expanded_plan_sha256(expanded_plan)}")
 
     weight_ipc_manifest = args.weight_ipc_manifest
     weight_server: WeightServer | None = None
@@ -1774,17 +2427,33 @@ def main(argv: list[str] | None = None) -> int:
                         work_dir=work_dir,
                         weight_ipc_manifest=weight_ipc_manifest,
                         weight_ipc_scope=weight_server_scope,
+                        dump_token_ids=dump_token_ids,
                     )
                 except ValueError as e:
-                    print(f"{profile.name:28s} FAILED {e}")
+                    print(f"{profile.name:42s} FAILED {e}")
                     failures += 1
                     continue
                 results[(prompt_case.id, profile.name)] = result
                 print_run_line(result)
                 if result.rc != 0:
                     failures += 1
+                # EOS-truncation guard. The long-context scenarios depend on
+                # running the full `tokens` decode; an unexpected EOS short of
+                # the floor means the matrix is comparing different decode
+                # lengths and would silently false-pass.
+                if (
+                    expected_gen_tokens_min > 0
+                    and result.rc == 0
+                    and result.gen_token_count < expected_gen_tokens_min
+                ):
+                    print(
+                        f"  [FAIL] {profile.name}: gen_token_count={result.gen_token_count} "
+                        f"< expected_gen_tokens_min={expected_gen_tokens_min} "
+                        "(prompt elicited an early EOS; pick a stronger long-response prompt)"
+                    )
+                    failures += 1
                 if weight_server and not weight_server.is_running():
-                    print(f"{profile.name:28s} FAILED ds4_weight_server exited during profile run")
+                    print(f"{profile.name:42s} FAILED ds4_weight_server exited during profile run")
                     failures += 1
 
             for contract in contracts:
@@ -1822,8 +2491,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         failures += 1
 
+    expected_validation: dict[str, Any] | None = None
+    if args.check_expected is not None:
+        if expanded_plan is None:
+            ap.error("--check-expected requires --expanded-plan or --scenario to build the plan")
+        snapshot = load_expected_snapshot(args.check_expected)
+        passed, reasons = validate_against_expected(snapshot, expanded_plan, results)
+        expected_validation = {
+            "snapshot_path": str(args.check_expected),
+            "passed": passed,
+            "reasons": reasons,
+        }
+        if not passed:
+            print(f"expected-snapshot validation FAILED reasons={reasons}")
+            failures += len(reasons)
+        else:
+            print(f"expected-snapshot validation OK ({args.check_expected})")
+
     report = {
         "schema": "ds4-proof-report-v1",
+        "scenario": scenario.name if scenario else "",
         "suite": args.suite,
         "tokens": tokens,
         "budget": {
@@ -1837,6 +2524,9 @@ def main(argv: list[str] | None = None) -> int:
         },
         "temperature": args.temperature,
         "work_dir": str(work_dir),
+        "expanded_plan_path": str(expanded_plan_path) if expanded_plan_path else "",
+        "expanded_plan_sha256": expanded_plan_sha256(expanded_plan) if expanded_plan else "",
+        "expected_validation": expected_validation,
         "weight_ipc_manifest": weight_ipc_manifest,
         "weight_ipc_scope": weight_server_scope,
         "weight_server_backend": args.weight_server_backend,
