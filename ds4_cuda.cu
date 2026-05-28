@@ -5655,6 +5655,109 @@ __global__ static void attention_decode_mixed_kernel(
     }
 }
 
+/* Opp C Phase 1A staged prototype: dedicated sticky scratch for
+ * pre-decoded FP8 -> FP32 compressed rows.  Lifetime is the process;
+ * grows monotonically with the largest n_comp seen.  Kept separate from
+ * cuda_tmp_alloc so the captured-graph pointer stays stable across
+ * replays and doesn't contend with other transient scratch users
+ * (e.g. indexed_topk_sort_512_asc_kernel in the prefill path).
+ *
+ * Capture safety: the first eager call from the per-(il, key) warmup pass
+ * grows scratch to the layer's required size; subsequent captured launches
+ * reuse the same pointer.  cudaMalloc/cudaFree only ever run outside
+ * capture because they only run when bytes > g_fp8_predecode_scratch_bytes. */
+static void *g_fp8_predecode_scratch = NULL;
+static uint64_t g_fp8_predecode_scratch_bytes = 0;
+
+static float *fp8_predecode_scratch_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    if (g_fp8_predecode_scratch_bytes >= bytes) {
+        return (float *)g_fp8_predecode_scratch;
+    }
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: fp8 predecode scratch alloc failed "
+                "(%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    if (g_fp8_predecode_scratch) {
+        (void)cudaFree(g_fp8_predecode_scratch);
+    }
+    g_fp8_predecode_scratch = ptr;
+    g_fp8_predecode_scratch_bytes = bytes;
+    return (float *)g_fp8_predecode_scratch;
+}
+
+/* Opp C Phase 1A staged prototype: pre-decode the topk-selected
+ * compressed rows from the packed FP8 mirror into a dense FP32 scratch
+ * before the main attention kernel runs.  Grid = (n_tokens, top_k, 1);
+ * each block handles one (t, i) pair where i is the slot inside topk[t,*].
+ * Skips invalid (c<0) and out-of-window (c>=visible_comp) slots; those
+ * positions in scratch may carry stale values from prior calls but the
+ * attention kernel applies the same visible_comp filter and never reads
+ * them.  Writes to scratch[c * head_dim] (compressed-row-indexed), so the
+ * consumer is the existing FP32 attention path with comp_kv=scratch and
+ * comp_fp8=NULL -- no kernel signature change required.
+ *
+ * Why this exists: in-kernel scalar fp8_kv_read() at decode (n_tokens=1,
+ * grid 1xn_headx1) re-decodes every selected row independently in each of
+ * the n_head=64 head blocks.  ncu on PRO 6000 showed +195.8% executed
+ * instructions vs. the FP32 path, ~2.18x duration.  Pre-decoding once per
+ * row (instead of n_head times) amortizes the decompression cost across
+ * heads; the attention kernel then reads FP32 with the existing tuned
+ * coalesced pattern.  Bit-identical to the scalar in-kernel path because
+ * this kernel just calls the same fp8_kv_read() inline. */
+__global__ static void attention_fp8_predecode_kernel(
+        float * __restrict__ scratch,
+        const int32_t * __restrict__ topk,
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t head_dim,
+        uint32_t ratio,
+        /* PC5 (live-pos substrate fix, 2026-05-28 postmortem): predecode
+         * computes visible_comp from pos0 and applies the same filter as
+         * attention_indexed_mixed_kernel (see line ~5779 for the full
+         * postmortem).  Without s_override the filter uses captured pos0
+         * on replay and writes a stale subset of comp rows into scratch,
+         * which the FP32 attention kernel then reads -- producing a
+         * predecode-specific capture attractor distinct from both the
+         * (now-fixed) scalar-FP8 path and the FP32 path.  Read pos0 live
+         * from the same substrate the attention kernel uses; the two
+         * kernels must agree on which c values to decode and read. */
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        const struct ds4_layer_scalars  * __restrict__ ls_override) {
+    if (s_override) {
+        pos0   = s_override->pos0;
+    }
+    if (ls_override) {
+        n_comp = ls_override->n_comp;
+    }
+    uint32_t t = blockIdx.x;
+    uint32_t i = blockIdx.y;
+    if (t >= n_tokens || i >= top_k) return;
+
+    uint32_t qpos = pos0 + t;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    int32_t c = topk[(uint64_t)t * top_k + i];
+    if (c < 0 || (uint32_t)c >= visible_comp) return;
+
+    float *out = scratch + (uint64_t)c * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        out[d] = fp8_kv_read(comp_fp8, comp_scale, (uint32_t)c, d);
+    }
+}
+
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -9325,6 +9428,33 @@ extern "C" int ds4_cuda_fp8_kv_debug_enabled(void) {
     return enabled;
 }
 
+/* Opp C Phase 1A staged prototype switch.  When set (and DS4_CUDA_FP8_KV is
+ * on), the indexed-mixed attention shim launches attention_fp8_predecode_kernel
+ * before the attention kernel and re-targets the attention launch at the
+ * decoded FP32 scratch (comp_kv=scratch, comp_fp8=NULL).  Independent of
+ * DS4_CUDA_FP8_KV so we can A/B in-kernel scalar decode vs. pre-decoded
+ * staging without disturbing the storage / write-side mirror plumbing. */
+extern "C" int ds4_cuda_fp8_kv_predecode_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_FP8_KV_PREDECODE");
+        if (s && *s &&
+            (strcmp(s, "1") == 0 ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
+            enabled = 1;
+            fprintf(stderr, "ds4: DS4_CUDA_FP8_KV_PREDECODE=%s - "
+                    "FP8 mirror predecoded to FP32 scratch before "
+                    "attention_indexed_mixed_kernel (Opp C Phase 1A staged "
+                    "prototype; supersedes in-kernel scalar fp8_kv_read)\n", s);
+        }
+    }
+    return enabled;
+}
+
 static struct layer_graph_entry *layer_graph_slot(const struct ds4_layer_graph_key *key) {
     /* Deterministic slot selection: il * 64 + flags*2 + parity.  The
      * earlier FNV-1a-over-key-bytes hash folded in 18 ASLR-randomized
@@ -9605,6 +9735,26 @@ static void ds4_cuda_layer_graph_warm_tmp_scratch(void) {
      * when sized below the request it does cudaFree(old) + cudaMalloc(new).
      * Pass 4 MiB to force at least that much. */
     (void)cuda_tmp_alloc((uint64_t)4 * 1024 * 1024, "layer_graph_warmup");
+
+    /* Opp C Phase 1A staged prototype: the FP8 predecode scratch has the
+     * SAME failure mode as cuda_tmp_alloc -- it's a sticky pointer that
+     * grows on first too-small request, and a grow inside a captured
+     * region cudaFrees the pointer that an earlier layer's captured graph
+     * still holds.  At long context, per-layer n_comp values diverge, so
+     * earlier captures end up with smaller scratch requests than later
+     * ones; the later request grows the buffer, invalidates the earlier
+     * captured pointer, and replays read freed memory (manifests as
+     * eager-vs-capture divergence at n=128+ long context, with predecode
+     * landing on a different attractor than the scalar in-kernel path).
+     *
+     * Pre-warm to the theoretical maximum: max n_comp = comp_cap = 8194
+     * (per the existing g_decode_dev / indexer_topk_tree commentary above),
+     * head_dim = 512, sizeof(float) = 4 -> ~16 MiB.  Round to 32 MiB to
+     * leave headroom for any future config bump.  This is only paid when
+     * DS4_CUDA_FP8_KV_PREDECODE will actually be exercised; without the
+     * env flag the scratch helper is never called and the cudaMalloc is
+     * a waste, but at 32 MiB on a 96 GB device the cost is negligible. */
+    (void)fp8_predecode_scratch_alloc((uint64_t)32 * 1024 * 1024);
 }
 
 /* Step 6 diagnostic: cudaPeekAtLastError check used to localize the
@@ -12209,12 +12359,61 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      * bit-identical without needing a parallel rewrite. */
     const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
     const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
+
+    /* Opp C Phase 1A staged prototype: when DS4_CUDA_FP8_KV_PREDECODE is set
+     * AND we have a packed FP8 mirror, run attention_fp8_predecode_kernel
+     * first to materialize the topk-selected compressed rows into an FP32
+     * scratch buffer, then point the attention launch at the scratch.  This
+     * amortizes the decompression across the n_head head blocks: each row
+     * is decoded once instead of n_head=64 times.  Bit-identical to the
+     * scalar in-kernel path because the predecode just calls fp8_kv_read().
+     *
+     * Fallback: if scratch alloc fails OR the predecode launch errors, leave
+     * fp8_codes/fp8_sc/comp_kv unchanged so the attention kernel falls back
+     * to the existing scalar in-kernel decode -- no regression. */
+    const float *comp_kv_dev = (const float *)comp_kv->ptr;
+    if (fp8_codes != NULL && fp8_sc != NULL && ds4_cuda_fp8_kv_predecode_enabled()) {
+        const uint64_t scratch_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        float *scratch = fp8_predecode_scratch_alloc(scratch_bytes);
+        if (scratch != NULL) {
+            dim3 pre_grid(n_tokens, top_k, 1);
+            attention_fp8_predecode_kernel<<<pre_grid, 128, 0, ds4_current_stream()>>>(
+                    scratch,
+                    topk_ptr,
+                    fp8_codes,
+                    fp8_sc,
+                    n_tokens,
+                    pos0,
+                    n_comp,
+                    top_k,
+                    head_dim,
+                    ratio,
+                    /* PC5: pass the decode-scalars substrate so predecode
+                     * reads live pos0 (same fix as the indexed_mixed kernel
+                     * a few lines below).  Without this the predecode/attn
+                     * pair disagrees on visible_comp at long context, and
+                     * predecode_capture lands on its own attractor distinct
+                     * from the scalar-FP8 capture path. */
+                    (const struct ds4_decode_scalars *)scalars,
+                    ls_override);
+            if (cuda_ok(cudaGetLastError(), "attention fp8 predecode launch")) {
+                comp_kv_dev = scratch;
+                fp8_codes = NULL;
+                fp8_sc = NULL;
+            }
+            /* Launch error path: keep the scalar fallback active.  cuda_ok
+             * already printed the underlying message; the attention kernel
+             * below will surface any sticky propagation through its own
+             * cuda_ok(...) check. */
+        }
+    }
+
     dim3 grid(n_tokens, n_head, 1);
     attention_indexed_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
-                                                  (const float *)comp_kv->ptr,
+                                                  comp_kv_dev,
                                                   topk_ptr,
                                                   n_tokens,
                                                   pos0,
