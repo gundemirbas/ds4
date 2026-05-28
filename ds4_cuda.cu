@@ -5689,6 +5689,33 @@ __global__ static void attention_indexed_mixed_kernel(
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
+        /* PC5 (live-pos substrate fix, 2026-05-28 long-context capture-vs-eager
+         * postmortem): pos0 must be read live from the substrate too, not just
+         * its derived n_raw/raw_start.  The kernel uses pos0 to compute
+         * visible_comp = (qpos+1)/ratio, which is the upper bound on which
+         * topk[]-selected compressed rows the attention loop considers
+         * (filter at line ~5856: `if (c >= 0 && c < visible_comp)`).
+         *
+         * At capture time the by-value pos0 arg is baked into the kernel-node
+         * arg list at queue time.  On replay at a much later token, frozen
+         * pos0 gives a visible_comp far smaller than the live formula would
+         * yield, and the `min(formula, live n_comp)` clamp picks the frozen
+         * value -- silently dropping every topk entry whose compressed-row
+         * index lies between visible_comp_capture and visible_comp_live.
+         * The frozen value of n_raw/raw_start was already a symptom of the
+         * same class (PC4); the override below was made live for those but
+         * not for the underlying pos0, leaving the formula inconsistent
+         * (frozen pos0 + live n_raw -> meaningless first_raw_pos).
+         *
+         * Manifestation: FP32 long-n=128 capture-vs-eager parity failed on
+         * /tmp/long_prompt.txt with first divergent gen idx 40 (abs pos
+         * ~10542).  Hash-dump bisect localized the first-divergent kernel
+         * to attention_indexed_mixed_kernel at il=2 with all probed inputs
+         * (q, raw_cache, comp_cache, comp_selected) bit-identical to BE,
+         * but heads.after_rope_back differing.  Read pos0 live from the
+         * decode-scalars substrate (sibling field to n_raw/raw_start) so
+         * visible_comp tracks the live position. */
+        pos0      = s_override->pos0;
     }
     if (ls_override) {
         n_comp    = ls_override->n_comp;
