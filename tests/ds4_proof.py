@@ -1320,17 +1320,29 @@ SCENARIOS: dict[str, Scenario] = {
             ("fp8-kv",),
             ("fp8-kv", "fp8-kv-predecode"),
         ),
-        prompts=("builtin:0", "builtin:1", "@tests/long_context_story_prompt.txt"),
+        prompts=("@tests/long_context_essay_prompt.txt",),
         budget="candidate",
         # cuda-default is the only canonical, so vs-canonical-counterpart
-        # generates zero contracts. The selected_token_ids_md5 contract here is
-        # used in --check-expected mode against tests/proof/expected/ snapshots.
+        # generates zero cross-profile contracts -- by design. This is a DRIFT
+        # gate, not a parity gate: each FP8 cell is anchored against a committed
+        # golden snapshot via --check-expected (tests/proof/expected/<scenario>.json).
+        # An exact_bytes(baseline, fp8) parity contract would be *wrong* here --
+        # FP8 KV is lossy and is supposed to diverge from FP32 baseline over a
+        # long decode; the meaningful invariant is "FP8 output has not drifted
+        # from its blessed reference," which only a snapshot can express.
+        # The essay prompt (~10k input, n=512 decode, no early EOS) populates a
+        # large compressed-KV cache so the FP8 read path is heavily exercised --
+        # making genuine drift detectable rather than masked by a short context.
         contracts=("selected_token_ids_md5",),
         expected_gen_tokens_min=480,
         description=(
-            "Opp C FP8 KV mirror progression sweep across baseline / read path / "
-            "predecode at candidate budget (n=512). Snapshot-anchored: changes "
-            "to expected token-id MD5s indicate semantic drift, not just perf."
+            "Opp C FP8 KV mirror DRIFT gate: baseline / read path / predecode at "
+            "candidate budget (n=512) over the essay prompt. Golden-anchored via "
+            "--check-expected -- a change to any cell's token-id MD5 or gen-token "
+            "count signals FP8 numeric drift that no in-build parity gate can "
+            "catch (parity compares two paths in the same build; a change that "
+            "shifts both identically slips through). Refresh the golden with "
+            "--write-expected after an intentional output change."
         ),
     ),
 }
@@ -2034,6 +2046,40 @@ def validate_against_expected(
     return (not reasons, reasons)
 
 
+def write_expected_snapshot(
+    path: Path,
+    scenario_name: str,
+    expanded_plan: dict[str, Any] | None,
+    results: dict[tuple[str, str], RunResult],
+) -> int:
+    """Bless the current run's per-cell token-id MD5s + gen-token counts as the
+    golden snapshot at `path` (ds4-proof-expected-v1). Symmetric with
+    --check-expected. Returns the number of cells written.
+
+    The expanded_plan_sha256 fingerprint is stored alongside so a later
+    --check-expected run fails loudly if the plan inputs (prompts, profiles,
+    budget) have drifted from what was blessed, rather than silently comparing
+    different inputs."""
+    cells = [
+        {
+            "prompt_id": prompt_id,
+            "profile": profile_name,
+            "selected_token_ids_md5": result.selected_token_ids_md5,
+            "gen_token_count": result.gen_token_count,
+        }
+        for (prompt_id, profile_name), result in sorted(results.items())
+    ]
+    snapshot = {
+        "schema": "ds4-proof-expected-v1",
+        "scenario": scenario_name,
+        "expanded_plan_sha256": expanded_plan_sha256(expanded_plan) if expanded_plan else "",
+        "cells": cells,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+    return len(cells)
+
+
 def print_run_line(result: RunResult) -> None:
     shadow = result.shadow
     shadow_text = ""
@@ -2120,6 +2166,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="Validate the run against an expected-hash snapshot (tests/proof/expected/"
                     "<scenario>.json). Fails the proof if any cell's token-ids MD5 or gen-token "
                     "count drifts from the snapshot.")
+    ap.add_argument("--write-expected", type=Path,
+                    help="Bless this run's per-cell token-id MD5s + gen-token counts as the golden "
+                    "snapshot at PATH (tests/proof/expected/<scenario>.json). Use to create or "
+                    "refresh the snapshot after an intentional output change. Refuses to write if "
+                    "the run had any failures. Mutually exclusive with --check-expected.")
     ap.add_argument("--bin", default=os.environ.get("DS4_PROOF_BIN", "./ds4"))
     ap.add_argument("--base", default=os.environ.get("DS4_PROOF_BASE"))
     ap.add_argument("--mtp", default=os.environ.get("DS4_PROOF_MTP"))
@@ -2191,6 +2242,8 @@ def main(argv: list[str] | None = None) -> int:
     scenario_profiles: list[EngineProfile] = []
     scenario_prompts: list[PromptCase] = []
     scenario_contracts: list[Contract] = []
+    if args.write_expected and args.check_expected:
+        ap.error("--write-expected and --check-expected are mutually exclusive")
     if args.scenario:
         if args.plan:
             ap.error("--scenario and --plan are mutually exclusive")
@@ -2285,12 +2338,22 @@ def main(argv: list[str] | None = None) -> int:
     if not profiles:
         ap.error("no profiles selected")
 
+    # Contract source precedence. A scenario's materialized contracts are
+    # AUTHORITATIVE -- including the empty set. A single-canonical scenario
+    # (cuda-opp-c-full) deliberately produces zero cross-profile contracts and
+    # is anchored via --check-expected instead; falling back to default_contracts
+    # there would silently impose an exact_bytes(baseline, candidate) parity the
+    # scenario never declared (and which a lossy FP8 read path would fail over a
+    # long decode). The default_contracts fallback is only for the ad-hoc,
+    # plan-less, scenario-less path.
+    if scenario is not None:
+        base_contracts = scenario_contracts
+    elif plan_contracts:
+        base_contracts = plan_contracts
+    else:
+        base_contracts = default_contracts(profiles, args.suite)
     contracts = [
-        c for c in (
-            scenario_contracts
-            or plan_contracts
-            or default_contracts(profiles, args.suite)
-        )
+        c for c in base_contracts
         if c.baseline in selected and c.candidate in selected
     ]
 
@@ -2490,6 +2553,23 @@ def main(argv: list[str] | None = None) -> int:
             f"reasons={','.join(weight_server_verdict['reasons'])}"
         )
         failures += 1
+
+    if args.write_expected is not None:
+        if expanded_plan is None:
+            ap.error("--write-expected requires --expanded-plan or --scenario to build the plan")
+        if failures:
+            print(
+                f"--write-expected: refusing to bless a run with {failures} failure(s); "
+                "fix the run before regenerating the golden snapshot"
+            )
+            return 1
+        n_cells = write_expected_snapshot(
+            args.write_expected,
+            scenario.name if scenario else "",
+            expanded_plan,
+            results,
+        )
+        print(f"wrote golden snapshot {args.write_expected} ({n_cells} cells)")
 
     expected_validation: dict[str, Any] | None = None
     if args.check_expected is not None:

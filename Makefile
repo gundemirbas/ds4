@@ -137,6 +137,13 @@ cuda-regression: tests/cuda_long_context_smoke
 # materializes the (canonical x overlay) matrix, writes work_dir/expanded-plan.json,
 # runs every cell, and reports per-cell selected-token-id MD5s with vs-canonical-
 # counterpart parity contracts.
+#   - smoke / long: capture-vs-eager PARITY (two paths in one build must match).
+#   - opp-c: FP8 KV DRIFT gate. Single canonical, no parity contract; each cell
+#     is checked against a committed golden snapshot (tests/proof/expected/
+#     cuda-opp-c-full.json) so lossy-FP8 numeric drift between builds is caught.
+#     Regenerate the golden after an intentional output change with:
+#       tests/ds4_proof.py --scenario cuda-opp-c-full \
+#         --write-expected tests/proof/expected/cuda-opp-c-full.json [weight-server flags]
 DS4_PROOF_REQUIRE_BASE := @if [ -z "$$DS4_PROOF_BASE" ]; then echo "$@: set DS4_PROOF_BASE to a base model gguf path" >&2; exit 2; fi
 
 proof-cuda-smoke: ds4
@@ -149,7 +156,8 @@ proof-cuda-long: ds4
 
 proof-cuda-opp-c: ds4
 	$(DS4_PROOF_REQUIRE_BASE)
-	tests/ds4_proof.py --scenario cuda-opp-c-full --work-dir /tmp/ds4_proof/$@
+	tests/ds4_proof.py --scenario cuda-opp-c-full --work-dir /tmp/ds4_proof/$@ \
+		--check-expected tests/proof/expected/cuda-opp-c-full.json
 endif
 
 ds4.o: ds4.c ds4.h ds4_gpu.h
