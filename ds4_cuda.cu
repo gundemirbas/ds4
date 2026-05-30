@@ -81,6 +81,7 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+static int g_model_mapping_failure_notice_printed;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
@@ -131,9 +132,6 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-static uint64_t g_model_startup_hbm_bytes;
-#endif
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -155,6 +153,10 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset);
+static uint64_t cuda_model_cache_limit_bytes(void);
+static uint64_t cuda_model_local_model_limit_bytes(void);
+static int cuda_model_cache_limit_explicit(void);
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -198,6 +200,78 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+static const char *cuda_model_range_register_mapped(const void *model_map,
+                                                    uint64_t offset,
+                                                    uint64_t bytes,
+                                                    const char *what) {
+    if (!g_model_range_mapping_supported || bytes == 0) return NULL;
+
+    const long page_sz_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
+    const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
+    const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
+    uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
+    if (model_map == g_model_host_base &&
+        g_model_registered_size >= 88ull * 1073741824ull &&
+        g_model_registered_size <= 96ull * 1073741824ull &&
+        g_model_range_bytes >= 80ull * 1073741824ull) {
+        const uintptr_t model_base = (uintptr_t)model_map;
+        const uintptr_t model_end = model_base + (uintptr_t)g_model_registered_size;
+        if (model_end > model_base && model_end > reg_addr) {
+            const uint64_t tail_bytes = (uint64_t)(model_end - reg_addr);
+            reg_bytes = (tail_bytes + page_sz - 1u) & ~(page_sz - 1u);
+        }
+    }
+    void *reg_dev = NULL;
+
+    unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
+    if (getenv("DS4_CUDA_HOST_REGISTER_PLAIN") != NULL) {
+        flags = cudaHostRegisterMapped;
+    }
+
+    cudaError_t err = cudaHostRegister((void *)reg_addr,
+                                       (size_t)reg_bytes,
+                                       flags);
+    if (err != cudaSuccess &&
+        (flags & cudaHostRegisterReadOnly) != 0 &&
+        (err == cudaErrorNotSupported || err == cudaErrorInvalidValue)) {
+        (void)cudaGetLastError();
+        err = cudaHostRegister((void *)reg_addr,
+                               (size_t)reg_bytes,
+                               cudaHostRegisterMapped);
+    }
+    if (err == cudaSuccess) {
+        err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
+        if (err == cudaSuccess && reg_dev) {
+            char *dev_ptr = (char *)reg_dev + reg_delta;
+            g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
+            g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+            if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
+                        what ? what : "weights",
+                        (double)bytes / 1048576.0);
+            }
+            return dev_ptr;
+        }
+        fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
+                what ? what : "weights", cudaGetErrorString(err));
+        (void)cudaHostUnregister((void *)reg_addr);
+        (void)cudaGetLastError();
+        return NULL;
+    }
+
+    if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) {
+        g_model_range_mapping_supported = 0;
+    }
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA model range map skipped for %s: %s\n",
+                what ? what : "weights", cudaGetErrorString(err));
+    }
+    (void)cudaGetLastError();
+    return NULL;
+}
+
 /* Allocate a device-resident copy of [offset, offset+bytes) from model_map and
  * push it into g_model_ranges so future cuda_model_range_ptr lookups hit it.
  * Returns the device pointer on success, NULL on cudaMalloc/cudaMemcpy failure.
@@ -206,6 +280,17 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
                                                           uint64_t offset,
                                                           uint64_t bytes,
                                                           const char *what) {
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr, "ds4: CUDA skipped device copy for %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
+                    what ? what : "weights",
+                    (double)bytes / 1048576.0,
+                    (double)limit / 1073741824.0);
+        }
+        return NULL;
+    }
+
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
@@ -284,42 +369,36 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         if (fd_ptr) return fd_ptr;
     }
 
-    cudaError_t err = cudaSuccess;
-    if (g_model_range_mapping_supported) {
-        const long page_sz_l = sysconf(_SC_PAGESIZE);
-        const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
-        const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
-        const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
-        const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
-        const uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
-        void *reg_dev = NULL;
-        err = cudaHostRegister((void *)reg_addr,
-                               (size_t)reg_bytes,
-                               cudaHostRegisterMapped);
-        if (err == cudaSuccess) {
-            err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
-            if (err == cudaSuccess && reg_dev) {
-                char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
-                g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
-                            what ? what : "weights",
-                            (double)bytes / 1048576.0);
-                }
-                return dev_ptr;
-            }
-            fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
-                    what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaHostUnregister((void *)reg_addr);
-            (void)cudaGetLastError();
-        } else {
-            if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
-            (void)cudaGetLastError();
-        }
-    }
+    const char *mapped = cuda_model_range_register_mapped(model_map, offset, bytes, what);
+    if (mapped) return mapped;
 
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+}
+
+static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
+    if (bytes == 0) return 1;
+    if (g_model_device_owned || g_model_registered || g_model_hmm_direct) return 1;
+
+    const uint64_t end = offset + bytes;
+    if (end < offset) return 0;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map &&
+            offset >= r.offset &&
+            end <= r.offset + r.bytes) {
+            return 1;
+        }
+        if (r.host_base == model_map &&
+            r.host_registered &&
+            r.registered_base &&
+            r.registered_device_base) {
+            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
+            const uintptr_t h1 = h0 + bytes;
+            const uintptr_t r0 = (uintptr_t)r.registered_base;
+            const uintptr_t r1 = r0 + r.registered_bytes;
+            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return 1;
+        }
+    }
+    return 0;
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
@@ -346,15 +425,7 @@ static uint64_t cuda_parse_mib_env(const char *name, int *present) {
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
-    if (present) return limit;
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    /* Spark startup HBM spans and the Q8->F16 cache duplicate some hot Q8
-     * tensors.  Keep the optional dequant cache bounded unless explicitly
-     * overridden; otherwise long prefill can overcommit UMA memory and produce
-     * invalid logits before CUDA reports a clean allocation failure. */
-    if (g_model_startup_hbm_bytes != 0) return 8192ull * 1048576ull;
-#endif
-    return UINT64_MAX;
+    return present ? limit : UINT64_MAX;
 }
 
 static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
@@ -418,7 +489,7 @@ static void cuda_q8_f16_cache_budget_notice(
 
 static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
     (void)label;
-    const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
+    uint64_t limit = cuda_q8_f16_cache_limit_bytes();
     if (limit == 0) return 0;
     if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
         cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
@@ -437,6 +508,27 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
 
     const uint64_t free_bytes = (uint64_t)free_b;
     const uint64_t total_bytes = (uint64_t)total_b;
+    /* On 96/128 GB UMA Spark-class systems the expanded Q8->F16 cache can
+     * pass a simple free-memory reserve check but still leave too little room
+     * for long-prefill cuBLAS execution.  Keep the startup cache useful but
+     * bounded unless the caller explicitly sets DS4_CUDA_Q8_F16_CACHE_MB. */
+    if (limit == UINT64_MAX &&
+        total_bytes <= 128ull * 1073741824ull &&
+        (g_model_range_bytes >= 64ull * 1073741824ull ||
+         g_model_registered_size >= 64ull * 1073741824ull)) {
+        if (g_model_registered_size >= 88ull * 1073741824ull ||
+            g_model_range_bytes >= 88ull * 1073741824ull) {
+            limit = 4ull * 1073741824ull;
+        } else if (g_model_range_bytes >= 64ull * 1073741824ull) {
+            limit = 12ull * 1073741824ull;
+        } else {
+            limit = 8ull * 1073741824ull;
+        }
+        if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
+            cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
+            return 0;
+        }
+    }
     const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
     if (request_bytes > free_bytes ||
         free_bytes - request_bytes < reserve_bytes) {
@@ -494,25 +586,8 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
             in_dim == 1024u && out_dim == 32768u);
 }
 
-static int cuda_q8_label_is_attention_output(const char *label) {
-    return label &&
-           (strstr(label, "attn_output_a") != NULL ||
-            strstr(label, "attn_output_b") != NULL ||
-            strstr(label, "attention_output_a") != NULL ||
-            strstr(label, "attention_output_b") != NULL);
-}
-
 static int cuda_q8_use_dp4a(void) {
     return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
-}
-
-static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
-    if (cuda_q8_label_is_attention_output(label) &&
-        getenv("DS4_CUDA_ATTENTION_OUTPUT_PRELOAD") == NULL &&
-        getenv("DS4_CUDA_Q8_F16_ALL") == NULL) {
-        return 0;
-    }
-    return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
 }
 
 static int cuda_q8_f32_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
@@ -666,7 +741,7 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
                                      1024ull * 1024ull * 1024ull;
         g_model_load_progress_last = now;
         if (g_model_load_progress_tty) {
-            fprintf(stderr, "ds4: CUDA loading model tensors into device cache: 0.00 GiB");
+            fprintf(stderr, "\r\033[Kds4: CUDA loading model tensors into device cache: 0.00 GiB");
         } else {
             fprintf(stderr, "ds4: CUDA loading model tensors into device cache\n");
         }
@@ -678,7 +753,7 @@ static void cuda_model_load_progress_note(uint64_t cached_bytes) {
     }
 
     if (g_model_load_progress_tty) {
-        fprintf(stderr, "\rds4: CUDA loading model tensors into device cache: %.2f GiB",
+        fprintf(stderr, "\r\033[Kds4: CUDA loading model tensors into device cache: %.2f GiB",
                 (double)cached_bytes / 1073741824.0);
     } else {
         fprintf(stderr, "ds4: CUDA loading model tensors %.2f GiB cached\n",
@@ -935,14 +1010,24 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         if (end != env) gb = (uint64_t)v;
         return gb * 1073741824ull;
     }
-    /* Default cap protects against OOM on UMA systems where a full ~80 GiB
-     * model would otherwise duplicate the mmap'd host pages into HBM-backed
-     * cudaMalloc allocations and exhaust the 121 GiB UMA pool.  24 GiB
-     * comfortably covers attn projections + embedding + output head +
-     * shared FFN; routed MoE experts (~65 GiB, only top-K active per token)
-     * fall back to the UVA-mapped pointer for cold lookups.  Tune up via
-     * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more memory budget. */
-    return 24ull * 1073741824ull;
+    /* One Spark can run the IQ2 model (~81 GiB) and the mixed q2/q4 model
+     * (~91 GiB) via the old startup tensor cache.  Keep enough headroom for
+     * scratch, KV, and optional Q8->F16 buffers, and make the full-Q4 model
+     * use distributed layer loading unless the operator opts into a larger
+     * cache budget explicitly. */
+    return 96ull * 1073741824ull;
+}
+
+static uint64_t cuda_model_local_model_limit_bytes(void) {
+    const uint64_t default_limit = 96ull * 1073741824ull;
+    if (!cuda_model_cache_limit_explicit()) return default_limit;
+    const uint64_t explicit_limit = cuda_model_cache_limit_bytes();
+    return explicit_limit > default_limit ? explicit_limit : default_limit;
+}
+
+static int cuda_model_cache_limit_explicit(void) {
+    const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+    return env && env[0];
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -956,6 +1041,10 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     if (mb < 256) mb = 256;
     if (mb > 8192) mb = 8192;
     uint64_t bytes = mb * 1048576ull;
+    if (need > bytes / 2u) {
+        const uint64_t align = 64ull * 1048576ull;
+        return (need + align - 1u) & ~(align - 1u);
+    }
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
@@ -1213,9 +1302,6 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    g_model_startup_hbm_bytes = 0;
-#endif
     cuda_model_load_progress_reset();
 }
 
@@ -1304,6 +1390,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_model_mapping_failure_notice_printed = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -1437,9 +1524,8 @@ extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchroni
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
-extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
-    if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -1464,9 +1550,15 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
+    g_model_mapping_failure_notice_printed = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+    if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
     if (copy_env && copy_env[0]) {
@@ -1493,12 +1585,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
-    /* GB10 / driver 580.142 reports cudaDevAttrHostRegisterReadOnlySupported = 0,
-     * so requesting cudaHostRegisterReadOnly here fails with cudaErrorNotSupported
-     * and the entire model-resident fast path falls back to per-deref H2D streaming.
-     * Plain `Mapped` works on Spark. */
+    unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
+    if (getenv("DS4_CUDA_HOST_REGISTER_PLAIN") != NULL) {
+        flags = cudaHostRegisterMapped;
+    }
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped);
+                                       flags);
     if (err == cudaSuccess) {
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
@@ -1514,6 +1606,16 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     } else {
         fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
+        const uint64_t limit = cuda_model_local_model_limit_bytes();
+        if (!cuda_model_cache_limit_explicit() && model_size > limit) {
+            fprintf(stderr,
+                    "ds4: CUDA model %.2f GiB exceeds the default single-GPU "
+                    "startup cache budget %.2f GiB; use distributed layer "
+                    "loading or set DS4_CUDA_WEIGHT_CACHE_LIMIT_GB explicitly\n",
+                    (double)model_size / 1073741824.0,
+                    (double)limit / 1073741824.0);
+            return 0;
+        }
     }
     return 1;
 }
@@ -1544,19 +1646,11 @@ extern "C" int ds4_gpu_set_model_map_spans(
             return 0;
         }
     }
-    if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    if (!cuda_model_set_host_map(model_map, model_size)) return 0;
 
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
-        if (count > 1) {
-            for (uint32_t i = 0; i < count; i++) {
-                (void)cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i]);
-            }
-            return 1;
-        }
         for (uint32_t i = 0; i < count; i++) {
-            if (!cuda_model_copy_chunked(model_map, model_size, offsets[i], sizes[i])) {
-                (void)cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i]);
-            }
+            (void)cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i]);
         }
     }
     return 1;
@@ -1599,52 +1693,33 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
-#ifndef DS4_CUDA_SPARK_HBM_CACHE
-    (void)model_map;
-    (void)model_size;
-    (void)offset;
-    (void)bytes;
-    (void)label;
-    return 1;
-#else
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    /* Startup walk: force-populate the device-resident HBM cache so hot
-     * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
-     * Skip silently if over budget or opted out — the mapped pointer still
-     * works for any tensor we don't pre-cache. */
-    if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 1;
-    if (g_model_device_owned) return 1;
-    const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 1;
-    const char *what = label ? label : "model_tensor";
-    /* Skip if this span is already populated. */
-    auto exact = g_model_range_by_offset.find(offset);
-    if (exact != g_model_range_by_offset.end()) {
-        const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
+    if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
+
+    const char *ptr = cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor");
+    if (!ptr || !cuda_model_range_is_cached(model_map, offset, bytes)) {
+        if (!g_model_mapping_failure_notice_printed) {
+            fprintf(stderr,
+                    "ds4: CUDA failed to prepare model tensor spans for device access\n");
+            g_model_mapping_failure_notice_printed = 1;
+        }
+        return 0;
     }
-    const char *ptr = cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
-    if (ptr) g_model_startup_hbm_bytes += bytes;
-    return ptr != NULL;
-#endif
+    return 1;
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    static int optional_q8_preload_disabled = 0;
-    if (optional_q8_preload_disabled) return 1;
     const char *cache_label = label ? label : "q8_0";
     if (getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL &&
         cuda_q8_f32_cache_allowed(cache_label, in_dim, out_dim)) {
         if (cuda_q8_f32_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
-        optional_q8_preload_disabled = 1;
         return 1;
     }
-    if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
+    if (!cuda_q8_f16_cache_allowed(cache_label, in_dim, out_dim)) return 1;
     if (cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
-    optional_q8_preload_disabled = 1;
     return 1;
 }
 
