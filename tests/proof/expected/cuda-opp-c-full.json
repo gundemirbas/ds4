@@ -4,19 +4,19 @@
       "gen_token_count": 512,
       "profile": "cuda-default",
       "prompt_id": "long_context_essay_prompt",
-      "selected_token_ids_md5": "703b23f13f70e5fd08245dfd735efbd6"
+      "selected_token_ids_md5": "3e9f42b12408c5ea2d3cbe1b9fb156ee"
     },
     {
       "gen_token_count": 512,
       "profile": "fp8-kv",
       "prompt_id": "long_context_essay_prompt",
-      "selected_token_ids_md5": "703b23f13f70e5fd08245dfd735efbd6"
+      "selected_token_ids_md5": "3e9f42b12408c5ea2d3cbe1b9fb156ee"
     },
     {
       "gen_token_count": 512,
       "profile": "fp8-kv+fp8-kv-predecode",
       "prompt_id": "long_context_essay_prompt",
-      "selected_token_ids_md5": "703b23f13f70e5fd08245dfd735efbd6"
+      "selected_token_ids_md5": "3e9f42b12408c5ea2d3cbe1b9fb156ee"
     }
   ],
   "expanded_plan_sha256": "2113dd6a90b4eb08cc1b9c038f64fd616f64cba3ec4609e5a7eabb3903603a11",

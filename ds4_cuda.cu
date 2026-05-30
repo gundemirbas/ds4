@@ -432,6 +432,15 @@ static uint64_t g_cuda_tmp_bytes;
  * since ksplit scales inversely with out_dim to hit a fixed block target). */
 static float *g_f16_splitk_partials = NULL;
 static uint64_t g_f16_splitk_partials_bytes = 0;
+/* SM count cached in ds4_gpu_init; gates the flash-decode attention split so it
+ * only engages when the per-head attention grid (n_head blocks) under-fills the
+ * machine (n_head < SM count). On small-SM integrated GPUs (GB10, 48 SMs, 64
+ * heads) the condition is false -> no split -> output unchanged. */
+static int g_cuda_sm_count = 0;
+/* Dedicated capture-stable scratch for the flash-decode attention partials
+ * (per (head,split): m, l, acc[head_dim]). Allocated once in ds4_gpu_init. */
+static float *g_attn_split_partials = NULL;
+static uint64_t g_attn_split_partials_bytes = 0;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -2172,6 +2181,22 @@ extern "C" int ds4_gpu_init(void) {
         if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
             g_f16_splitk_partials = (float *)p;
             g_f16_splitk_partials_bytes = bytes;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    /* SM count for the flash-decode attention split gate. */
+    (void)cudaDeviceGetAttribute(&g_cuda_sm_count, cudaDevAttrMultiProcessorCount, dev);
+    /* Flash-decode attention partials scratch (eager init -> capture-stable
+     * pointer). Sized for n_head*n_split*(head_dim+2) floats; 1M floats (4 MiB)
+     * covers e.g. 64 heads * 8 splits * 514 = 263K. A failure just disables the
+     * split (the single-block decode kernel remains the fallback). */
+    if (g_attn_split_partials == NULL) {
+        const uint64_t bytes = (uint64_t)1024u * 1024u * sizeof(float); /* 4 MiB */
+        void *p = NULL;
+        if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
+            g_attn_split_partials = (float *)p;
+            g_attn_split_partials_bytes = bytes;
         } else {
             (void)cudaGetLastError();
         }
@@ -5878,6 +5903,183 @@ __global__ static void attention_decode_mixed_kernel(
             }
             oh[d] = acc / denom;
         }
+    }
+}
+
+/* ---- Flash-decode split for the single-token attention decode path ----
+ * attention_decode_mixed_kernel launches one block per head (grid = n_head),
+ * which under-fills GPUs with many SMs (e.g. 64 heads on the PRO 6000's 188
+ * SMs) and serializes each head's V-accumulation over the whole KV window.
+ * These two kernels split each head's score rows across n_split blocks, each
+ * emitting an online-softmax partial (m = chunk row-max, l = sum exp(s-m),
+ * acc[d] = sum exp(s-m)*v), then a fixed-order combine merges the partials and
+ * folds in the sink. Mathematically equal to the single-block path; fp rounding
+ * differs (the split changes the softmax reference and summation order) -> a
+ * one-time deterministic output shift. eager==captured still holds: n_split, the
+ * row partition, and the sp-ascending combine are all deterministic and the
+ * scratch pointer is allocated eager (capture-stable). Mirrors the kernel's
+ * `single_all` decode branch exactly (t=0, pos0=0, window=0, ratio=0): raw_count
+ * = min(n_raw,256), all n_comp visible, raw_rows[r] = (raw_start+r) % raw_cap. */
+__global__ static void attention_decode_split_kernel(
+        float *partials,            /* [(h*n_split+sp)*(head_dim+2)] = {m, l, acc[head_dim]} */
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        uint32_t use_comp_mask,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_split,
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        const struct ds4_layer_scalars  * __restrict__ ls_override,
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
+    if (s_override) { n_raw = s_override->n_raw; raw_start = s_override->raw_start; }
+    if (ls_override) { n_comp = ls_override->n_comp; }
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
+    if (use_fp8 && threadIdx.x == 0) atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
+    const uint32_t sp = blockIdx.x;
+    const uint32_t h  = blockIdx.y;
+    if (h >= n_head || sp >= n_split) return;
+    const uint32_t raw_count = n_raw > 256u ? 256u : n_raw;
+    const uint32_t visible_comp = n_comp;
+    const uint32_t n_score = raw_count + visible_comp;
+    const float scale = rsqrtf((float)head_dim);
+    const float *qh = q + (uint64_t)h * head_dim;
+    __shared__ uint32_t raw_rows[256];
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ float partial[256];
+    __shared__ float m_sh;
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x)
+        raw_rows[r] = (raw_start + r) % raw_cap;
+    __syncthreads();
+    /* this block's contiguous chunk of the row index range [0, n_score) */
+    const uint32_t chunk = (n_score + n_split - 1u) / n_split;
+    const uint32_t lo = sp * chunk;
+    uint32_t hi = lo + chunk;
+    if (hi > n_score) hi = n_score;
+    float *out_m = partials + (uint64_t)(h * n_split + sp) * (head_dim + 2u);
+    if (lo >= hi) {
+        if (threadIdx.x == 0) { out_m[0] = -INFINITY; out_m[1] = 0.0f; }
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) out_m[2u + d] = 0.0f;
+        return;
+    }
+    const uint32_t cn = hi - lo;
+    float local_max = -INFINITY;
+    for (uint32_t j = threadIdx.x; j < cn; j += blockDim.x) {
+        const uint32_t row = lo + j;
+        float s;
+        if (row < raw_count) {
+            const float *kv = raw_kv + (uint64_t)raw_rows[row] * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+            s = dot * scale;
+        } else {
+            const uint32_t c = row - raw_count;
+            const float add = use_comp_mask ? comp_mask[c] : 0.0f;
+            if (add > -1.0e20f) {
+                float dot = 0.0f;
+                if (use_fp8) {
+                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, c, d);
+                } else {
+                    const float *kv = comp_kv + (uint64_t)c * head_dim;
+                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                }
+                s = dot * scale + add;
+            } else {
+                s = -INFINITY;
+            }
+        }
+        scores[j] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t st = blockDim.x >> 1; st > 0; st >>= 1) {
+        if (threadIdx.x < st) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + st]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) m_sh = partial[0];
+    __syncthreads();
+    const float m = m_sh;
+    if (m == -INFINITY) {
+        /* whole chunk masked out -> contributes nothing to the combine */
+        if (threadIdx.x == 0) { out_m[0] = -INFINITY; out_m[1] = 0.0f; }
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) out_m[2u + d] = 0.0f;
+        return;
+    }
+    float den_local = 0.0f;
+    for (uint32_t j = threadIdx.x; j < cn; j += blockDim.x) {
+        const float e = expf(scores[j] - m);
+        scores[j] = e;
+        den_local += e;
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t st = blockDim.x >> 1; st > 0; st >>= 1) {
+        if (threadIdx.x < st) partial[threadIdx.x] += partial[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { out_m[0] = m; out_m[1] = partial[0]; }
+    float *out_acc = out_m + 2u;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t j = 0; j < cn; j++) {
+            const uint32_t row = lo + j;
+            const float sc = scores[j];
+            if (row < raw_count) {
+                acc += raw_kv[(uint64_t)raw_rows[row] * head_dim + d] * sc;
+            } else {
+                const uint32_t c = row - raw_count;
+                if (use_fp8) acc += fp8_kv_read(comp_fp8, comp_scale, c, d) * sc;
+                else acc += comp_kv[(uint64_t)c * head_dim + d] * sc;
+            }
+        }
+        out_acc[d] = acc;
+    }
+}
+
+/* Combine the n_split online-softmax partials for each head into the final
+ * attention output, folding in the sink. Fixed sp-ascending order keeps it
+ * deterministic (eager==captured). One block per head. */
+__global__ static void attention_decode_combine_kernel(
+        float *heads,
+        const float *sinks,
+        const float *partials,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_split) {
+    const uint32_t h = blockIdx.x;
+    if (h >= n_head) return;
+    const float *base = partials + (uint64_t)(h * n_split) * (head_dim + 2u);
+    const uint32_t stride = head_dim + 2u;
+    __shared__ float f_sh[64];
+    __shared__ float denom_sh;
+    if (threadIdx.x == 0) {
+        const float sink = sinks[h];
+        float gm = sink;
+        for (uint32_t sp = 0; sp < n_split; sp++) gm = fmaxf(gm, base[(uint64_t)sp * stride]);
+        float denom = expf(sink - gm);
+        for (uint32_t sp = 0; sp < n_split; sp++) {
+            const float m = base[(uint64_t)sp * stride];
+            const float l = base[(uint64_t)sp * stride + 1u];
+            const float f = (m == -INFINITY) ? 0.0f : expf(m - gm);
+            f_sh[sp] = f;
+            denom += f * l;
+        }
+        denom_sh = denom;
+    }
+    __syncthreads();
+    const float denom = denom_sh;
+    float *oh = heads + (uint64_t)h * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t sp = 0; sp < n_split; sp++) acc += f_sh[sp] * base[(uint64_t)sp * stride + 2u + d];
+        oh[d] = acc / denom;
     }
 }
 
@@ -12305,6 +12507,46 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
      * FP32 keeps it bit-identical without needing a parallel rewrite. */
     const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
     const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
+    /* Flash-decode split: when the per-head decode grid under-fills the machine
+     * (n_head < SM count, e.g. 64 heads on the PRO 6000's 188 SMs), split each
+     * head's KV reduction across n_split blocks + a fixed-order combine to fill
+     * the SMs. Self-gating: false on small-SM integrated GPUs (GB10, 48 SMs >=
+     * 64 heads is false) so their output stays bit-identical. head_dim==512 only
+     * (the validated single-token decode geometry); DS4_CUDA_NO_ATTN_SPLIT forces
+     * the legacy single-block kernel. */
+    if (head_dim == 512u && g_cuda_sm_count > 0 &&
+        n_head < (uint32_t)g_cuda_sm_count && g_attn_split_partials != NULL &&
+        getenv("DS4_CUDA_NO_ATTN_SPLIT") == NULL) {
+        /* Target ~1.33 waves of (n_head * n_split) 256-thread blocks: measured
+         * fastest on the PRO 6000 (188 SMs, 64 heads -> n_split=4; -19% attn).
+         * 1 wave (n_split=3) under-hides KV-read latency; >=2 waves (6,8) lose to
+         * combine overhead + tiny per-block score phases. */
+        uint32_t target_blocks = (uint32_t)g_cuda_sm_count + (uint32_t)g_cuda_sm_count / 3u;
+        uint32_t n_split = (target_blocks + n_head - 1u) / n_head;
+        if (n_split < 2u) n_split = 2u;
+        if (n_split > 8u) n_split = 8u;
+        { const char *ov = getenv("DS4_CUDA_ATTN_SPLIT_N");
+          if (ov) { int v = atoi(ov); if (v >= 1 && v <= 16) n_split = (uint32_t)v; } }
+        const uint64_t need = (uint64_t)n_head * n_split * (head_dim + 2u) * sizeof(float);
+        if (need <= g_attn_split_partials_bytes) {
+            dim3 ssgrid(n_split, n_head, 1);
+            attention_decode_split_kernel<<<ssgrid, 256, 0, ds4_current_stream()>>>(
+                    g_attn_split_partials,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                    use_mask ? (const float *)comp_mask->ptr : NULL,
+                    use_mask,
+                    n_raw, raw_cap, raw_start, n_comp, n_head, head_dim, n_split,
+                    (const struct ds4_decode_scalars *)scalars,
+                    ls_override,
+                    fp8_codes, fp8_sc);
+            if (!cuda_ok(cudaGetLastError(), "attention decode split launch")) return 0;
+            attention_decode_combine_kernel<<<n_head, 256, 0, ds4_current_stream()>>>(
+                    (float *)heads->ptr, sinks, g_attn_split_partials, n_head, head_dim, n_split);
+            return cuda_ok(cudaGetLastError(), "attention decode combine launch");
+        }
+    }
     dim3 grid(1, n_head, 1);
     attention_decode_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                  sinks,
