@@ -491,18 +491,67 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+/* Allocate a device-resident copy of [offset, offset+bytes) from model_map and
+ * push it into g_model_ranges so future cuda_model_range_ptr lookups hit it.
+ * Returns the device pointer on success, NULL on cudaMalloc/cudaMemcpy failure.
+ * Caller is responsible for any policy gating (budget cap, env opt-out, etc.) */
+static const char *cuda_model_range_populate_device_copy(const void *model_map,
+                                                          uint64_t offset,
+                                                          uint64_t bytes,
+                                                          const char *what) {
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        return NULL;
+    }
+
+    const char *src = (const char *)model_map + offset;
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    for (uint64_t done = 0; done < bytes; done += chunk) {
+        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)done / 1048576.0,
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaFree(dev);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+    }
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
+                what ? what : "weights",
+                (double)bytes / 1048576.0,
+                (double)g_model_range_bytes / 1073741824.0);
+    }
+    return (const char *)dev;
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    const uint64_t end = offset + bytes;
-    if (end < offset) return NULL;
 
+    /* Device-resident HBM cache hits win over UVA-mapped registered pointers:
+     * direct HBM reads are ~10% faster than mapped reads through host page
+     * tables (measured on plain decode at GB10).  Cache lookup runs first; the
+     * registered-mapped shortcut below is the cold fallback when an allocation
+     * hasn't been pre-populated. */
+    const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
     }
     for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end <= r.offset + r.bytes) {
+        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -539,12 +588,12 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         void *reg_dev = NULL;
         err = cudaHostRegister((void *)reg_addr,
                                (size_t)reg_bytes,
-                               cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+                               cudaHostRegisterMapped);
         if (err == cudaSuccess) {
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0, 0, 0, 0, 0, 0});
+                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
@@ -563,67 +612,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
-    void *dev = NULL;
-    err = cudaMalloc(&dev, (size_t)bytes);
-    if (err != cudaSuccess) {
-        (void)cudaGetLastError();
-        fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
-                what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
-        return NULL;
-    }
-
-    const char *src = (const char *)model_map + offset;
-    const uint64_t chunk = 64ull * 1024ull * 1024ull;
-    for (uint64_t done = 0; done < bytes; done += chunk) {
-        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f/%.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)done / 1048576.0,
-                    (double)bytes / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaFree(dev);
-            (void)cudaGetLastError();
-            return NULL;
-        }
-    }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0});
-    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-    g_model_range_bytes += bytes;
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached %s %.2f MiB (total %.2f GiB)\n",
-                what ? what : "weights",
-                (double)bytes / 1048576.0,
-                (double)g_model_range_bytes / 1073741824.0);
-    }
-    return (const char *)dev;
-}
-
-static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
-    if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
-
-    const uint64_t end = offset + bytes;
-    if (end < offset) return 0;
-    for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map &&
-            offset >= r.offset &&
-            end <= r.offset + r.bytes) {
-            return 1;
-        }
-        if (r.host_base == model_map &&
-            r.host_registered &&
-            r.registered_base &&
-            r.registered_device_base) {
-            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-            const uintptr_t h1 = h0 + bytes;
-            const uintptr_t r0 = (uintptr_t)r.registered_base;
-            const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return 1;
-        }
-    }
-    return 0;
+    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
 }
 
 static char *cuda_derived_weight_ptr(
@@ -1629,9 +1618,16 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
+        return gb * 1073741824ull;
     }
-    if (gb == 0) return UINT64_MAX;
-    return gb * 1073741824ull;
+    /* Default cap protects against OOM on UMA systems where a full ~80 GiB
+     * model would otherwise duplicate the mmap'd host pages into HBM-backed
+     * cudaMalloc allocations and exhaust the 121 GiB UMA pool.  24 GiB
+     * comfortably covers attn projections + embedding + output head +
+     * shared FFN; routed MoE experts (~65 GiB, only top-K active per token)
+     * fall back to the UVA-mapped pointer for cold lookups.  Tune up via
+     * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more memory budget. */
+    return 24ull * 1073741824ull;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -1872,6 +1868,17 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* A raw host pointer is safe for kernels only after CUDA owns, registered, or
+ * HMM-prefetched the mapping.  Otherwise let the caller try per-range mapping
+ * or a device copy instead of surfacing an async illegal access later. */
+static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset) {
+    if (g_model_device_owned || g_model_registered || g_model_hmm_direct ||
+        getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        return cuda_model_ptr(model_map, offset);
+    }
+    return NULL;
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -1893,7 +1900,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
-        return cuda_model_ptr(model_map, offset);
+        return cuda_model_direct_fallback_ptr(model_map, offset);
     }
 
     // Prefer the VMM arena when supported: same backing storage the
@@ -1906,7 +1913,7 @@ static const char *cuda_model_range_ptr_from_fd(
     if (!dev) dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
         if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
-        return cuda_model_ptr(model_map, offset);
+        return cuda_model_direct_fallback_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
 
@@ -2455,8 +2462,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
+    /* GB10 / driver 580.142 reports cudaDevAttrHostRegisterReadOnlySupported = 0,
+     * so requesting cudaHostRegisterReadOnly here fails with cudaErrorNotSupported
+     * and the entire model-resident fast path falls back to per-deref H2D streaming.
+     * Plain `Mapped` works on Spark. */
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+                                       cudaHostRegisterMapped);
     if (err == cudaSuccess) {
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
@@ -2482,6 +2493,40 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_model_map_spans(
+        const void *model_map,
+        uint64_t model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t count,
+        uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (offsets[i] > model_size ||
+            sizes[i] == 0 ||
+            sizes[i] > model_size - offsets[i]) {
+            return 0;
+        }
+    }
+    if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+
+    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
+        if (count > 1) {
+            for (uint32_t i = 0; i < count; i++) {
+                (void)cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i]);
+            }
+            return 1;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (!cuda_model_copy_chunked(model_map, model_size, offsets[i], sizes[i])) {
+                (void)cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i]);
+            }
+        }
     }
     return 1;
 }
@@ -3159,10 +3204,33 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
+#ifndef DS4_CUDA_SPARK_HBM_CACHE
+    (void)model_map;
+    (void)model_size;
+    (void)offset;
+    (void)bytes;
+    (void)label;
+    return 1;
+#else
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
-    return cuda_model_range_is_cached(model_map, offset, bytes);
+    /* Startup walk: force-populate the device-resident HBM cache so hot
+     * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
+     * Skip silently if over budget or opted out — the mapped pointer still
+     * works for any tensor we don't pre-cache. */
+    if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 1;
+    if (g_model_device_owned) return 1;
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 1;
+    const char *what = label ? label : "model_tensor";
+    /* Skip if this span is already populated. */
+    auto exact = g_model_range_by_offset.find(offset);
+    if (exact != g_model_range_by_offset.end()) {
+        const cuda_model_range &r = g_model_ranges[exact->second];
+        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
+    }
+    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
+#endif
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
@@ -8055,6 +8123,52 @@ __global__ static void indexer_scores_wmma128_kernel(
 #endif
 }
 
+/* Single-block argmax over n_vocab F32 logits. One block of 1024 threads
+ * cooperatively scans the vocab, tracking a (best_v, best_idx) pair per
+ * thread, then reduces in shared memory with value-keyed comparison.
+ *
+ * Tie-breaking: lower index wins, matching the host sample_argmax used by
+ * the CPU reference path. Replaces the indexer-as-argmax workaround used
+ * in the MTP top-id sites, which fell through to the legacy single-thread
+ * indexer_topk_kernel at top_k=1, costing ~17.5 ms per call on n_vocab=129280. */
+__global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
+    enum { THREADS = 1024 };
+    __shared__ float sm_val[THREADS];
+    __shared__ int32_t sm_idx[THREADS];
+
+    const uint32_t tid = threadIdx.x;
+    float local_v = -INFINITY;
+    int32_t local_i = 0;
+    for (uint32_t i = tid; i < n_vocab; i += THREADS) {
+        const float v = logits[i];
+        if (v > local_v) {
+            local_v = v;
+            local_i = (int32_t)i;
+        }
+    }
+    sm_val[tid] = local_v;
+    sm_idx[tid] = local_i;
+    __syncthreads();
+
+    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s];
+            const int32_t ir = sm_idx[tid + s];
+            const float vl = sm_val[tid];
+            const int32_t il = sm_idx[tid];
+            /* Larger value wins; on exact ties prefer the lower index. */
+            const bool take_right = (vr > vl) || (vr == vl && ir < il);
+            if (take_right) {
+                sm_val[tid] = vr;
+                sm_idx[tid] = ir;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) *out_idx = sm_idx[0];
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
         /* PC5 substrate override (see indexer_topk_8192_cub_kernel docstring). */
         const struct ds4_layer_scalars * __restrict__ ls_override) {
@@ -9038,6 +9152,21 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k, ls);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+extern "C" int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab) {
+    if (!out_idx || !logits || n_vocab == 0 ||
+        out_idx->bytes < sizeof(int32_t) ||
+        logits->bytes < (uint64_t)n_vocab * sizeof(float)) {
+        return 0;
+    }
+    argmax_kernel<<<1, 1024>>>((int32_t *)out_idx->ptr,
+                               (const float *)logits->ptr,
+                               n_vocab);
+    return cuda_ok(cudaGetLastError(), "argmax launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
