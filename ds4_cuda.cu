@@ -2462,6 +2462,36 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
+    /* Importing weights from a VMM weight server on an integrated / unified-memory
+     * GPU (e.g. DGX Spark GB10): do NOT pin the full host mmap. The server already
+     * holds the model in device VMM; cudaHostRegister-ing the same ~80 GiB here
+     * double-residencies it against that VMM (2x the model on one shared LPDDR5X
+     * pool -> can't fit twice -> disk thrash). Leave the raw mmap as the base
+     * pointer: the IPC import overlays device pointers for the weight ranges, and
+     * any stray non-imported (metadata) deref reaches the pageable mmap via
+     * ATS/HMM. Discrete GPUs keep the registration path (separate host/VRAM pools).
+     *
+     * FOLLOW-UP (B): making our VMM arena the *default* single-process residency
+     * path on integrated (no server) is a separate, larger change -- it needs a
+     * coalesced up-front loader to match the server's ~20 s load + ~19.64 t/s.
+     * See local/docs/ds4_gb10_vmm_default_followup_2026-05-30.md. */
+    if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST") != NULL) {
+        int integrated = 0;
+        int reg_dev = 0;
+        if (cudaGetDevice(&reg_dev) == cudaSuccess) {
+            (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, reg_dev);
+        }
+        if (integrated) {
+            g_model_device_base = (const char *)model_map;
+            g_model_hmm_direct = 1;
+            fprintf(stderr,
+                    "ds4: CUDA integrated + VMM import: skipping full host registration "
+                    "(%.2f GiB mmap left unpinned; weights served from device VMM)\n",
+                    (double)model_size / 1073741824.0);
+            return 1;
+        }
+    }
+
     /* GB10 / driver 580.142 reports cudaDevAttrHostRegisterReadOnlySupported = 0,
      * so requesting cudaHostRegisterReadOnly here fails with cudaErrorNotSupported
      * and the entire model-resident fast path falls back to per-deref H2D streaming.

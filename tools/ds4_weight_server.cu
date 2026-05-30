@@ -678,6 +678,20 @@ static bool inspect_model_plan(const char *id, const char *path, uint64_t span_b
     return true;
 }
 
+/* Host MemAvailable (free + reclaimable page cache), in bytes; 0 if unreadable. */
+static uint64_t host_mem_available_bytes(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long v = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &v) == 1) { kb = (uint64_t)v; break; }
+    }
+    fclose(f);
+    return kb * 1024ull;
+}
+
 static bool cuda_memory_preflight(const char *what, uint64_t planned_bytes, uint64_t reserve_bytes) {
     size_t free_b = 0;
     size_t total_b = 0;
@@ -687,19 +701,39 @@ static bool cuda_memory_preflight(const char *what, uint64_t planned_bytes, uint
                 what, cudaGetErrorString(err));
         return false;
     }
+    /* On integrated / unified-memory GPUs (e.g. DGX Spark GB10), cudaMemGetInfo's
+     * `free` reports only physically-free pages (kernel MemFree) and ignores the
+     * reclaimable page cache -- which on these hosts is dominated by the mmap'd
+     * model file itself. A device allocation reclaims that clean, file-backed
+     * cache, so the real allocatable budget is host MemAvailable, not MemFree.
+     * Discrete-VRAM GPUs have no such host cache to reclaim, so MemFree stays the
+     * correct ceiling there. Use the larger of the two only when integrated. */
+    uint64_t budget = (uint64_t)free_b;
+    int integrated = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) == cudaSuccess &&
+        integrated) {
+        const uint64_t avail = host_mem_available_bytes();
+        if (avail > budget) budget = avail;
+    }
+    const char *bypass = getenv("DS4_WEIGHT_SERVER_NO_PREFLIGHT");
     fprintf(stderr,
-            "ds4_weight_server: memory preflight %s need=%.2f GiB reserve=%.2f GiB free=%.2f GiB total=%.2f GiB\n",
+            "ds4_weight_server: memory preflight %s need=%.2f GiB reserve=%.2f GiB free=%.2f GiB budget=%.2f GiB total=%.2f GiB integrated=%d\n",
             what,
             (double)planned_bytes / 1073741824.0,
             (double)reserve_bytes / 1073741824.0,
             (double)free_b / 1073741824.0,
-            (double)total_b / 1073741824.0);
+            (double)budget / 1073741824.0,
+            (double)total_b / 1073741824.0,
+            integrated);
+    if (bypass && bypass[0]) return true;
     if (reserve_bytes > 0 &&
         planned_bytes <= UINT64_MAX - reserve_bytes &&
-        (uint64_t)free_b < planned_bytes + reserve_bytes) {
+        budget < planned_bytes + reserve_bytes) {
         fprintf(stderr,
-                "ds4_weight_server: refusing upload; not enough free CUDA memory for %s plus reserve. "
-                "Stop other model processes or lower --reserve-gb explicitly.\n",
+                "ds4_weight_server: refusing upload; not enough allocatable CUDA memory for %s plus reserve. "
+                "Stop other model processes, lower --reserve-gb, or set DS4_WEIGHT_SERVER_NO_PREFLIGHT=1.\n",
                 what);
         return false;
     }
