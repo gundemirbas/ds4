@@ -424,6 +424,14 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+
+/* Dedicated, capture-stable scratch for the split-K F16 matmul partials.
+ * Allocated once in ds4_gpu_init (eager) and never grown/freed during graph
+ * capture, so the captured-decode graph bakes a stable pointer. Sized to a
+ * generous fixed max (out_dim*ksplit ~ a few thousand floats by construction,
+ * since ksplit scales inversely with out_dim to hit a fixed block target). */
+static float *g_f16_splitk_partials = NULL;
+static uint64_t g_f16_splitk_partials_bytes = 0;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -2145,6 +2153,22 @@ extern "C" int ds4_gpu_init(void) {
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
+    /* Dedicated split-K F16 partials scratch. Allocated here (eager init,
+     * before any graph capture) so the captured-decode graph can reference a
+     * stable device pointer without an illegal mid-capture cudaMalloc. By
+     * construction out_dim*ksplit stays near the ~2K block target, so 1M floats
+     * is far more than the partials ever need; a failure just disables split-K
+     * (the matmul falls back to the single-block-per-row kernel). */
+    if (g_f16_splitk_partials == NULL) {
+        const uint64_t bytes = (uint64_t)1024u * 1024u * sizeof(float); /* 4 MiB */
+        void *p = NULL;
+        if (cudaMalloc(&p, (size_t)bytes) == cudaSuccess) {
+            g_f16_splitk_partials = (float *)p;
+            g_f16_splitk_partials_bytes = bytes;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
     /* Opp C Phase 1A.3: populate the E4M3FN magnitude lookup table on the
      * device when the FP8 KV mirror is enabled.  Definition lives next to
      * the __constant__ table further down in this file. */
@@ -2187,6 +2211,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
+    }
+    if (g_f16_splitk_partials) {
+        (void)cudaFree(g_f16_splitk_partials);
+        g_f16_splitk_partials = NULL;
+        g_f16_splitk_partials_bytes = 0;
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -3368,6 +3397,104 @@ __device__ static float warp_sum_f32(float v) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
     }
     return v;
+}
+
+/* Deterministic block reduction for a 256-thread (8-warp) block. Fixed
+ * shuffle-tree order within each warp, then a fixed 8-element shuffle-tree
+ * across warps -- scheduling-independent, so it is bit-identical run-to-run
+ * and between eager and captured replay. Result is valid in thread 0. */
+__device__ static float block_reduce_sum_256(float v) {
+    v = warp_sum_f32(v);                       /* lane 0 of each warp holds its warp sum */
+    __shared__ float s[8];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    if (lane == 0u) s[warp] = v;
+    __syncthreads();
+    float r = 0.0f;
+    if (warp == 0u) {
+        r = (lane < 8u) ? s[lane] : 0.0f;
+        r += __shfl_down_sync(0xffffffffu, r, 4);
+        r += __shfl_down_sync(0xffffffffu, r, 2);
+        r += __shfl_down_sync(0xffffffffu, r, 1);
+    }
+    return r;                                   /* valid in thread 0 (warp 0, lane 0) */
+}
+
+/* Split-K F16 matmul, pass 1 (decode, n_tok==1). Each (row, kseg) block
+ * reduces its contiguous in_dim segment [kseg*seg, (kseg+1)*seg) with
+ * coalesced stride-blockDim loads, then writes a per-segment partial. Splitting
+ * the row's dot product across kseg blocks raises the launched-block count so
+ * the GPU's SMs actually fill (the single-block-per-row fast kernel left
+ * waves_per_multiprocessor << 1 on the small-out_dim projections). */
+__global__ static void matmul_f16_splitk_kernel(
+        float *partial,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t ksplit,
+        int vec_ok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint32_t kseg = blockIdx.y;
+    if (row >= out_dim) return;
+    /* Round the segment length up to a multiple of 8 so every segment start k0
+     * is 8-half aligned -> the uint4 (8-half) vector loads below stay 16B
+     * aligned. Segments still tile [0,in_dim); a fully-trailing segment
+     * (k0 >= in_dim) just contributes 0. */
+    uint64_t seg = (in_dim + (uint64_t)ksplit - 1u) / (uint64_t)ksplit;
+    seg = (seg + 7u) & ~(uint64_t)7u;
+    const uint64_t k0 = (uint64_t)kseg * seg;
+    if (k0 >= in_dim) {
+        if (threadIdx.x == 0u) partial[row * (uint64_t)ksplit + (uint64_t)kseg] = 0.0f;
+        return;
+    }
+    uint64_t k1 = k0 + seg;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wr = w + row * in_dim;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nt = blockDim.x;
+    float sum = 0.0f;
+    if (vec_ok) {
+        /* Vectorized: each thread consumes 8 contiguous halves per step via a
+         * 16B uint4 load (coalesced: consecutive threads -> consecutive 16B),
+         * paired with two float4 activation loads. ~8x fewer memory
+         * instructions than the scalar path -> better latency tolerance on a
+         * reduction that ncu shows is latency-, not bandwidth-, bound. */
+        const uint64_t vend = k0 + ((k1 - k0) & ~(uint64_t)7u);
+        for (uint64_t i = k0 + (uint64_t)tid * 8u; i < vend; i += (uint64_t)nt * 8u) {
+            const uint4 wv = *reinterpret_cast<const uint4 *>(wr + i);
+            const float4 xa = *reinterpret_cast<const float4 *>(x + i);
+            const float4 xb = *reinterpret_cast<const float4 *>(x + i + 4);
+            const __half2 *h = reinterpret_cast<const __half2 *>(&wv);
+            const float2 w0 = __half22float2(h[0]);
+            const float2 w1 = __half22float2(h[1]);
+            const float2 w2 = __half22float2(h[2]);
+            const float2 w3 = __half22float2(h[3]);
+            sum += w0.x * xa.x + w0.y * xa.y + w1.x * xa.z + w1.y * xa.w
+                 + w2.x * xb.x + w2.y * xb.y + w3.x * xb.z + w3.y * xb.w;
+        }
+        for (uint64_t i = vend + tid; i < k1; i += nt) sum += __half2float(wr[i]) * x[i];
+    } else {
+        for (uint64_t i = k0 + tid; i < k1; i += nt) sum += __half2float(wr[i]) * x[i];
+    }
+    sum = block_reduce_sum_256(sum);
+    if (threadIdx.x == 0u) partial[row * (uint64_t)ksplit + (uint64_t)kseg] = sum;
+}
+
+/* Split-K F16 matmul, pass 2: combine the ksplit per-segment partials for each
+ * row in a fixed (kseg ascending) order. Fixed order keeps the result
+ * deterministic and eager==captured. */
+__global__ static void matmul_f16_splitk_combine_kernel(
+        float *out,
+        const float *partial,
+        uint64_t out_dim,
+        uint32_t ksplit) {
+    const uint64_t row = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
+    if (row >= out_dim) return;
+    const float *p = partial + row * (uint64_t)ksplit;
+    float s = 0.0f;
+    for (uint32_t k = 0u; k < ksplit; k++) s += p[k];
+    out[row] = s;
 }
 
 __device__ __forceinline__ static int32_t dot_i8_block(const int8_t *a, const int8_t *b, uint64_t n, int use_dp4a);
@@ -11005,11 +11132,16 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         router_shape &&
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+    /* Default decode (n_tok==1) F16 matmul is now the split-K path
+     * (occupancy-fixed + vectorized; ~+22% vs the legacy ordered_chunks kernel,
+     * proven eager==captured via the proof gates). The deterministic
+     * ordered_chunks summation is retained as an opt-in for A/B and bisection
+     * via DS4_CUDA_ORDERED_F16_MATMUL. */
     const int ordered_router =
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        getenv("DS4_CUDA_ORDERED_F16_MATMUL") != NULL;
     if (!serial_f16 && g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
@@ -11048,6 +11180,45 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         matmul_f16_ordered_chunks_kernel<<<grid, 32, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
+    /* Fast path. For decode (n_tok==1) the single-block-per-row kernel leaves
+     * the SMs mostly idle (waves_per_multiprocessor << 1) on the small-out_dim
+     * projections, so fan each row's reduction across kseg blocks (split-K) to
+     * fill the machine, then combine the per-segment partials in a fixed
+     * (kseg-ascending) order -- a deterministic two-pass. ksplit is chosen so
+     * out_dim*ksplit lands near a fixed block target; large out_dim already
+     * fills the GPU, leaving ksplit==1 and a path byte-identical to
+     * matmul_f16_kernel. */
+    uint32_t ksplit = 1u;
+    if (n_tok == 1u && g_f16_splitk_partials != NULL) {
+        const uint32_t target_blocks = 2048u;
+        const uint32_t min_seg = 512u;
+        /* Split whenever the single-block-per-row kernel under-fills the SMs
+         * (out_dim < the block target -> waves < 1). The two-pass combine looked
+         * like a ~4us tax under eager ncu, but under graph capture its launch is
+         * amortized by replay, so splitting even large out_dim is ~free and
+         * measured fastest -- keep the permissive threshold. */
+        if (out_dim < target_blocks && in_dim >= 2u * (uint64_t)min_seg) {
+            uint32_t k = (uint32_t)((target_blocks + out_dim - 1u) / out_dim);
+            const uint32_t maxk = (uint32_t)(in_dim / min_seg);
+            if (k > maxk) k = maxk;
+            const uint64_t need = out_dim * (uint64_t)k * sizeof(float);
+            if (k > 1u && need <= g_f16_splitk_partials_bytes) ksplit = k;
+        }
+    }
+    if (ksplit > 1u) {
+        /* uint4/float4 vector loads need 16B-aligned w and x and in_dim%8==0
+         * (so each row base and 8-aligned segment start stay aligned); else the
+         * kernel falls back to scalar loads. */
+        const int vec_ok = (in_dim % 8u == 0u)
+                && (((uintptr_t)w & 15u) == 0u)
+                && (((uintptr_t)x->ptr & 15u) == 0u);
+        dim3 sgrid((unsigned)out_dim, ksplit, 1);
+        matmul_f16_splitk_kernel<<<sgrid, 256, 0, ds4_current_stream()>>>(
+                g_f16_splitk_partials, w, (const float *)x->ptr, in_dim, out_dim, ksplit, vec_ok);
+        matmul_f16_splitk_combine_kernel<<<(unsigned)((out_dim + 255u) / 256u), 256, 0, ds4_current_stream()>>>(
+                (float *)out->ptr, g_f16_splitk_partials, out_dim, ksplit);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_splitk launch");
+    }
     matmul_f16_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
@@ -11066,11 +11237,14 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
         return 0;
     }
+    /* Default: route each output of the pair through the single-matmul split-K
+     * path (ordered_chunks pair kernel is opt-in via DS4_CUDA_ORDERED_F16_MATMUL,
+     * matching the single-matmul default flip above). */
     if (n_tok != 1 ||
         getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        getenv("DS4_CUDA_ORDERED_F16_MATMUL") == NULL) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
