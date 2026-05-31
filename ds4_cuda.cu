@@ -10424,30 +10424,43 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
     ds4_cuda_moe_stream_sync_post(s);
 }
 
-/* Bug 2 / Option D gate.  See local/docs/ds4_mmq_mtp_correctness_plan.html
- * in the auto-round companion repo for the full mechanism.  mmq's Q8_0 dense
- * FP32 reduction order drifts ~1 ULP/layer vs the legacy warp8 kernel; the
- * MTP drafter is trained against legacy-style decoding, so an mmq verifier
- * produces tight-margin argmax flips and collapses draft acceptance (analyst
- * measured 0/314 on GB10).  When set, this thread-local flag forces
- * ds4_cuda_use_mmq() to report disabled, routing every Q8_0 dense matmul
- * (attention projections, lm_head, attn_output_b) and the routed-MoE
- * dispatch onto the legacy native kernels for the duration of one verifier
- * call.  Non-verifier paths (prefill, non-MTP decode) are untouched.
+/* MTP verifier Q8_0 kernel selection (formerly the "Bug 2 / Option D" gate).
+ * See local/docs/ds4_mmq_mtp_correctness_plan.html for the original mechanism.
  *
- * Repro override: DS4_CUDA_MTP_VERIFIER_USE_MMQ=1 keeps mmq active inside
- * the verifier (today's broken behavior; for bisection only). */
+ * Background: mmq's Q8_0 dense FP32 reduction order differs ~1 ULP/layer from
+ * the legacy warp8 kernel.  Base decode uses mmq, so for the exact speculative
+ * verifier to reproduce the no-MTP stream it must ALSO use mmq -- otherwise it
+ * verifies drafts against a different argmax reference and the accepted tokens
+ * drift from no-MTP decode.  The old default forced the verifier onto warp8
+ * (g_in_mtp_verifier=1 -> use_mmq/use_cublas report disabled), on the premise
+ * that the warp8-calibrated drafter would otherwise lose all acceptance
+ * ("0/314 on GB10").  Measured 2026-05-31 (HEAD 70c3870, after the upstream
+ * dedicated-argmax merge): that premise no longer holds -- the mmq verifier is
+ * bit-identical to base (md5 match) with NO acceptance loss (GB10 accept-suffix
+ * 1.61 vs warp8 1.68) and equal throughput.  So the default is now to KEEP mmq
+ * active in the verifier (g_in_mtp_verifier stays 0), making MTP decode exact
+ * vs no-MTP.  Non-verifier paths (prefill, non-MTP decode) were always
+ * untouched.
+ *
+ * Opt out (restore legacy warp8 forcing; drifts from base, for bisection):
+ *   DS4_CUDA_MTP_VERIFIER_FORCE_WARP8=1   (or back-compat DS4_CUDA_MTP_VERIFIER_USE_MMQ=0) */
 static __thread int g_in_mtp_verifier = 0;
 static int g_mtp_verifier_bypass_init = 0;
-static int g_mtp_verifier_bypass = 0;
+static int g_mtp_verifier_bypass = 1;  /* default: mmq stays active in verifier (exact vs base) */
 
 static int ds4_cuda_mtp_verifier_bypass(void) {
     if (!g_mtp_verifier_bypass_init) {
         g_mtp_verifier_bypass_init = 1;
-        const char *s = getenv("DS4_CUDA_MTP_VERIFIER_USE_MMQ");
-        if (s && *s && strcmp(s, "0") != 0) {
-            g_mtp_verifier_bypass = 1;
-            fprintf(stderr, "ds4: DS4_CUDA_MTP_VERIFIER_USE_MMQ=%s - mmq stays active in MTP verifier (Bug 2 repro mode)\n", s);
+        const char *force_warp8 = getenv("DS4_CUDA_MTP_VERIFIER_FORCE_WARP8");
+        const char *use_mmq = getenv("DS4_CUDA_MTP_VERIFIER_USE_MMQ");
+        if (force_warp8 && *force_warp8 && strcmp(force_warp8, "0") != 0) {
+            g_mtp_verifier_bypass = 0;  /* legacy: force verifier onto warp8 */
+            fprintf(stderr, "ds4: DS4_CUDA_MTP_VERIFIER_FORCE_WARP8=%s - verifier forced to warp8 (drifts from base)\n", force_warp8);
+        } else if (use_mmq && strcmp(use_mmq, "0") == 0) {
+            g_mtp_verifier_bypass = 0;  /* back-compat: explicit USE_MMQ=0 -> warp8 */
+            fprintf(stderr, "ds4: DS4_CUDA_MTP_VERIFIER_USE_MMQ=0 - verifier forced to warp8 (drifts from base)\n");
+        } else {
+            g_mtp_verifier_bypass = 1;  /* default: mmq stays active in verifier (bit-exact to base) */
         }
     }
     return g_mtp_verifier_bypass;
@@ -10575,7 +10588,7 @@ static ds4_q8_strategy ds4_cuda_q8_strategy(void) {
 }
 
 static int ds4_cuda_use_mmq() {
-    if (g_in_mtp_verifier) return 0;  /* Bug 2 / Option D gate. */
+    if (g_in_mtp_verifier) return 0;  /* legacy warp8-forcing opt-out (FORCE_WARP8); default keeps mmq for exactness vs base */
     if (ds4_cuda_q8_strategy() != DS4_Q8_STRATEGY_MMQ) return 0;
     if (!g_ds4_use_mmq_init) {
         g_ds4_use_mmq_init = 1;
@@ -10591,7 +10604,7 @@ static int ds4_cuda_use_mmq() {
 }
 
 static int ds4_cuda_use_cublas_q8(void) {
-    if (g_in_mtp_verifier) return 0;  /* MTP verifier wants warp8 for exactness vs drafter. */
+    if (g_in_mtp_verifier) return 0;  /* legacy warp8-forcing opt-out (FORCE_WARP8); default keeps cublas/mmq for exactness vs base */
     return ds4_cuda_q8_strategy() == DS4_Q8_STRATEGY_CUBLAS && g_cublas_ready;
 }
 

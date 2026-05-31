@@ -24023,15 +24023,23 @@ static bool ds4_mtp_exact_policy_use_seq(ds4_session *s) {
     }
     if (!s) return true;
 
+    /*
+     * Determinism: the sequential exact verifier reuses the same single-token
+     * decode kernels as base decode, so its accepted stream is bit-identical
+     * to no-MTP output (measured GB10 2026-05-31, md5 match in eager AND
+     * captured).  The decode2 verifier batches the two draft rows through
+     * warp8-family pair kernels (no mmq equivalent), so it drifts ~1 ULP/layer
+     * from base and is NOT bit-identical -- and it is also slower, since it
+     * always pays the full two-row pass while seq early-stops on partial
+     * accepts.  So default to seq unconditionally (faster AND exact).  Decode2
+     * remains reachable via explicit DS4_MTP_EXACT_DECODE2, and its old
+     * acceptance-adaptive auto-selection is opt-in via
+     * DS4_MTP_EXACT_DECODE2_ADAPTIVE (drifts; for experiments only).
+     */
+    if (getenv("DS4_MTP_EXACT_DECODE2_ADAPTIVE") == NULL) return true;
+
     const uint32_t warmup = ds4_env_u32_default("DS4_MTP_EXACT_DECODE2_WARMUP", 8u);
     if (s->mtp_accept_samples < warmup) return true;
-
-    /*
-     * Decode2 wins only when two-draft acceptance is very high: it avoids the
-     * second sequential target pass on full accepts, but wastes row1 work on
-     * partial accepts.  Keep the default conservative so low-acceptance prose
-     * stays on the cheaper sequential exact verifier.
-     */
     const float min_accept = ds4_env_float_default("DS4_MTP_EXACT_DECODE2_MIN_ACCEPT", 0.90f);
     const bool use_seq = s->mtp_accept_ewma < (double)min_accept;
     if (getenv("DS4_MTP_EXACT_POLICY_LOG")) {
