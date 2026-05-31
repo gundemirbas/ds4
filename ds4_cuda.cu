@@ -1632,6 +1632,10 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
+    return 0;
+}
+
 extern "C" int ds4_gpu_set_model_map_spans(
         const void *model_map,
         uint64_t model_size,
