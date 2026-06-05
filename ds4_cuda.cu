@@ -1686,9 +1686,9 @@ extern "C" int ds4_gpu_set_model_map_spans(
     return 1;
 }
 
-extern "C" int ds4_gpu_set_model_fd(int fd) {
+extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     g_model_fd = fd;
-    g_model_fd_host_base = g_model_host_base;
+    g_model_fd_host_base = model_map;
     g_model_file_size = 0;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
@@ -1720,6 +1720,10 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 #endif
     }
     return 1;
+}
+
+extern "C" int ds4_gpu_set_model_fd(int fd) {
+    return ds4_gpu_set_model_fd_for_map(fd, g_model_host_base);
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {

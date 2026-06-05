@@ -20115,6 +20115,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
@@ -20130,13 +20131,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         free(load_sizes);
         /* Also apply explicit optional Q8 preload settings to the MTP support
          * model when loaded. */
-        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
-                                                             NULL, NULL, 0)) {
-            fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
-                    ds4_backend_name(e->backend));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        if (e->mtp_ready) {
+            (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
+            if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
+                                                 NULL, NULL, 0)) {
+                fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
+                        ds4_backend_name(e->backend));
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
