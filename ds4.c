@@ -24122,36 +24122,6 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return false;
     }
 
-    const uint64_t uncapped_model_target_bytes = plan.model_target_bytes;
-    const uint64_t uncapped_effective_cache_bytes = plan.effective_cache_bytes;
-    const uint32_t uncapped_cache_experts = plan.cache_experts;
-    bool throughput_capped = false;
-    if (DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
-        recommended <= 128ull * 1024ull * 1024ull * 1024ull) {
-        /*
-         * Work around the current PRO q2 cache-policy bug on 128GB M-series
-         * machines: beyond this point, more resident experts reduce SSD reads
-         * but can still slow decode because the Metal path works over a larger
-         * random shared-buffer set.  Let explicit CLI budgets reproduce and
-         * debug the bug, but keep auto near the measured throughput knee.
-         */
-        const uint64_t cap_bytes = 40ull * 1024ull * 1024ull * 1024ull;
-        const uint32_t cap_experts =
-            ds4_ssd_cache_experts_for_byte_budget(cap_bytes,
-                                                  per_expert_bytes);
-        if (cap_experts != 0 && cap_experts < plan.cache_experts) {
-            plan.cache_experts = cap_experts;
-            plan.effective_cache_bytes =
-                (uint64_t)cap_experts * per_expert_bytes;
-            plan.cache_bytes = plan.effective_cache_bytes;
-            if (non_routed_bytes <= UINT64_MAX - plan.effective_cache_bytes) {
-                plan.model_target_bytes =
-                    non_routed_bytes + plan.effective_cache_bytes;
-            }
-            throughput_capped = true;
-        }
-    }
-
     e->ssd_streaming_cache_experts = plan.cache_experts;
     fprintf(stderr,
             "ds4: Metal SSD streaming auto cache budget\n");
@@ -24159,22 +24129,14 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             "ds4:   Metal recommends %.2f GiB working set\n",
             (double)recommended / 1073741824.0);
     fprintf(stderr,
-            "ds4:   80%% total model + cached expert target before caps: %.2f GiB\n",
-            (double)uncapped_model_target_bytes / 1073741824.0);
+            "ds4:   using 80%% total for model + cached experts: %.2f GiB\n",
+            (double)plan.model_target_bytes / 1073741824.0);
     fprintf(stderr,
             "ds4:   non-routed weights: %.2f GiB\n",
             (double)non_routed_bytes / 1073741824.0);
     fprintf(stderr,
             "ds4:   routed expert size: %.2f MiB\n",
             (double)per_expert_bytes / 1048576.0);
-    if (throughput_capped) {
-        fprintf(stderr,
-                "ds4:   PRO 128GB throughput cap: %u experts (%.2f GiB), uncapped would be %u experts (%.2f GiB)\n",
-                plan.cache_experts,
-                (double)plan.effective_cache_bytes / 1073741824.0,
-                uncapped_cache_experts,
-                (double)uncapped_effective_cache_bytes / 1073741824.0);
-    }
     fprintf(stderr,
             "ds4:   cached expert count: %u (%.2f GiB)\n",
             e->ssd_streaming_cache_experts,

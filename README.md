@@ -287,21 +287,15 @@ Then start with the automatic cache budget:
   --nothink
 ```
 
-On 128GB M-series systems, the automatic PRO budget is capped near the observed
-throughput knee as a workaround for a current cache-policy/runtime bug. Larger
-expert caches can reduce SSD reads while still slowing decode because the
-current Metal path works over a much larger random shared-memory set.
-
-If startup reports that the requested expert cache is too large, or if you want
-to tune manually, start with `32GB` or `40GB`. Treat larger values as
-experiments for reproducing or investigating the bug, not guaranteed
-improvements:
+If startup reports that the requested expert cache is too large, set it
+manually. On 128GB systems, useful values to try are usually in the `32GB` to
+`64GB` range:
 
 ```sh
 ./ds4 \
   -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
   --ssd-streaming \
-  --ssd-streaming-cache-experts 32GB \
+  --ssd-streaming-cache-experts 48GB \
   --ctx 32768 \
   --nothink
 ```
@@ -315,7 +309,7 @@ generation limit:
 ./ds4 \
   -m gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf \
   --ssd-streaming \
-  --ssd-streaming-cache-experts 32GB \
+  --ssd-streaming-cache-experts 48GB \
   --ctx 32768 \
   --think \
   --tokens 1500
