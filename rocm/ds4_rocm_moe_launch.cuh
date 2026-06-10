@@ -1369,3 +1369,14 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
 }
+
+extern "C" int ds4_gpu_routed_moe_set_selected_override(
+        const int32_t *selected,
+        uint32_t n_selected) {
+    if (!selected || n_selected == 0 || n_selected > DS4_ROCM_STREAM_EXPERT_MAX_SELECTED)
+        return 0;
+    memcpy(g_routed_moe_selected_override, selected,
+           n_selected * sizeof(int32_t));
+    g_routed_moe_selected_override_n = n_selected;
+    return 1;
+}

@@ -9,6 +9,7 @@
 
 #include "cuda/ds4_cuda_common.cuh"
 #include "ds4_iq2_tables_cuda.inc"
+#include "cuda/ds4_cuda_stream_expert_cache.cuh"
 #include "cuda/ds4_cuda_runtime.cuh"
 
 // --- Device kernels (and their immediate launch helpers) ---

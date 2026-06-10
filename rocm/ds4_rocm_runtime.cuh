@@ -1489,12 +1489,21 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     g_model_host_base = model_map;
-    g_model_device_base = cuda_model_image_owned(model_map) ?
-                          cuda_model_image_ptr(model_map, 0) :
-                          (const char *)model_map;
+
+    if (g_ssd_streaming_mode) {
+        // Streaming: UMA'da direkt pointer kullanılır, kopyalama yapılmaz
+        g_model_device_base = (const char *)model_map;
+        g_model_device_owned = 0;
+        g_model_range_mapping_supported = 0;
+    } else {
+        g_model_device_base = cuda_model_image_owned(model_map) ?
+                              cuda_model_image_ptr(model_map, 0) :
+                              (const char *)model_map;
+        g_model_device_owned = cuda_model_image_owned(model_map);
+        g_model_range_mapping_supported = 0;
+    }
+
     g_model_registered_size = model_size;
-    g_model_device_owned = cuda_model_image_owned(model_map);
-    g_model_range_mapping_supported = 0;
     g_model_cache_full = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
@@ -1509,6 +1518,10 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    if (g_ssd_streaming_mode) {
+        // Streaming mode: model kopyalanmaz, UMA'da direkt pointer kullanılır
+        return 1;
+    }
     return cuda_model_copy_chunked(model_map, model_size, map_offset, map_size);
 }
 
@@ -1530,6 +1543,13 @@ extern "C" int ds4_gpu_set_model_map_spans(
     }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
 
+    if (g_ssd_streaming_mode) {
+        // Streaming: sadece token embedding + non-routed weight'ler map edilir.
+        // Expert weight'leri map edilmez (expert cache yönetir).
+        // UMA'da direkt pointer yeterli, kopyalama gerekmez.
+        return 1;
+    }
+
     for (uint32_t i = 0; i < count; i++) {
         const uint64_t offset = offsets[i];
         const uint64_t size = sizes[i];
@@ -1543,6 +1563,7 @@ extern "C" int ds4_gpu_set_model_map_spans(
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
+    g_stream_model_fd = fd;
     g_model_file_size = 0;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);

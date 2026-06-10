@@ -18,6 +18,7 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     int ok = ds4_gpu_set_model_fd(fd);
     g_model_fd_host_base = model_map ? model_map : g_model_host_base;
+    g_stream_model_fd = fd;
     return ok;
 }
 
@@ -66,113 +67,6 @@ extern "C" int ds4_gpu_preload_q4_expert_tables(
     return 0;
 }
 
-extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
-    (void)enabled;
-}
-
-extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    (void)experts;
-}
-
-extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
-    return 0;
-}
-
-extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
-}
-
-extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return 0;
-}
-
-extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
-}
-
-extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        const int32_t *selected_ids,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    (void)model_map;
-    (void)model_size;
-    (void)layer;
-    (void)selected_ids;
-    (void)n_total_expert;
-    (void)n_selected;
-    (void)gate_offset;
-    (void)up_offset;
-    (void)down_offset;
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        const int32_t *selected_ids,
-        uint32_t n_total_expert,
-        uint32_t n_selected,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    return ds4_gpu_stream_expert_cache_seed_selected(
-            model_map, model_size, layer, selected_ids, n_total_expert,
-            n_selected, gate_offset, up_offset, down_offset,
-            gate_expert_bytes, down_expert_bytes);
-}
-
-extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
-        const void *model_map,
-        uint64_t model_size,
-        uint32_t layer,
-        const int32_t *expert_ids,
-        const uint32_t *expert_priorities,
-        uint32_t n_experts,
-        uint32_t n_total_expert,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    (void)model_map;
-    (void)model_size;
-    (void)layer;
-    (void)expert_ids;
-    (void)expert_priorities;
-    (void)n_experts;
-    (void)n_total_expert;
-    (void)gate_offset;
-    (void)up_offset;
-    (void)down_offset;
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_routed_moe_set_selected_override(
-        const int32_t *selected,
-        uint32_t n_selected) {
-    (void)selected;
-    (void)n_selected;
-    return 0;
-}
+// SSD streaming expert cache stubs removed — implemented in
+// ds4_rocm_stream_expert_cache.cuh (included from ds4_rocm.cu).
+// ds4_gpu_routed_moe_set_selected_override moved to ds4_rocm_moe_launch.cuh.

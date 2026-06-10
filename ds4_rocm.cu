@@ -86,6 +86,8 @@ typedef struct {
 
 #include "ds4_iq2_tables_cuda.inc"
 
+#include "rocm/ds4_rocm_stream_expert_cache.cuh"
+
 #include "rocm/ds4_rocm_runtime.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
