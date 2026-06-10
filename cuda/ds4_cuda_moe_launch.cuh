@@ -24,7 +24,8 @@ static int routed_moe_launch(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t layer_index) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -48,10 +49,57 @@ static int routed_moe_launch(
         down_bytes > model_size - down_offset) {
         return 0;
     }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
-    if (!gate_w || !up_w || !down_w) return 0;
+
+    // --- SSD Streaming: temp contiguous buffers from expert cache ---
+    void *stream_free_bufs[4] = {NULL};
+    int32_t *saved_selected = NULL;
+    const int streaming_active = g_ssd_streaming_mode &&
+        layer_index < DS4_CUDA_STREAM_EXPERT_CACHE_MAX_LAYER &&
+        g_routed_moe_selected_override_n >= n_expert;
+
+    const char *gate_w, *up_w, *down_w;
+    if (streaming_active) {
+        const uint64_t sg_bytes = (uint64_t)n_expert * gate_expert_bytes;
+        const uint64_t sd_bytes = (uint64_t)n_expert * down_expert_bytes;
+        char *sg = (char *)malloc(sg_bytes);
+        char *su = (char *)malloc(sg_bytes);
+        char *sdd = (char *)malloc(sd_bytes);
+        stream_free_bufs[0] = sg;
+        stream_free_bufs[1] = su;
+        stream_free_bufs[2] = sdd;
+        if (!sg || !su || !sdd) { free(sg); free(su); free(sdd); return 0; }
+
+        // Copy selected experts from cache into temp contiguous buffers
+        for (uint32_t i = 0; i < n_expert; i++) {
+            const int32_t eid = g_routed_moe_selected_override[i];
+            if (eid < 0 || (uint32_t)eid >= DS4_CUDA_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+            StreamExpertEntry *entry = &g_stream_expert_cache[layer_index][(uint32_t)eid];
+            if (!entry->valid) continue;
+            memcpy(sg + i * gate_expert_bytes, entry->gate_ptr, (size_t)gate_expert_bytes);
+            memcpy(su + i * gate_expert_bytes, entry->up_ptr, (size_t)gate_expert_bytes);
+            memcpy(sdd + i * down_expert_bytes, entry->down_ptr, (size_t)down_expert_bytes);
+        }
+
+        // Save and rewrite selected tensor with local indices [0..n_expert-1]
+        const uint64_t sel_bytes = (uint64_t)n_tokens * n_expert * sizeof(int32_t);
+        saved_selected = (int32_t *)malloc(sel_bytes);
+        stream_free_bufs[3] = saved_selected;
+        if (saved_selected) {
+            memcpy(saved_selected, selected->ptr, sel_bytes);
+            int32_t *selp = (int32_t *)selected->ptr;
+            for (uint64_t j = 0; j < (uint64_t)n_tokens * n_expert; j++)
+                selp[j] = (int32_t)(j % n_expert);
+        }
+
+        gate_w = sg;
+        up_w = su;
+        down_w = sdd;
+    } else {
+        gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+        up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+        down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+        if (!gate_w || !up_w || !down_w) return 0;
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -626,6 +674,10 @@ static int routed_moe_launch(
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
         }
+        if (streaming_active) {
+            if (saved_selected) memcpy(selected->ptr, saved_selected, (uint64_t)n_tokens * n_expert * sizeof(int32_t));
+            for (int i = 0; i < 4; i++) free(stream_free_bufs[i]);
+        }
         return ok;
     }
 
@@ -667,6 +719,10 @@ static int routed_moe_launch(
         moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
+    if (streaming_active) {
+        if (saved_selected) memcpy(selected->ptr, saved_selected, (uint64_t)n_tokens * n_expert * sizeof(int32_t));
+        for (int i = 0; i < 4; i++) free(stream_free_bufs[i]);
+    }
     return ok;
 }
 
@@ -680,17 +736,15 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected,
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
-    (void)layer_index;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, 1);
+                             selected, weights, n_total_expert, n_expert, clamp, x, 1, layer_index);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    (void)layer_index;
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -698,5 +752,5 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens, layer_index);
 }
