@@ -499,11 +499,11 @@ static void stream_expert_cache_prune_layer(
 
         if (e->valid) {
             // Protected mı?
-            uint8_t protected = 0;
+            uint8_t is_protected = 0;
             for (uint32_t p = 0; p < n_protect; p++) {
-                if (protect_ids[p] == (int32_t)expert) { protected = 1; break; }
+                if (protect_ids[p] == (int32_t)expert) { is_protected = 1; break; }
             }
-            if (!protected) {
+            if (!is_protected) {
                 slab_free_entry(e);
                 g_stream_expert_cache_evictions++;
                 evict--;
@@ -536,13 +536,13 @@ static void stream_expert_cache_prune_global(
                 if (!entry->valid) continue;
 
                 // Protected mı?
-                uint8_t protected = 0;
+                uint8_t is_protected = 0;
                 if (l == protect_layer) {
                     for (uint32_t p = 0; p < n_protect; p++) {
-                        if (protect_ids[p] == (int32_t)ex) { protected = 1; break; }
+                        if (protect_ids[p] == (int32_t)ex) { is_protected = 1; break; }
                     }
                 }
-                if (protected) continue;
+                if (is_protected) continue;
 
                 if (entry->last_used < min_clock) {
                     min_clock = entry->last_used;
