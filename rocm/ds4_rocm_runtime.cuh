@@ -1012,11 +1012,32 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
+    uint64_t gb = 0;
+    const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env) gb = (uint64_t)v;
+        return gb * 1073741824ull;
+    }
     return UINT64_MAX;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t bytes = 1792ull * 1048576ull;
+    uint64_t mb = 1792;
+    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0) mb = (uint64_t)v;
+    }
+    if (mb < 256) mb = 256;
+    if (mb > 8192) mb = 8192;
+    uint64_t bytes = mb * 1048576ull;
+    if (need > bytes / 2u) {
+        const uint64_t align = 64ull * 1048576ull;
+        return (need + align - 1u) & ~(align - 1u);
+    }
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
