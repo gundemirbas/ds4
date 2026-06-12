@@ -10185,6 +10185,17 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 
 enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
 
+/* Opp C Phase 1A FP8 KV constants.  The packed row format uses 1-byte E4M3
+ * codes for the non-rotary part of the head (DS4_OPP_C_FP8_NOPE elements)
+ * followed by the still-FP32 rotary tail (DS4_N_ROT elements).  Per-64-lane
+ * block scales are FP32.  These constants are hard-coded to Flash dimensions
+ * (512-64) because the device-side packed-row macros are not generic. */
+#define DS4_OPP_C_FP8_NOPE        ((uint32_t)(DS4_N_HEAD_DIM - DS4_N_ROT))   /* 448 */
+#define DS4_OPP_C_FP8_BLOCKS      (DS4_OPP_C_FP8_NOPE / 64u)                 /* 7   */
+#define DS4_OPP_C_FP8_ROW_BYTES   ((uint64_t)DS4_OPP_C_FP8_NOPE             \
+                                   + (uint64_t)DS4_N_ROT * sizeof(float))    /* 704 */
+#define DS4_OPP_C_FP8_SCALE_BYTES ((uint64_t)DS4_OPP_C_FP8_BLOCKS * sizeof(float)) /* 28 */
+
 typedef struct {
     /* One-token decode tensors.  These stay allocated for the life of a
      * session; a generated token enters as an embedding in cur_hc and leaves as
@@ -10211,6 +10222,14 @@ typedef struct {
      * the row counters whenever a checkpoint is saved or partially rewound. */
     ds4_gpu_tensor *layer_raw_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_MAX_LAYER];
+    /* Opp C Phase 1A: packed FP8 mirror of the attention-compressed cache.
+     * layer_comp_cache_fp8 holds, per compressed row, DS4_OPP_C_FP8_NOPE
+     * 1-byte E4M3 codes followed by a still-FP32 rotary tail;
+     * layer_comp_scale holds the DS4_OPP_C_FP8_BLOCKS per-64-lane FP32
+     * block scales.  Both are allocated only when DS4_CUDA_FP8_KV is
+     * enabled and are NULL otherwise. */
+    ds4_gpu_tensor *layer_comp_cache_fp8[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_comp_scale[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
@@ -10516,6 +10535,12 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_index_state_score[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_comp_cache_fp8[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_comp_scale[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->spec_attn_state_kv[il]);
@@ -10930,6 +10955,7 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
+    const bool fp8_kv = ds4_cuda_fp8_kv_enabled() != 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
@@ -10958,6 +10984,16 @@ static bool metal_graph_alloc_raw_cap(
             if (g->layer_attn_state_score[il]) {
                 state_init_ok = state_init_ok &&
                                 metal_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows);
+            }
+
+            /* Opp C Phase 1A: allocate FP8 KV mirror buffers when enabled. */
+            if (fp8_kv) {
+                g->layer_comp_cache_fp8[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_ROW_BYTES);
+                g->layer_comp_scale[il] = metal_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] * DS4_OPP_C_FP8_SCALE_BYTES);
             }
 
             if (ratio == 4) {
@@ -14310,6 +14346,15 @@ static bool metal_graph_encode_decode_layer(
                 if (ok) {
                     metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
                 }
+                /* Opp C Phase 1A: also write the packed FP8 mirror. */
+                if (ok && g->layer_comp_cache_fp8[il] && g->layer_comp_scale[il]) {
+                    ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
+                            comp_row_view,
+                            DS4_N_HEAD_DIM, DS4_N_ROT,
+                            il,
+                            g->layer_comp_cache_fp8[il],
+                            g->layer_comp_scale[il]) != 0;
+                }
                 ds4_gpu_tensor_free(comp_row_view);
             }
             if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
@@ -14571,8 +14616,8 @@ static bool metal_graph_encode_decode_layer(
                                                          NULL,
                                                          0,
                                                          DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                                         NULL, /* comp_fp8 */
-                                                         NULL) /* comp_scale */ != 0;
+                                                         n_comp ? g->layer_comp_cache_fp8[il] : NULL, /* comp_fp8 */
+                                                         n_comp ? g->layer_comp_scale[il]    : NULL) /* comp_scale */ != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
@@ -17131,6 +17176,15 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           il,
                                                           pos);
                         }
+                        /* Opp C Phase 1A: also write the packed FP8 mirror. */
+                        if (ok && g->layer_comp_cache_fp8[il] && g->layer_comp_scale[il]) {
+                            ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
+                                    comp_row_view,
+                                    DS4_N_HEAD_DIM, DS4_N_ROT,
+                                    il,
+                                    g->layer_comp_cache_fp8[il],
+                                    g->layer_comp_scale[il]) != 0;
+                        }
                         ds4_gpu_tensor_free(comp_row_view);
                         if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
                     }
@@ -17794,8 +17848,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  n_selected,
                                                                  DS4_N_HEAD,
                                                                  DS4_N_HEAD_DIM,
-                                                                 NULL, /* comp_fp8 */
-                                                                 NULL) /* comp_scale */ != 0;
+                                                                 cur_comp ? g->layer_comp_cache_fp8[il] : NULL, /* comp_fp8 */
+                                                                 cur_comp ? g->layer_comp_scale[il]    : NULL) /* comp_scale */ != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);

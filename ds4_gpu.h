@@ -106,6 +106,9 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         uint64_t       down_expert_bytes);
 void ds4_gpu_print_memory_report(const char *label);
 
+/* Returns 1 if DS4_CUDA_FP8_KV is set to a truthy value (default OFF). */
+int  ds4_cuda_fp8_kv_enabled(void);
+
 /* =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================
