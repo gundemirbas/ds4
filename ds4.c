@@ -14570,7 +14570,9 @@ static bool metal_graph_encode_decode_layer(
                                                          n_comp,
                                                          NULL,
                                                          0,
-                                                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                                                         DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                         NULL, /* comp_fp8 */
+                                                         NULL) /* comp_scale */ != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
@@ -17791,7 +17793,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  comp_mask,
                                                                  n_selected,
                                                                  DS4_N_HEAD,
-                                                                 DS4_N_HEAD_DIM) != 0;
+                                                                 DS4_N_HEAD_DIM,
+                                                                 NULL, /* comp_fp8 */
+                                                                 NULL) /* comp_scale */ != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);

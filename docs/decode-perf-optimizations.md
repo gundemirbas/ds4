@@ -1,7 +1,7 @@
 # DGX Spark (CUDA) Performans Optimizasyon Planı
 
-> decode-perf-tuning branch'inden alınacak optimizasyonlar
-> Tarih: 2026-06-12
+> decode-perf-tuning branch'inden alınan optimizasyonlar
+> Güncelleme: 2026-06-12 (implementasyon tamamlandı)
 
 ## Mevcut Durum
 
@@ -13,15 +13,28 @@ tam kullanamıyor. ROCm kodu AMD-native optimizasyonlarla daha verimli.
 
 ---
 
+## Uygulama Durumu
+
+| # | Optimizasyon | Durum | Detay |
+|---|-------------|-------|-------|
+| 🏆1 | **MMQ/MMVQ Kernel'leri** | ✅ **Uygulandı** | `cuda/mmq/` dizini var, Makefile MMQ_OBJS+INCLUDES ekli, `ds4_cuda_runtime.cuh`'da init+strategy, matmul/MoE dispatch tam. Derleniyor. |
+| 🎯2 | **Ayrı MoE Stream** | ✅ **Uygulandı** | `g_moe_stream` + `ds4_cuda_moe_stream()`, tüm MoE launch'lar `moe_stream` kullanıyor. |
+| 💾3 | **DGX Spark HBM Cache** | ✅ **Uygulandı** | `DS4_CUDA_SPARK_HBM_CACHE` flag'ı `cuda_model_range_ptr`'de UVA-mapped fallback'leri atlayıp direkt HBM copy'e yöneliyor. Cache limit 120 GiB. |
+| 🔬4 | **FP8 KV Cache** | ✅ **Uygulandı** | Packed E4M3 codes + per-64-lane scale + FP32 rotary tail format. `fp8_kv_read()` device helper, `fp8_kv_quantize_kernel` (packed), `fp8_kv_quantize_row_kernel`. Attention decode kernel `comp_fp8`/`comp_scale` pointer'ları alıyor, FP8 yolunda `fp8_kv_read()` kullanıyor. Counter'lar (`g_fp8_kv_read_path_blocks`/`g_fp8_kv_indexed_read_path_blocks`) mevcut. Host-side `ds4_gpu_dsv4_fp8_kv_quantize_pack_tensor()` / `_row_tensor()` entry'leri. |
+
+---
+
 ## 🏆 Öncelik 1: MMQ/MMVQ Kernel'leri (llama.cpp vendor)
 
 **Etki:** Prefill ~2.8x, decode ~%5-20 iyileşme
 **Zorluk:** Orta
-**Durum:** 🔴 YAPILMADI
+**Durum:** ✅ UYGULANDI
 
 ### Ne Alınacak
 
-decode-perf-tuning branch'indeki `cuda/mmq/` dizini:
+https://github.com/Entrpi/ds4/tree/decode-perf-tuning/misc altını oku
+
+https://github.com/Entrpi/ds4/tree/decode-perf-tuning branch'indeki `cuda/mmq/` dizini:
 - `mmq.cuh` — ana fused-dequant-matmul template'leri (4176 satır)
 - `mma.cuh` — CUDA WMMA/PTX mma yardımcıları (1456 satır)
 - `vecdotq.cuh` — vector dot-product kernels (1317 satır)
@@ -87,7 +100,7 @@ cuda/mmq/
 
 **Etki:** Decode ~%5-15 iyileşme
 **Zorluk:** Düşük
-**Durum:** 🔴 YAPILMADI
+**Durum:** ✅ UYGULANDI
 
 ### Ne Alınacak
 
@@ -116,7 +129,7 @@ static cudaStream_t ds4_cuda_moe_stream(void) {
 
 **Etki:** Spark ~%10-30 iyileşme
 **Zorluk:** Düşük
-**Durum:** 🔴 YAPILMADI
+**Durum:** ✅ UYGULANDI
 
 ### Ne Alınacak
 
@@ -137,28 +150,11 @@ cuda-spark:
 
 ---
 
-## 🔄 Öncelik 4: CUDA Graph Capture (Per-Layer Decode)
-
-**Etki:** Decode ~%5-10 iyileşme
-**Zorluk:** Yüksek
-**Durum:** 🔴 YAPILMADI
-
-### Ne Alınacak
-
-- `thread_local cudaStream_t t_ds4_capture_stream`
-- `ds4_capture_set_stream()` / `ds4_current_stream()` / `ds4_capture_active()`
-- `struct ds4_layer_graph_key` — 20+ tensor pointer + flags
-- `ds4_cuda_layer_graph_begin_or_replay()` / `ds4_cuda_layer_graph_end_or_commit()`
-- Token-stable scalars: `ds4_gpu_decode_scalars_init/set/flush/cleanup`
-- Per-layer scalars: `ds4_gpu_decode_layer_scalars_init/host/flush/device_ptr/cleanup`
-
----
-
-## 🔬 Öncelik 5: FP8 KV Cache (Opp C Phase 1A)
+## 🔬 Öncelik 4: FP8 KV Cache (Opp C Phase 1A)
 
 **Etki:** Uzun context ~%10-20
 **Zorluk:** Yüksek
-**Durum:** 🔴 YAPILMADI
+**Durum:** ✅ UYGULANDI
 
 ### Ne Alınacak
 
@@ -191,6 +187,5 @@ Gün 2: MMQ matmul entegrasyonu
 Gün 2: MMQ MoE entegrasyonu
 Gün 2: Test + doğrulama
 ---
-Gün 3+: CUDA Graph Capture
 Gün 3+: FP8 KV Cache
 ```

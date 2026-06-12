@@ -328,10 +328,20 @@ __global__ static void attention_decode_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        /* Opp C Phase 1A.3: optional packed FP8 mirror of compressed rows.
+         * When both pointers are non-NULL the kernel reads compressed lanes
+         * via fp8_kv_read() instead of comp_kv.  NULL when DS4_CUDA_FP8_KV
+         * is off. */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
+    if (use_fp8 && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
+    }
     const bool single_all = (n_tokens == 1u && ratio == 0u);
     uint32_t qpos = pos0 + t;
     uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
@@ -387,9 +397,13 @@ __global__ static void attention_decode_mixed_kernel(
             float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
             float s = -INFINITY;
             if (add > -1.0e20f) {
-                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                if (use_fp8) {
+                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, c, d);
+                } else {
+                    const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                }
                 s = dot * scale + add;
             }
             scores[raw_count + c] = s;
@@ -403,17 +417,30 @@ __global__ static void attention_decode_mixed_kernel(
             if (row < n_score) {
                 float add = 0.0f;
                 const float *kvrow = NULL;
+                bool fp8_row = false;
+                uint32_t fp8_c = 0u;
                 if (row < raw_count) {
                     kvrow = raw_kv + (uint64_t)raw_rows[row] * head_dim;
                 } else {
                     uint32_t c = row - raw_count;
                     add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
-                    if (add > -1.0e20f) kvrow = comp_kv + (uint64_t)c * head_dim;
+                    if (add > -1.0e20f) {
+                        if (use_fp8) {
+                            fp8_row = true;
+                            fp8_c = c;
+                        } else {
+                            kvrow = comp_kv + (uint64_t)c * head_dim;
+                        }
+                    }
                 }
                 float s = -INFINITY;
-                if (kvrow) {
+                if (kvrow || fp8_row) {
                     float dot = 0.0f;
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    if (fp8_row) {
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * fp8_kv_read(comp_fp8, comp_scale, fp8_c, d);
+                    } else {
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    }
                     const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -461,11 +488,19 @@ __global__ static void attention_decode_mixed_kernel(
             acc0 += kv[d0] * s;
             acc1 += kv[d1] * s;
         }
-        for (uint32_t c = 0; c < visible_comp; c++) {
-            float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+        if (use_fp8) {
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                float s = scores[raw_count + c];
+                acc0 += fp8_kv_read(comp_fp8, comp_scale, c, d0) * s;
+                acc1 += fp8_kv_read(comp_fp8, comp_scale, c, d1) * s;
+            }
+        } else {
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                float s = scores[raw_count + c];
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                acc0 += kv[d0] * s;
+                acc1 += kv[d1] * s;
+            }
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -473,7 +508,11 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+            if (use_fp8) {
+                for (uint32_t c = 0; c < visible_comp; c++) acc += fp8_kv_read(comp_fp8, comp_scale, c, d) * scores[raw_count + c];
+            } else {
+                for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+            }
             oh[d] = acc / denom;
         }
     }

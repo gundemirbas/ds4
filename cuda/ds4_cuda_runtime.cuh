@@ -326,6 +326,12 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
+#ifdef DS4_CUDA_SPARK_HBM_CACHE
+    /* On DGX Spark, skip UVA-mapped fallbacks and go straight to device-local
+     * HBM copy.  Direct HBM reads avoid page-table walk overhead and are
+     * measurably faster on plain decode. */
+    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+#else
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
@@ -335,6 +341,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (mapped) return mapped;
 
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
+#endif
 }
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
@@ -974,12 +981,18 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         if (end != env) gb = (uint64_t)v;
         return gb * 1073741824ull;
     }
+#ifdef DS4_CUDA_SPARK_HBM_CACHE
+    /* DGX Spark has 128 GiB HBM.  Allow the full model cache to use most of it
+     * since UVA-mapped fallbacks are skipped in favor of device-local copies. */
+    return 120ull * 1073741824ull;
+#else
     /* One Spark can run the IQ2 model (~81 GiB) and the mixed q2/q4 model
      * (~91 GiB) via the old startup tensor cache.  Keep enough headroom for
      * scratch, KV, and optional Q8->F16 buffers, and make the full-Q4 model
      * use distributed layer loading unless the operator opts into a larger
      * cache budget explicitly. */
     return 96ull * 1073741824ull;
+#endif
 }
 
 static uint64_t cuda_model_local_model_limit_bytes(void) {
@@ -1431,6 +1444,16 @@ extern "C" int ds4_gpu_init(void) {
     return 1;
 }
 
+/* Forward declarations for FP8 KV functions defined in ds4_cuda.cu / ds4_cuda_fp8_kv.cuh
+ * (after ds4_cuda_runtime.cuh is included).  These are needed because
+ * ds4_gpu_cleanup() calls them before their definitions. */
+extern "C" int      ds4_cuda_fp8_kv_enabled(void);
+extern "C" int      ds4_cuda_fp8_kv_debug_enabled(void);
+extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
+extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void);
+extern "C" void ds4_gpu_decode_scalars_cleanup(void);
+extern "C" void ds4_gpu_decode_layer_scalars_cleanup(void);
+
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     if (g_cublas_ready) {
@@ -1502,6 +1525,17 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
     }
+    /* Opp C Phase 1A tripwire: print FP8 KV read-path block counts. */
+    if (ds4_cuda_fp8_kv_enabled() && ds4_cuda_fp8_kv_debug_enabled()) {
+        const unsigned long long dense   = ds4_cuda_fp8_kv_read_path_blocks();
+        const unsigned long long indexed = ds4_cuda_fp8_kv_indexed_read_path_blocks();
+        fprintf(stderr, "ds4: DS4_CUDA_FP8_KV path stats -- dense decode blocks: %llu, indexed decode blocks: %llu\n",
+                dense, indexed);
+    }
+    /* Cleanup token-stable decode scalars. */
+    ds4_gpu_decode_scalars_cleanup();
+    /* Cleanup per-layer scalars substrate. */
+    ds4_gpu_decode_layer_scalars_cleanup();
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -1890,9 +1924,6 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
  * Return 0 = disabled/unavailable; callers proceed eagerly.
  * ------------------------------------------------------------------ */
 int ds4_cuda_layer_graphs_enabled(void) {
-    return 0;
-}
-int ds4_cuda_fp8_kv_enabled(void) {
     return 0;
 }
 

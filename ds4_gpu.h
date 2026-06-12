@@ -571,7 +571,9 @@ int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
-        uint32_t                head_dim);
+        uint32_t                head_dim,
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,

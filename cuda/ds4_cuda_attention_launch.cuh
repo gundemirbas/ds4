@@ -14,7 +14,11 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
-        uint32_t                head_dim) {
+        uint32_t                head_dim,
+        /* Opp C Phase 1A.3: optional packed FP8 mirror of compressed rows.
+         * Pass NULL/NULL when DS4_CUDA_FP8_KV is off; kernel falls back to comp_kv. */
+        const ds4_gpu_tensor *comp_fp8,
+        const ds4_gpu_tensor *comp_scale) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
@@ -30,6 +34,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* FP8 mirror pointers (NULL when disabled). */
+    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
+    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -63,7 +70,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
-                                                 0, 0, n_head, head_dim);
+                                                 0, 0, n_head, head_dim,
+                                                 fp8_codes,
+                                                 fp8_sc);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
@@ -256,7 +265,9 @@ static int attention_decode_batch_launch(
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
-                                                 raw_start, n_comp, window, ratio, n_head, head_dim);
+                                                 raw_start, n_comp, window, ratio, n_head, head_dim,
+                                                 NULL, /* comp_fp8 */
+                                                 NULL); /* comp_scale */
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
