@@ -1358,10 +1358,11 @@ static ds4_q8_strategy ds4_cuda_q8_strategy(void) {
         reason = "DS4_CUDA_USE_MMQ=0 (legacy override)";
     }
 
-    /* Default: mmq. Validated fastest on both sm_120 and sm_121. */
+    /* Default: cuBLAS. MMQ has a bug on sm_121 (GB10) with IQ2_XXS pair_vec
+     * MoE path causing segfaults. Use cuBLAS until the MMQ issue is fixed. */
     if (chosen == DS4_Q8_STRATEGY_UNKNOWN) {
-        chosen = DS4_Q8_STRATEGY_MMQ;
-        reason = "default";
+        chosen = DS4_Q8_STRATEGY_CUBLAS;
+        reason = "default (cuBLAS, MMQ disabled pending sm_121 fix)";
     }
 
     cudaDeviceProp props;
