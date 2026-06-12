@@ -19,6 +19,37 @@ static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
 
+/* ------------------------------------------------------------------
+ * MMQ (vendored llama.cpp fused-dequant-matmul) state.
+ * ------------------------------------------------------------------ */
+static int g_ds4_use_mmq_init = 0;
+static int g_ds4_use_mmq = 0;
+
+/* Q8_0 dense matmul strategy selection.
+ *   mmq    - vendored llama.cpp fused-dequant-matmul (fastest on Blackwell)
+ *   cublas - Q8 -> FP16 expansion cache + cublasGemmEx
+ *   warp8  - Native matmul_q8_0_preq_*_kernel family (last-resort)
+ * Auto-selected: mmq > cublas > warp8 (with fallback chain). */
+typedef enum {
+    DS4_Q8_STRATEGY_UNKNOWN = 0,
+    DS4_Q8_STRATEGY_MMQ,
+    DS4_Q8_STRATEGY_CUBLAS,
+    DS4_Q8_STRATEGY_WARP8,
+} ds4_q8_strategy;
+
+static ds4_q8_strategy g_q8_strategy = DS4_Q8_STRATEGY_UNKNOWN;
+
+/* ------------------------------------------------------------------
+ * MoE stream for async expert computation.
+ * ------------------------------------------------------------------ */
+static cudaStream_t g_moe_stream = NULL;
+
+/* ------------------------------------------------------------------
+ * Thread-local capture stream override (CUDA Graphs).
+ * Default (0) = implicit default stream; preserves pre-capture behavior.
+ * ------------------------------------------------------------------ */
+static thread_local cudaStream_t t_ds4_capture_stream = (cudaStream_t)0;
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -1244,13 +1275,149 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+/* ------------------------------------------------------------------
+ * Capture-stream helpers (CUDA Graphs / MMQ stream routing).
+ * ------------------------------------------------------------------ */
+static inline void ds4_capture_set_stream(cudaStream_t s) {
+    t_ds4_capture_stream = s;
+}
+
+static inline cudaStream_t ds4_current_stream(void) {
+    return t_ds4_capture_stream;
+}
+
+static inline int ds4_capture_active(void) {
+    return t_ds4_capture_stream != (cudaStream_t)0;
+}
+
+/* Stream selector for MMQ wrapper calls. Under capture, route through
+ * the active capture stream so kernels are recorded with proper deps.
+ * Outside capture, return 0 (default stream) for legacy behavior. */
+static inline cudaStream_t ds4_mmq_stream_for_call(void) {
+    return ds4_capture_active() ? ds4_current_stream() : (cudaStream_t)0;
+}
+
+/* ------------------------------------------------------------------
+ * MoE stream helpers.
+ * ------------------------------------------------------------------ */
+static cudaStream_t ds4_cuda_moe_stream(void) {
+    if (!g_moe_stream) {
+        cudaError_t ge = cudaStreamCreateWithFlags(&g_moe_stream,
+                                                     cudaStreamNonBlocking);
+        if (ge != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaStreamCreate (moe) failed: %s\n",
+                    cudaGetErrorString(ge));
+            return (cudaStream_t)0;
+        }
+    }
+    return g_moe_stream;
+}
+
+/* ------------------------------------------------------------------
+ * Q8_0 matmul strategy selection.
+ * ------------------------------------------------------------------ */
+static const char *ds4_q8_strategy_name(ds4_q8_strategy s) {
+    switch (s) {
+    case DS4_Q8_STRATEGY_MMQ:    return "mmq";
+    case DS4_Q8_STRATEGY_CUBLAS: return "cublas";
+    case DS4_Q8_STRATEGY_WARP8:  return "warp8";
+    default:                     return "unknown";
+    }
+}
+
+static int ds4_q8_env_value_is_off(const char *v) {
+    if (!v || !*v) return 0;
+    if (v[0] == '0' && v[1] == '\0') return 1;
+    if (!strcmp(v, "off")   || !strcmp(v, "OFF"))   return 1;
+    if (!strcmp(v, "no")    || !strcmp(v, "NO"))    return 1;
+    if (!strcmp(v, "false") || !strcmp(v, "FALSE")) return 1;
+    return 0;
+}
+
+static ds4_q8_strategy ds4_cuda_q8_strategy(void) {
+    if (g_q8_strategy != DS4_Q8_STRATEGY_UNKNOWN) return g_q8_strategy;
+
+    ds4_q8_strategy chosen = DS4_Q8_STRATEGY_UNKNOWN;
+    const char *reason = NULL;
+
+    const char *path = getenv("DS4_CUDA_PREFILL_PATH");
+    if (path && *path && strcmp(path, "auto") != 0 && strcmp(path, "AUTO") != 0) {
+        if (!strcmp(path, "mmq")    || !strcmp(path, "MMQ"))
+            { chosen = DS4_Q8_STRATEGY_MMQ;    reason = "DS4_CUDA_PREFILL_PATH=mmq"; }
+        else if (!strcmp(path, "cublas") || !strcmp(path, "CUBLAS"))
+            { chosen = DS4_Q8_STRATEGY_CUBLAS; reason = "DS4_CUDA_PREFILL_PATH=cublas"; }
+        else if (!strcmp(path, "warp8")  || !strcmp(path, "WARP8"))
+            { chosen = DS4_Q8_STRATEGY_WARP8;  reason = "DS4_CUDA_PREFILL_PATH=warp8"; }
+        else
+            fprintf(stderr, "ds4: ignoring unknown DS4_CUDA_PREFILL_PATH=%s\n", path);
+    }
+
+    if (chosen == DS4_Q8_STRATEGY_UNKNOWN &&
+        ds4_q8_env_value_is_off(getenv("DS4_CUDA_USE_MMQ"))) {
+        chosen = DS4_Q8_STRATEGY_CUBLAS;
+        reason = "DS4_CUDA_USE_MMQ=0 (legacy override)";
+    }
+
+    /* Default: mmq. Validated fastest on both sm_120 and sm_121. */
+    if (chosen == DS4_Q8_STRATEGY_UNKNOWN) {
+        chosen = DS4_Q8_STRATEGY_MMQ;
+        reason = "default";
+    }
+
+    cudaDeviceProp props;
+    if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Q8_0 dispatch: %s (sm_%d%d) [%s]\n",
+                ds4_q8_strategy_name(chosen),
+                props.major, props.minor, reason);
+    } else {
+        fprintf(stderr, "ds4: CUDA Q8_0 dispatch: %s [%s]\n",
+                ds4_q8_strategy_name(chosen), reason);
+    }
+
+    g_q8_strategy = chosen;
+    return chosen;
+}
+
+/* Forward declaration: ds4_mmq_init is defined in cuda/mmq/ds4_mmq.cu
+ * and declared in cuda/mmq/ds4_mmq.h (extern "C").  We repeat the
+ * declaration here because this .cuh is included before ds4_mmq.h. */
+#ifdef __cplusplus
+extern "C" int ds4_mmq_init(int device);
+#endif
+
+static int ds4_cuda_use_mmq(void) {
+    if (ds4_cuda_q8_strategy() != DS4_Q8_STRATEGY_MMQ) return 0;
+    if (!g_ds4_use_mmq_init) {
+        g_ds4_use_mmq_init = 1;
+        int rc = ds4_mmq_init(0);
+        if (rc == 0) {
+            g_ds4_use_mmq = 1;
+        } else {
+            fprintf(stderr, "ds4: ds4_mmq_init failed (%d); downgrading to cublas\n", rc);
+            g_q8_strategy = DS4_Q8_STRATEGY_CUBLAS;
+        }
+    }
+    return g_ds4_use_mmq;
+}
+
+static int ds4_cuda_use_cublas_q8(void) {
+    return ds4_cuda_q8_strategy() == DS4_Q8_STRATEGY_CUBLAS;
+}
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
-                prop.name, prop.major, prop.minor);
+        int mem_clock_khz = 0, bus_width_bits = 0;
+        (void)cudaDeviceGetAttribute(&mem_clock_khz,  cudaDevAttrMemoryClockRate, dev);
+        (void)cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, dev);
+        const double bw_gbps = (mem_clock_khz > 0 && bus_width_bits > 0)
+            ? 2.0 * (double)mem_clock_khz * (double)bus_width_bits / 8.0 / 1.0e6
+            : 0.0;
+        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d, %.0f GB/s)\n",
+                prop.name, prop.major, prop.minor, bw_gbps);
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
@@ -1271,6 +1438,13 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas_ready = 0;
         g_cublas = NULL;
     }
+    if (g_moe_stream) {
+        (void)cudaStreamDestroy(g_moe_stream);
+        g_moe_stream = NULL;
+    }
+    g_ds4_use_mmq = 0;
+    g_ds4_use_mmq_init = 0;
+    g_q8_strategy = DS4_Q8_STRATEGY_UNKNOWN;
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -1709,6 +1883,17 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
+}
+
+/* ------------------------------------------------------------------
+ * CUDA Graph capture stubs (not yet implemented).
+ * Return 0 = disabled/unavailable; callers proceed eagerly.
+ * ------------------------------------------------------------------ */
+int ds4_cuda_layer_graphs_enabled(void) {
+    return 0;
+}
+int ds4_cuda_fp8_kv_enabled(void) {
+    return 0;
 }
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {

@@ -1851,6 +1851,34 @@ __global__ static void moe_down_sorted_p2_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+/* SwiGLU + clamp + router-weight kernel for MMQ/MMVQ MoE path.
+ * Applies V4 clamp to gate/up BEFORE silu, then computes silu(gate)*up*weight. */
+__global__ static void moe_swiglu_weighted_clamp_kernel(
+        float *mid_out,
+        const float *gate_buf, const float *up_buf,
+        const float *weights,
+        uint32_t expert_mid_dim,
+        uint32_t n_tokens,
+        uint32_t n_expert_used,
+        float clamp) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * n_expert_used * expert_mid_dim;
+    if (gid >= n) return;
+    uint64_t slot_pair = gid / expert_mid_dim;
+    uint32_t tok = (uint32_t)(slot_pair / n_expert_used);
+    uint32_t slot = (uint32_t)(slot_pair - (uint64_t)tok * n_expert_used);
+    float g = gate_buf[gid];
+    float u = up_buf[gid];
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    const float w = weights[(uint64_t)tok * n_expert_used + slot];
+    const float s = g / (1.0f + expf(-g));
+    mid_out[gid] = s * u * w;
+}
+
 __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;

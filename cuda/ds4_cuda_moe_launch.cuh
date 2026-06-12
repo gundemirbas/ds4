@@ -53,6 +53,146 @@ static int routed_moe_launch(
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
+    /* ---- MMQ/MMVQ fused-dequant-matmul MoE path ---- */
+    if (ds4_cuda_use_mmq() && (expert_in_dim % 256u == 0) &&
+        getenv("DS4_CUDA_NO_MMQ_MOE") == NULL) {
+        const uint32_t n_experts_total = n_total_expert;
+        const uint32_t n_expert_used   = n_expert;
+        const uint64_t n_assignments   = (uint64_t)n_tokens * n_expert_used;
+        cudaStream_t moe_stream = ds4_cuda_moe_stream();
+
+        if (n_tokens == 1u && getenv("DS4_CUDA_NO_MMVQ_DECODE") == NULL &&
+            n_assignments <= 8u) {
+            /* ---- MMVQ decode path (n_tokens=1, vec-optimized) ---- */
+            int rc = -1;
+            if (q4k_path) {
+                rc = ds4_mmq_q4_K_moe_vec(gate_w, (const float *)x->ptr,
+                    (const int32_t *)selected->ptr, (float *)gate->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim,
+                    (int)n_tokens, (int)n_experts_total,
+                    (int)n_expert_used, moe_stream);
+                if (rc == 0)
+                    rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
+                        (const int32_t *)selected->ptr, (float *)up->ptr,
+                        (int)expert_mid_dim, (int)expert_in_dim,
+                        (int)n_tokens, (int)n_experts_total,
+                        (int)n_expert_used, moe_stream);
+            } else {
+                rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
+                    (const int32_t *)selected->ptr, (float *)gate->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim,
+                    (int)n_tokens, (int)n_experts_total,
+                    (int)n_expert_used, moe_stream);
+                if (rc == 0)
+                    rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
+                        (const int32_t *)selected->ptr, (float *)up->ptr,
+                        (int)expert_mid_dim, (int)expert_in_dim,
+                        (int)n_tokens, (int)n_experts_total,
+                        (int)n_expert_used, moe_stream);
+            }
+            if (rc == 0) {
+                /* SwiGLU + clamp via existing kernel */
+                moe_swiglu_weighted_clamp_kernel<<<
+                    (uint32_t)((n_assignments * expert_mid_dim + 255) / 256), 256>>>(
+                    (float *)mid->ptr,
+                    (const float *)gate->ptr, (const float *)up->ptr,
+                    (const float *)weights->ptr,
+                    expert_mid_dim, n_tokens, n_expert_used, clamp);
+                if (!cuda_ok(cudaGetLastError(), "mmvq moe swiglu launch"))
+                    goto moe_fallback;
+
+                /* Down matmul */
+                if (q4k_path) {
+                    rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
+                        (const int32_t *)selected->ptr, (float *)down->ptr,
+                        (int)out_dim, (int)expert_mid_dim,
+                        (int)n_assignments, (int)n_experts_total,
+                        /*n_expert_used=*/1, moe_stream);
+                } else {
+                    rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
+                        (const int32_t *)selected->ptr, (float *)down->ptr,
+                        (int)out_dim, (int)expert_mid_dim,
+                        (int)n_assignments, (int)n_experts_total,
+                        /*n_expert_used=*/1, moe_stream);
+                }
+                if (rc == 0) {
+                    /* Sum across n_expert_used */
+                    uint64_t n = (uint64_t)n_tokens * out_dim;
+                    moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+                        (float *)out->ptr, (const float *)down->ptr,
+                        out_dim, n_expert_used, n_tokens);
+                    if (cuda_ok(cudaGetLastError(), "mmvq moe sum launch"))
+                        return 1;
+                }
+            }
+        } else {
+            /* ---- MMQ prefill path (n_tokens > 1, tile-optimized) ---- */
+            int rc = -1;
+            if (q4k_path) {
+                rc = ds4_mmq_q4_K_moe(gate_w, (const float *)x->ptr,
+                    (const int32_t *)selected->ptr, (float *)gate->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim,
+                    (int)n_tokens, (int)n_experts_total,
+                    (int)n_expert_used, moe_stream);
+                if (rc == 0)
+                    rc = ds4_mmq_q4_K_moe(up_w, (const float *)x->ptr,
+                        (const int32_t *)selected->ptr, (float *)up->ptr,
+                        (int)expert_mid_dim, (int)expert_in_dim,
+                        (int)n_tokens, (int)n_experts_total,
+                        (int)n_expert_used, moe_stream);
+            } else {
+                rc = ds4_mmq_iq2_xxs_moe(gate_w, (const float *)x->ptr,
+                    (const int32_t *)selected->ptr, (float *)gate->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim,
+                    (int)n_tokens, (int)n_experts_total,
+                    (int)n_expert_used, moe_stream);
+                if (rc == 0)
+                    rc = ds4_mmq_iq2_xxs_moe(up_w, (const float *)x->ptr,
+                        (const int32_t *)selected->ptr, (float *)up->ptr,
+                        (int)expert_mid_dim, (int)expert_in_dim,
+                        (int)n_tokens, (int)n_experts_total,
+                        (int)n_expert_used, moe_stream);
+            }
+            if (rc == 0) {
+                /* SwiGLU + clamp */
+                moe_swiglu_weighted_clamp_kernel<<<
+                    (uint32_t)((n_assignments * expert_mid_dim + 255) / 256), 256>>>(
+                    (float *)mid->ptr,
+                    (const float *)gate->ptr, (const float *)up->ptr,
+                    (const float *)weights->ptr,
+                    expert_mid_dim, n_tokens, n_expert_used, clamp);
+                if (!cuda_ok(cudaGetLastError(), "mmq moe swiglu launch"))
+                    goto moe_fallback;
+
+                /* Down matmul */
+                if (q4k_path) {
+                    rc = ds4_mmq_q4_K_moe(down_w, (const float *)mid->ptr,
+                        (const int32_t *)selected->ptr, (float *)down->ptr,
+                        (int)out_dim, (int)expert_mid_dim,
+                        (int)n_assignments, (int)n_experts_total,
+                        /*n_expert_used=*/1, moe_stream);
+                } else {
+                    rc = ds4_mmq_q2_K_moe(down_w, (const float *)mid->ptr,
+                        (const int32_t *)selected->ptr, (float *)down->ptr,
+                        (int)out_dim, (int)expert_mid_dim,
+                        (int)n_assignments, (int)n_experts_total,
+                        /*n_expert_used=*/1, moe_stream);
+                }
+                if (rc == 0) {
+                    /* Sum across n_expert_used */
+                    uint64_t n = (uint64_t)n_tokens * out_dim;
+                    moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+                        (float *)out->ptr, (const float *)down->ptr,
+                        out_dim, n_expert_used, n_tokens);
+                    if (cuda_ok(cudaGetLastError(), "mmq moe sum launch"))
+                        return 1;
+                }
+            }
+        }
+        /* Fall through to legacy paths if mmq returned non-zero */
+    }
+moe_fallback:
+
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;

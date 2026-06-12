@@ -11,6 +11,10 @@
 #include "ds4_iq2_tables_cuda.inc"
 #include "cuda/ds4_cuda_runtime.cuh"
 
+// Vendored llama.cpp fused-dequant-matmul kernels (MMQ/MMVQ)
+// Provides ~2.8x prefill speedup on Blackwell via mul_mat_q templates.
+#include "cuda/mmq/ds4_mmq.h"
+
 // --- Device kernels (and their immediate launch helpers) ---
 // These come first so their symbols are visible to later host-dispatch files.
 #include "cuda/ds4_cuda_embedding.cuh"

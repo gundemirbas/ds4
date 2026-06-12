@@ -562,6 +562,29 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
+
+    /* ---- MMVQ dense vec path (decode-optimized, n_tok=1) ---- */
+    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok == 1u &&
+        getenv("DS4_CUDA_NO_MMVQ_DECODE") == NULL) {
+        int rc = ds4_mmq_q8_0_dense_vec(wptr, (const float *)x->ptr,
+                                         (float *)out->ptr,
+                                         (int)out_dim, (int)n_tok, (int)in_dim,
+                                         ds4_mmq_stream_for_call());
+        if (rc == 0) return 1;
+        /* Fall through on failure */
+    }
+
+    /* ---- MMQ fused-dequant-matmul path ---- */
+    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok > 0) {
+        int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr,
+                                     (float *)out->ptr,
+                                     (int)out_dim, (int)n_tok, (int)in_dim,
+                                     ds4_mmq_stream_for_call());
+        if (rc == 0) return 1;
+        /* On failure, fall through to legacy paths */
+        fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d; falling back\n", rc);
+    }
+
     if (g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f32) {
