@@ -39,7 +39,6 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    fprintf(stderr, "ds4: MoE launch: expert_in_dim=%u expert_mid_dim=%u out_dim=%u n_tokens=%u n_total_expert=%u n_expert=%u\n", expert_in_dim, expert_mid_dim, out_dim, n_tokens, n_total_expert, n_expert);
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;

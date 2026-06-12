@@ -553,7 +553,6 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
 
 
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
-    fprintf(stderr, "ds4: Q8_0 matmul %s: out_dim=%lu in_dim=%lu n_tok=%lu\n", label ? label : "?", out_dim, in_dim, n_tok);
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
