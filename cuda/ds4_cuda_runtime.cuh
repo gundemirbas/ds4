@@ -293,7 +293,6 @@ static const char *cuda_model_range_populate_device_copy(const void *model_map,
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
 
-#if defined(DS4_CUDA_SPARK_HBM_CACHE)
     /* Device-resident HBM cache hits win over UVA-mapped registered pointers:
      * direct HBM reads are ~10% faster than mapped reads through host page
      * tables (measured on plain decode at GB10).  Cache lookup runs first; the
@@ -317,7 +316,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
     }
-#endif /* DS4_CUDA_SPARK_HBM_CACHE */
 
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
@@ -343,7 +341,6 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     if (bytes == 0) return 1;
     if (g_model_device_owned || g_model_registered || g_model_hmm_direct) return 1;
 
-#if defined(DS4_CUDA_SPARK_HBM_CACHE)
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
     for (const cuda_model_range &r : g_model_ranges) {
@@ -364,9 +361,6 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
         }
     }
     return 0;
-#else
-    return 1;
-#endif /* DS4_CUDA_SPARK_HBM_CACHE */
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
@@ -1364,13 +1358,11 @@ static ds4_q8_strategy ds4_cuda_q8_strategy(void) {
         reason = "DS4_CUDA_USE_MMQ=0 (legacy override)";
     }
 
-    /* Default: MMQ (fused dequant matmul).  The earlier sm_121 cuBLAS-only
-     * workaround is no longer needed — the pool allocator fix (cudaMallocAsync
-     * -> cudaMalloc) resolved the driver-corruption crash.  MMQ is ~2x faster
-     * than cuBLAS on Blackwell for Q8_0 prefill. */
+    /* Default: cuBLAS. MMQ has a bug on sm_121 (GB10) with IQ2_XXS pair_vec
+     * MoE path causing segfaults. Use cuBLAS until the MMQ issue is fixed. */
     if (chosen == DS4_Q8_STRATEGY_UNKNOWN) {
-        chosen = DS4_Q8_STRATEGY_MMQ;
-        reason = "default (MMQ)";
+        chosen = DS4_Q8_STRATEGY_CUBLAS;
+        reason = "default (cuBLAS, MMQ disabled pending sm_121 fix)";
     }
 
     cudaDeviceProp props;
