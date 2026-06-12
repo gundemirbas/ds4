@@ -909,6 +909,15 @@ int ds4_mmq_moe_pair_vec_impl(
         int             n_expert_used,
         cudaStream_t    stream) {
 
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+
+    if (cc >= GGML_CUDA_CC_BLACKWELL) {
+        fprintf(stderr, "%s: pair_vec not supported on Blackwell (cc=%d); use cuBLAS fallback\n",
+                tag, cc);
+        return -1;
+    }
+
     if (!W_a || !W_b || !X_f32 || !ids || !out_silu) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -927,7 +936,6 @@ int ds4_mmq_moe_pair_vec_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);

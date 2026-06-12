@@ -8,7 +8,8 @@
 /ds4_test
 /ds4flash.gguf
 /TODO.md
-/gguf/
+/gguf
+/tmp/
 *.o
 *.dSYM/
 __pycache__/
