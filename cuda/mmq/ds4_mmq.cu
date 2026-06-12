@@ -295,7 +295,8 @@ int ds4_mmq_dense_impl(
     const int64_t s13    = ne12 * s12;
 
     const bool use_stream_k =
-        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_BLACKWELL;
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
 
     const mmq_args args = {
         /*x=*/(const char *)W,
@@ -485,7 +486,8 @@ int ds4_mmq_moe_impl(
     const int64_t s13_mmq = ne12 * s12_mmq;
 
     const bool use_stream_k =
-        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_BLACKWELL;
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
 
     const mmq_args args = {
         /*x=*/(const char *)W,
@@ -626,7 +628,8 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s13_mmq = ne12 * s12_mmq;
 
     const bool use_stream_k =
-        GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_BLACKWELL;
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
 
     mmq_args args = {
         /*x=*/(const char *)W_a,
