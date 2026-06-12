@@ -909,15 +909,6 @@ int ds4_mmq_moe_pair_vec_impl(
         int             n_expert_used,
         cudaStream_t    stream) {
 
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
-
-    if (cc >= GGML_CUDA_CC_BLACKWELL) {
-        fprintf(stderr, "%s: pair_vec not supported on Blackwell (cc=%d); use cuBLAS fallback\n",
-                tag, cc);
-        return -1;
-    }
-
     if (!W_a || !W_b || !X_f32 || !ids || !out_silu) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
@@ -936,14 +927,14 @@ int ds4_mmq_moe_pair_vec_impl(
         return -1;
     }
 
+    const int dev = ggml_cuda_get_device();
     ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
         fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
         return -1;
     }
 
-    // Route the pool's cudaMallocAsync through the caller-supplied stream
-    // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
+    // ds4_pool_set_stream is now a no-op (pool uses cudaMalloc/cudaFree).
     ds4_pool_set_stream(stream);
 
     const int n_tokens = 1;  // fusion only supported at ncols_dst=1.
@@ -1048,8 +1039,7 @@ int ds4_mmq_dense_vec_impl(
         return -1;
     }
 
-    // Route the pool's cudaMallocAsync through the caller-supplied stream
-    // for Step 8 / CUDA Graph compatibility.  See ds4_mmq_moe_vec_impl.
+    // ds4_pool_set_stream is now a no-op (pool uses cudaMalloc/cudaFree).
     ds4_pool_set_stream(stream);
 
     // Dense: no MoE, ids=null. Layout [K, N, 1, 1] for src1.

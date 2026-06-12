@@ -10,6 +10,7 @@
 /TODO.md
 /gguf
 /tmp/
+/dsstart.sh
 *.o
 *.dSYM/
 __pycache__/
