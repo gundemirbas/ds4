@@ -326,12 +326,12 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
     if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
 
-#ifdef DS4_CUDA_SPARK_HBM_CACHE
-    /* On DGX Spark, skip UVA-mapped fallbacks and go straight to device-local
-     * HBM copy.  Direct HBM reads avoid page-table walk overhead and are
-     * measurably faster on plain decode. */
-    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
-#else
+    /* DGX Spark HBM cache: when DS4_CUDA_SPARK_HBM_CACHE is set, prefer
+     * device-local HBM copy over UVA-mapped fallbacks for the ~10% decode
+     * perf win.  However, forcing device copy at load time costs ~400s for
+     * the full 81 GiB model (measured).  Instead, use the standard fallback
+     * chain (registered-mapped or FD cache first) and let the cache fill
+     * gradually during decode.  The HBM cache flag only lifts the budget. */
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) return fd_ptr;
@@ -341,7 +341,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     if (mapped) return mapped;
 
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
-#endif
+}
 }
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
