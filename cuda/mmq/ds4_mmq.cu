@@ -271,6 +271,7 @@ int ds4_mmq_dense_impl(
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
+    fprintf(stderr, "%s: TRACE before quantize M=%d N=%d K=%d\n", tag, M, N, K);
     quantize_mmq_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
         type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
@@ -282,6 +283,7 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
     }
+    fprintf(stderr, "%s: TRACE after quantize OK\n", tag);
 
     // 2. Build mmq_args. stride_row_x is in WEIGHT BLOCKS per row, which
     //    is K / blck_size(type). Q8_0 has block size 32; Q2_K and IQ2_XXS
@@ -312,6 +314,7 @@ int ds4_mmq_dense_impl(
         /*ncols_max=*/ne11,
     };
 
+    fprintf(stderr, "%s: TRACE before mul_mat_q_case\n", tag);
     mul_mat_q_case<type>(*ctx, args, stream);
 
     err = cudaGetLastError();
@@ -319,6 +322,7 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
+    fprintf(stderr, "%s: TRACE after mul_mat_q_case OK\n", tag);
     return 0;
 }
 
@@ -1045,6 +1049,7 @@ int ds4_mmq_dense_vec_impl(
                                 sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
 
+    fprintf(stderr, "%s: TRACE before quantize_row_q8_1 M=%d N=%d K=%d\n", tag, M, N, K);
     // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
     quantize_row_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
@@ -1059,6 +1064,7 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -2;
     }
+    fprintf(stderr, "%s: TRACE after quantize_row_q8_1 OK\n", tag);
 
     // Dense (no ids): per upstream dispatch (mmvq.cu:1121-1127),
     //   ncols_dst          = ne1  = N
@@ -1074,6 +1080,7 @@ int ds4_mmq_dense_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
+    fprintf(stderr, "%s: TRACE before mul_mat_vec_q_switch_type\n", tag);
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
         /*vy=*/(const void *)src1_q8_1.get(),
@@ -1099,6 +1106,7 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
+    fprintf(stderr, "%s: TRACE after mul_mat_vec_q_switch_type OK\n", tag);
     return 0;
 }
 
