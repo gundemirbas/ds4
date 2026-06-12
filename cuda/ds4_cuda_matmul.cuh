@@ -581,18 +581,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                      (float *)out->ptr,
                                      (int)out_dim, (int)n_tok, (int)in_dim,
                                      ds4_mmq_stream_for_call());
-        if (rc == 0) {
-            /* Synchronize after MMQ to catch any asynchronous kernel errors.
-             * Without this, a GPU-wide error from MMQ goes unnoticed until the
-             * next CUDA API call (e.g., cudaMalloc), producing confusing
-             * "illegal memory access" errors in unrelated code. */
-            cudaError_t sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) {
-                fprintf(stderr, "ds4: mmq sync failed: %s\n", cudaGetErrorString(sync_err));
-                return 0;
-            }
-            return 1;
-        }
+        if (rc == 0) return 1;
         /* On failure, fall through to legacy paths */
         fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d; falling back\n", rc);
     }

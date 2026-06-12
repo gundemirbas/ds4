@@ -271,7 +271,6 @@ int ds4_mmq_dense_impl(
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
-    fprintf(stderr, "%s: TRACE before quantize M=%d N=%d K=%d\n", tag, M, N, K);
     quantize_mmq_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
         type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
@@ -283,7 +282,6 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
         return -2;
     }
-    fprintf(stderr, "%s: TRACE after quantize OK\n", tag);
 
     // 2. Build mmq_args. stride_row_x is in WEIGHT BLOCKS per row, which
     //    is K / blck_size(type). Q8_0 has block size 32; Q2_K and IQ2_XXS
@@ -315,7 +313,6 @@ int ds4_mmq_dense_impl(
         /*ncols_max=*/ne11,
     };
 
-    fprintf(stderr, "%s: TRACE before mul_mat_q_case\n", tag);
     mul_mat_q_case<type>(*ctx, args, stream);
 
     err = cudaGetLastError();
@@ -323,7 +320,6 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    fprintf(stderr, "%s: TRACE after mul_mat_q_case OK\n", tag);
     return 0;
 }
 
@@ -455,7 +451,6 @@ int ds4_mmq_moe_impl(
     const int64_t s12_src = (int64_t)K * ne11;                          // stride between channels = K*1
     const int64_t s13_src = (int64_t)K * ne11 * ne12;                   // stride between samples
 
-    fprintf(stderr, "%s: TRACE before quantize M=%d K=%d ntok=%d nexp=%d nused=%d\n", tag, M, K, n_tokens, n_experts, n_expert_used);
     quantize_mmq_q8_1_cuda(
         X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
         type, /*ne00=*/K, s11_src, s12_src, s13_src,
@@ -467,7 +462,6 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: quantize_mmq_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    fprintf(stderr, "%s: TRACE after quantize OK\n", tag);
 
     // 3. Build mmq_args for the MoE path.
     //
@@ -516,7 +510,6 @@ int ds4_mmq_moe_impl(
         /*ncols_max=*/(int64_t)n_tokens,
     };
 
-    fprintf(stderr, "%s: TRACE before mul_mat_q_case\n", tag);
     mul_mat_q_case<type>(*ctx, args, stream);
 
     err = cudaGetLastError();
@@ -524,7 +517,6 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
-    fprintf(stderr, "%s: TRACE after mul_mat_q_case OK\n", tag);
     return 0;
 }
 
@@ -834,7 +826,6 @@ int ds4_mmq_moe_vec_impl(
     //       Logical src1 [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost.
     // s12 = stride between channels = K * ne11 = K.
     // s13 = stride between samples = K * ne11 * ne12 = K * n_tokens.
-    fprintf(stderr, "%s: TRACE before quantize M=%d K=%d ntok=%d nexp=%d nused=%d\n", tag, M, K, n_tokens, n_experts, n_expert_used);
     quantize_row_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
         type, /*ne00=*/K,
@@ -848,7 +839,6 @@ int ds4_mmq_moe_vec_impl(
                 tag, cudaGetErrorString(err));
         return -2;
     }
-    fprintf(stderr, "%s: TRACE after quantize OK\n", tag);
 
     // 2. mmvq stride setup. Mirror upstream's ggml_cuda_mul_mat_vec_q
     //    dispatch (mmvq.cu:1101-1136).
@@ -876,7 +866,6 @@ int ds4_mmq_moe_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    fprintf(stderr, "%s: TRACE before mul_mat_vec_q_switch_type\n", tag);
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
         /*vy=*/(const void *)src1_q8_1_ptr,
@@ -902,7 +891,6 @@ int ds4_mmq_moe_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    fprintf(stderr, "%s: TRACE after mul_mat_vec_q_switch_type OK\n", tag);
 
     return 0;
 }
@@ -1060,7 +1048,6 @@ int ds4_mmq_dense_vec_impl(
                                 sizeof(block_q8_1) / QK8_1;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
 
-    fprintf(stderr, "%s: TRACE before quantize_row_q8_1 M=%d N=%d K=%d\n", tag, M, N, K);
     // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
     quantize_row_q8_1_cuda(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
@@ -1075,7 +1062,6 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -2;
     }
-    fprintf(stderr, "%s: TRACE after quantize_row_q8_1 OK\n", tag);
 
     // Dense (no ids): per upstream dispatch (mmvq.cu:1121-1127),
     //   ncols_dst          = ne1  = N
@@ -1091,7 +1077,6 @@ int ds4_mmq_dense_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    fprintf(stderr, "%s: TRACE before mul_mat_vec_q_switch_type\n", tag);
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
         /*vy=*/(const void *)src1_q8_1.get(),
@@ -1117,7 +1102,6 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    fprintf(stderr, "%s: TRACE after mul_mat_vec_q_switch_type OK\n", tag);
     return 0;
 }
 
