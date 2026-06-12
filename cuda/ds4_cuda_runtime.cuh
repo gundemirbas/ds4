@@ -342,7 +342,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
 }
-}
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
