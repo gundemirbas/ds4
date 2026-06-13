@@ -14,11 +14,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_mask,
         uint32_t                n_head,
-        uint32_t                head_dim,
-        /* Opp C Phase 1A.3: optional packed FP8 mirror of compressed rows.
-         * Pass NULL/NULL when DS4_CUDA_FP8_KV is off; kernel falls back to comp_kv. */
-        const ds4_gpu_tensor *comp_fp8,
-        const ds4_gpu_tensor *comp_scale) {
+        uint32_t                head_dim) {
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
@@ -34,9 +30,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
-    /* FP8 mirror pointers (NULL when disabled). */
-    const unsigned char *fp8_codes = (comp_fp8  != NULL) ? (const unsigned char *)comp_fp8->ptr  : NULL;
-    const float         *fp8_sc    = (comp_scale != NULL) ? (const float        *)comp_scale->ptr : NULL;
+    /* FP8 mirror pointers (always NULL when disabled via ds4_gpu.h API). */
+    const unsigned char *fp8_codes = NULL;
+    const float         *fp8_sc    = NULL;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -266,8 +262,8 @@ static int attention_decode_batch_launch(
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim,
-                                                 NULL, /* comp_fp8 */
-                                                 NULL); /* comp_scale */
+                                                 NULL,
+                                                 0);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
