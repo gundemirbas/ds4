@@ -1417,6 +1417,15 @@ static int ds4_cuda_use_cublas_q8(void) {
     return ds4_cuda_q8_strategy() == DS4_Q8_STRATEGY_CUBLAS;
 }
 
+/* Forward declarations for FP8 KV functions defined in ds4_cuda.cu / ds4_cuda_fp8_kv.cuh
+ * (after ds4_cuda_runtime.cuh is included).  These are needed because
+ * ds4_gpu_cleanup() calls them before their definitions. */
+extern "C" int      ds4_cuda_fp8_kv_enabled(void);
+extern "C" int      ds4_cuda_fp8_kv_debug_enabled(void);
+extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
+extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void);
+extern "C" void ds4_gpu_decode_scalars_cleanup(void);
+extern "C" void ds4_gpu_decode_layer_scalars_cleanup(void);
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -1442,23 +1451,14 @@ extern "C" int ds4_gpu_init(void) {
     }
     if (ds4_cuda_fp8_kv_enabled()) {
         if (!ds4_cuda_fp8_kv_decode_table_init()) {
-            fprintf(stderr, "ds4: FP8 KV decode table init failed
-");
+            fprintf(stderr, "ds4: FP8 KV decode table init failed\n");
             return 0;
         }
     }
     return 1;
 }
 
-/* Forward declarations for FP8 KV functions defined in ds4_cuda.cu / ds4_cuda_fp8_kv.cuh
- * (after ds4_cuda_runtime.cuh is included).  These are needed because
- * ds4_gpu_cleanup() calls them before their definitions. */
-extern "C" int      ds4_cuda_fp8_kv_enabled(void);
-extern "C" int      ds4_cuda_fp8_kv_debug_enabled(void);
-extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
-extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void);
-extern "C" void ds4_gpu_decode_scalars_cleanup(void);
-extern "C" void ds4_gpu_decode_layer_scalars_cleanup(void);
+
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
