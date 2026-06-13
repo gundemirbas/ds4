@@ -1440,6 +1440,13 @@ extern "C" int ds4_gpu_init(void) {
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
+    if (ds4_cuda_fp8_kv_enabled()) {
+        if (!ds4_cuda_fp8_kv_decode_table_init()) {
+            fprintf(stderr, "ds4: FP8 KV decode table init failed
+");
+            return 0;
+        }
+    }
     return 1;
 }
 

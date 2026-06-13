@@ -41,7 +41,7 @@
  * Populates the __constant__ dsv4_e4m3fn_decode_table array on device.
  * Called once from ds4_gpu_init when DS4_CUDA_FP8_KV is enabled.
  * ------------------------------------------------------------------ */
-static int ds4_cuda_fp8_kv_decode_table_init(void) {
+extern "C" int ds4_cuda_fp8_kv_decode_table_init(void) {
     float table[128];
     for (int i = 0; i < 128; i++) {
         const int exp  = (i >> 3) & 15;
