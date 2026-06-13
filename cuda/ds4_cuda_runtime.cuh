@@ -1426,6 +1426,7 @@ extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
 extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void);
 extern "C" void ds4_gpu_decode_scalars_cleanup(void);
 extern "C" void ds4_gpu_decode_layer_scalars_cleanup(void);
+extern "C" int ds4_cuda_fp8_kv_decode_table_init(void);
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
