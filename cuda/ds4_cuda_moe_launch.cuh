@@ -61,6 +61,16 @@ static int routed_moe_launch(
         const uint64_t n_assignments   = (uint64_t)n_tokens * n_expert_used;
         cudaStream_t moe_stream = ds4_cuda_moe_stream();
 
+        /* Sync: moe_stream is non-blocking, so it doesn't implicitly
+         * wait for stream-0 writes to x->ptr / selected->ptr.  Record
+         * an event on stream 0 and make moe_stream wait for it. */
+        {
+            static cudaEvent_t sync_ev = nullptr;
+            if (!sync_ev) cudaEventCreateWithFlags(&sync_ev, cudaEventDisableTiming);
+            cudaEventRecord(sync_ev, (cudaStream_t)0);
+            cudaStreamWaitEvent(moe_stream, sync_ev, 0);
+        }
+
         if (n_tokens == 1u && getenv("DS4_CUDA_NO_MMVQ_DECODE") == NULL &&
             n_assignments <= 8u) {
             /* ---- MMVQ decode path (n_tokens=1, vec-optimized) ---- */
@@ -100,6 +110,16 @@ static int routed_moe_launch(
                     expert_mid_dim, n_tokens, n_expert_used, clamp);
                 if (!cuda_ok(cudaGetLastError(), "mmvq moe swiglu launch"))
                     goto moe_fallback;
+
+                /* Sync: SwiGLU runs on stream 0, but Down MMVQ runs
+                 * on moe_stream and reads mid->ptr.  Non-blocking
+                 * streams don't implicitly wait for stream 0. */
+                {
+                    static cudaEvent_t sync_ev2 = nullptr;
+                    if (!sync_ev2) cudaEventCreateWithFlags(&sync_ev2, cudaEventDisableTiming);
+                    cudaEventRecord(sync_ev2, (cudaStream_t)0);
+                    cudaStreamWaitEvent(moe_stream, sync_ev2, 0);
+                }
 
                 /* Down matmul */
                 if (q4k_path) {
@@ -163,6 +183,16 @@ static int routed_moe_launch(
                     expert_mid_dim, n_tokens, n_expert_used, clamp);
                 if (!cuda_ok(cudaGetLastError(), "mmq moe swiglu launch"))
                     goto moe_fallback;
+
+                /* Sync: SwiGLU runs on stream 0, but Down MMQ runs
+                 * on moe_stream and reads mid->ptr.  Non-blocking
+                 * streams don't implicitly wait for stream 0. */
+                {
+                    static cudaEvent_t sync_ev3 = nullptr;
+                    if (!sync_ev3) cudaEventCreateWithFlags(&sync_ev3, cudaEventDisableTiming);
+                    cudaEventRecord(sync_ev3, (cudaStream_t)0);
+                    cudaStreamWaitEvent(moe_stream, sync_ev3, 0);
+                }
 
                 /* Down matmul */
                 if (q4k_path) {
