@@ -1,6 +1,7 @@
 static const void *g_model_host_base;
 static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
+static int g_model_registered;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_fd = -1;
@@ -3378,6 +3379,7 @@ static const char *cuda_model_range_copy_uncached(
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (cuda_model_image_owned(model_map)) return cuda_model_ptr(model_map, offset);
+    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
@@ -3469,6 +3471,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
     if (cuda_model_image_owned(model_map)) return 1;
+    if (g_model_device_owned || g_model_registered) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -4132,7 +4135,7 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t bytes = 1792ull * 1048576ull;
+    uint64_t bytes = 1280ull * 1048576ull;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
@@ -4365,6 +4368,10 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    if (g_model_registered && g_model_host_base) {
+        (void)hipHostUnregister((void *)g_model_host_base);
+        g_model_registered = 0;
+    }
     g_stream_selected_cache.loaded = 0;
     cuda_stream_resident_cache_release();
     cuda_model_load_progress_reset();
@@ -4633,9 +4640,26 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         g_model_fd_host_base = model_map;
     }
 
-    /* Strix Halo uses the staged full-copy path in ds4_gpu_set_model_map_range().
-     * Avoid host-registering the mmap here: that would make the staged copier
-     * believe the model is already device-resident. */
+    /* Strix Halo: hipHostRegister fails, but the mmaped model is in
+     * shared memory.  Register the host pointer so cuda_model_range_ptr
+     * can return UVA pointers instead of staging to device copies. */
+    if (!g_model_device_owned) {
+        unsigned int flags = hipHostRegisterMapped | hipHostRegisterReadOnly;
+        hipError_t err = hipHostRegister((void *)model_map, (size_t)model_size, flags);
+        if (err == hipSuccess) {
+            void *dev = NULL;
+            err = hipHostGetDevicePointer(&dev, (void *)model_map, 0);
+            if (err == hipSuccess && dev) {
+                g_model_device_base = (const char *)dev;
+                g_model_registered = 1;
+            } else {
+                (void)hipHostUnregister((void *)model_map);
+                (void)hipGetLastError();
+            }
+        } else {
+            (void)hipGetLastError();
+        }
+    }
     return 1;
 }
 
