@@ -3452,6 +3452,9 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+/* Forward declaration used by shared-memory kernels below */
+__device__ static float warp_sum_f32(float v);
+
 __global__ static void matmul_f16_f32_sharedx_warp_rows_w32_kernel(
         float *out,
         const __half *w,
