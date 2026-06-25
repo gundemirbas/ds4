@@ -3452,6 +3452,104 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+__global__ static void matmul_f16_f32_sharedx_warp_rows_w32_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint32_t in_dim,
+        uint64_t out_dim) {
+    extern __shared__ float shx_f16[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx_f16[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const __half *wr = w + row * (uint64_t)in_dim;
+    float acc = 0.0f;
+    uint32_t i = lane;
+    for (; i + 224u < in_dim; i += 256u) {
+        acc += __half2float(wr[i]) * shx_f16[i];
+        acc += __half2float(wr[i + 32u]) * shx_f16[i + 32u];
+        acc += __half2float(wr[i + 64u]) * shx_f16[i + 64u];
+        acc += __half2float(wr[i + 96u]) * shx_f16[i + 96u];
+        acc += __half2float(wr[i + 128u]) * shx_f16[i + 128u];
+        acc += __half2float(wr[i + 160u]) * shx_f16[i + 160u];
+        acc += __half2float(wr[i + 192u]) * shx_f16[i + 192u];
+        acc += __half2float(wr[i + 224u]) * shx_f16[i + 224u];
+    }
+    for (; i < in_dim; i += 32u) {
+        acc += __half2float(wr[i]) * shx_f16[i];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
+__global__ static void matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint32_t in_dim,
+        uint64_t out_dim) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const __half *wr0 = w0 + row * (uint64_t)in_dim;
+    const __half *wr1 = w1 + row * (uint64_t)in_dim;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    uint32_t i = lane;
+    for (; i + 224u < in_dim; i += 256u) {
+        float xv = shx[i];
+        acc0 += __half2float(wr0[i]) * xv;
+        acc1 += __half2float(wr1[i]) * xv;
+        xv = shx[i + 32u];
+        acc0 += __half2float(wr0[i + 32u]) * xv;
+        acc1 += __half2float(wr1[i + 32u]) * xv;
+        xv = shx[i + 64u];
+        acc0 += __half2float(wr0[i + 64u]) * xv;
+        acc1 += __half2float(wr1[i + 64u]) * xv;
+        xv = shx[i + 96u];
+        acc0 += __half2float(wr0[i + 96u]) * xv;
+        acc1 += __half2float(wr1[i + 96u]) * xv;
+        xv = shx[i + 128u];
+        acc0 += __half2float(wr0[i + 128u]) * xv;
+        acc1 += __half2float(wr1[i + 128u]) * xv;
+        xv = shx[i + 160u];
+        acc0 += __half2float(wr0[i + 160u]) * xv;
+        acc1 += __half2float(wr1[i + 160u]) * xv;
+        xv = shx[i + 192u];
+        acc0 += __half2float(wr0[i + 192u]) * xv;
+        acc1 += __half2float(wr1[i + 192u]) * xv;
+        xv = shx[i + 224u];
+        acc0 += __half2float(wr0[i + 224u]) * xv;
+        acc1 += __half2float(wr1[i + 224u]) * xv;
+    }
+    for (; i < in_dim; i += 32u) {
+        const float xv = shx[i];
+        acc0 += __half2float(wr0[i]) * xv;
+        acc1 += __half2float(wr1[i]) * xv;
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0u) {
+        out0[row] = acc0;
+        out1[row] = acc1;
+    }
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -3547,6 +3645,15 @@ __device__ static float warp_max_f32(float v) {
         v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
     }
     return v;
+}
+
+__device__ static float q8_0_scale_broadcast_w32(const unsigned char *blk) {
+    float d = 0.0f;
+    if ((threadIdx.x & 31u) == 0u) {
+        const uint16_t bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+        d = __half2float(__ushort_as_half((unsigned short)bits));
+    }
+    return __shfl_sync(0xffffffffu, d, 0, 32);
 }
 
 __device__ static float dot4_f32(float4 a, float4 b) {
@@ -3720,6 +3827,151 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
+}
+
+__global__ static void matmul_q8_0_f32_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34u;
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint64_t i = b * 32u + lane;
+        if (i < in_dim) {
+            const unsigned char *blk = wr + b * 34u;
+            const float d = q8_0_scale_broadcast_w32(blk);
+            const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+            acc += d * (float)q * x[i];
+        }
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+__global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx_q8[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx_q8[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * row_bytes;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const unsigned char *blk = wr + (uint64_t)b * 34u;
+        const float d = q8_0_scale_broadcast_w32(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+        acc += d * (float)q * shx_q8[(b << 5u) + lane];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
+__global__ static void matmul_q8_0_pair_f32_warp8_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t blocks) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out0_dim && row >= out1_dim) return;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * blocks * 34u : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * blocks * 34u : NULL;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint64_t i = b * 32u + lane;
+        if (i < in_dim) {
+            if (wr0) {
+                const unsigned char *blk = wr0 + b * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+                acc0 += d * (float)q * x[i];
+            }
+            if (wr1) {
+                const unsigned char *blk = wr1 + b * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+                acc1 += d * (float)q * x[i];
+            }
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        if (row < out0_dim) out0[row] = acc0;
+        if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
+__global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * row_bytes : NULL;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const float xv = shx[(b << 5u) + lane];
+        if (wr0) {
+            const unsigned char *blk = wr0 + (uint64_t)b * 34u;
+            const float d = q8_0_scale_broadcast_w32(blk);
+            const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+            acc0 += d * (float)q * xv;
+        }
+        if (wr1) {
+            const unsigned char *blk = wr1 + (uint64_t)b * 34u;
+            const float d = q8_0_scale_broadcast_w32(blk);
+            const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+            acc1 += d * (float)q * xv;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[row] = acc0;
+        if (row < out1_dim) out1[row] = acc1;
+    }
 }
 
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
@@ -7669,27 +7921,80 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
-    if (g_cublas_ready && n_tok > 1) {
-        const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
-        if (w_f32) {
-            const float alpha = 1.0f;
-            const float beta = 0.0f;
-            cublasStatus_t st = cublasSgemm(g_cublas,
-                                            CUBLAS_OP_T,
-                                            CUBLAS_OP_N,
-                                            (int)out_dim,
-                                            (int)n_tok,
-                                            (int)in_dim,
-                                            &alpha,
-                                            w_f32,
-                                            (int)in_dim,
-                                            (const float *)x->ptr,
-                                            (int)in_dim,
-                                            &beta,
-                                            (float *)out->ptr,
-                                            (int)out_dim);
-            return cublas_ok(st, "q8 fp32 matmul");
+
+    /* Single-token decode: use shared-memory path for best occupancy.
+     * Loads input x into shared memory once, then all warps read from there.
+     * 32 rows per block, 1024 threads -> 4x better occupancy than prequant warp8. */
+    if (n_tok == 1) {
+        if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
+            const unsigned rows_per_block = 32u;
+            const unsigned threads = rows_per_block * 32u;
+            const size_t shmem = (size_t)in_dim * sizeof(float);
+            matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
+                    (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+                    threads,
+                    shmem>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    (const float *)x->ptr,
+                    (uint32_t)blocks,
+                    out_dim,
+                    blocks * 34u);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 sharedx launch");
         }
+        /* Fallback for unaligned in_dim: use direct warp8 kernel without prequant */
+        matmul_q8_0_f32_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                (const float *)x->ptr,
+                in_dim,
+                out_dim,
+                blocks);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 warp launch");
+    }
+
+    /* Batch path (n_tok > 1): use prequant batch kernels for small-to-medium batches.
+     * cuBLAS is only used for large batches where its launch overhead amortizes.
+     * This avoids the F16 cache memory cost and extra conversion kernels. */
+    if (n_tok > 1 && n_tok < 256u) {
+        const uint64_t xq_bytes = n_tok * blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 batch prequant");
+        if (tmp) {
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            const int use_dp4a = cuda_q8_use_dp4a();
+            dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+            quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+            if (cuda_ok(cudaGetLastError(), "matmul_q8_0 batch quantize launch")) {
+                if (blocks <= 32u) {
+                    dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
+                    matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
+                            (float *)out->ptr,
+                            reinterpret_cast<const unsigned char *>(wptr),
+                            xq,
+                            xscale,
+                            in_dim,
+                            out_dim,
+                            n_tok,
+                            blocks,
+                            use_dp4a);
+                    if (cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch")) return 1;
+                } else {
+                    dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
+                    matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,
+                            reinterpret_cast<const unsigned char *>(wptr),
+                            xq, xscale, in_dim, out_dim, n_tok, blocks, use_dp4a);
+                    if (cuda_ok(cudaGetLastError(), "matmul_q8_0 launch")) return 1;
+                }
+            }
+        }
+    }
+
+    /* Large batch: cuBLAS F16 path. Only reaches here for n_tok >= 256.
+     * The F16 cache is only populated on demand and only for large matmuls. */
+    if (g_cublas_ready && n_tok >= 256) {
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f16) {
             const uint64_t xh_count = n_tok * in_dim;
@@ -7722,11 +8027,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
             cuda_q8_f16_cache_disable_after_failure("cuBLAS f16 matmul failure",
                                                     in_dim * out_dim * sizeof(__half));
-            /* The F16 expansion cache is only an optimization.  If cuBLAS
-             * rejects the cached path under memory pressure, retry the same
-             * operation through the native Q8 kernels below. */
         }
     }
+
+    /* Last-resort fallback: prequant + generic kernel */
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
@@ -7750,7 +8054,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
     }
-    if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
+    if (blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
         matmul_q8_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
                 (float *)out->ptr,
@@ -7819,6 +8123,46 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
     if (!w0 || !w1) return 0;
 
+    /* Decode (n_tok == 1): use shared-memory path for best occupancy. */
+    const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
+        const unsigned rows_per_block = 32u;
+        const unsigned threads = rows_per_block * 32u;
+        matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel<<<
+                (unsigned)((max_out + rows_per_block - 1u) / rows_per_block),
+                threads,
+                (size_t)in_dim * sizeof(float)>>>(
+                (float *)out0->ptr,
+                (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                (const float *)x->ptr,
+                (uint32_t)blocks,
+                out0_dim,
+                out1_dim,
+                blocks * 34u);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 sharedx launch");
+    }
+    /* Fallback for unaligned in_dim: warp8 kernel without prequant */
+    matmul_q8_0_pair_f32_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            reinterpret_cast<const unsigned char *>(w0),
+            reinterpret_cast<const unsigned char *>(w1),
+            (const float *)x->ptr,
+            in_dim,
+            out0_dim,
+            out1_dim,
+            blocks);
+    return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 warp launch");
+}
+
+static int cuda_matmul_q8_0_pair_prequant_fallback(
+        float *out0, float *out1,
+        const unsigned char *w0, const unsigned char *w1,
+        const float *x,
+        uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        uint64_t blocks) {
     const uint64_t xq_bytes = blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
@@ -7828,17 +8172,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     dim3 qgrid((unsigned)blocks, 1, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, x, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
-            (float *)out0->ptr,
-            (float *)out1->ptr,
-            reinterpret_cast<const unsigned char *>(w0),
-            reinterpret_cast<const unsigned char *>(w1),
-            xq,
-            xscale,
-            in_dim,
+            out0, out1, w0, w1, xq, xscale, in_dim,
             out0_dim,
             out1_dim,
             blocks,
@@ -7947,7 +8285,29 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_router &&
         n_tok == 1u &&
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
-    if (!serial_f16 && g_cublas_ready && n_tok > 1) {
+
+    /* Single-token decode: use shared-memory path for best occupancy.
+     * 32 rows per block, 1024 threads. */
+    if (n_tok == 1 && !serial_f16 && !serial_router && !ordered_router &&
+        in_dim <= 8192u && (in_dim & 31u) == 0u) {
+        const unsigned rows_per_block = 32u;
+        const unsigned threads = rows_per_block * 32u;
+        const size_t shmem = (size_t)in_dim * sizeof(float);
+        matmul_f16_f32_sharedx_warp_rows_w32_kernel<<<
+                (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+                threads,
+                shmem>>>(
+                (float *)out->ptr,
+                w,
+                (const float *)x->ptr,
+                (uint32_t)in_dim,
+                out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_f32 sharedx launch");
+    }
+
+    /* Batch path: use cuBLAS only for large batches where overhead amortizes.
+     * For small-to-medium batches, use custom kernels. */
+    if (!serial_f16 && g_cublas_ready && n_tok >= 256) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;
@@ -8028,6 +8388,17 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
+    if (in_dim <= 8192u && (in_dim & 31u) == 0u &&
+        (size_t)in_dim * sizeof(float) <= 65536u) {
+        const uint32_t rows_per_block = 32u;
+        matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<
+                ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                rows_per_block * 32u,
+                (size_t)in_dim * sizeof(float)>>>(
+                (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                (const float *)x->ptr, (uint32_t)in_dim, out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair sharedx launch");
+    }
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
