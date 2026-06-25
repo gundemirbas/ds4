@@ -3455,6 +3455,146 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
 /* Forward declaration used by shared-memory kernels below */
 __device__ static float warp_sum_f32(float v);
 
+/* --- Old-hip compatible attention helpers (vectorized float4 dot, block reductions) --- */
+
+__device__ static float attention_warp_sum_oldhip_w32(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffffu, v, offset, 32);
+    return v;
+}
+
+__device__ static float attention_warp_max_oldhip_w32(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset, 32));
+    return v;
+}
+
+__device__ static float attention_block_sum_oldhip_w32(float v) {
+    __shared__ float sh[32];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wid = tid >> 5u;
+    const uint32_t nwarp = (blockDim.x + 31u) >> 5u;
+    v = attention_warp_sum_oldhip_w32(v);
+    if (lane == 0u) sh[wid] = v;
+    __syncthreads();
+    v = (tid < nwarp) ? sh[lane] : 0.0f;
+    if (wid == 0u) v = attention_warp_sum_oldhip_w32(v);
+    if (tid == 0u) sh[0] = v;
+    __syncthreads();
+    return sh[0];
+}
+
+__device__ static float attention_block_max_oldhip_w32(float v) {
+    __shared__ float sh[32];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wid = tid >> 5u;
+    const uint32_t nwarp = (blockDim.x + 31u) >> 5u;
+    v = attention_warp_max_oldhip_w32(v);
+    if (lane == 0u) sh[wid] = v;
+    __syncthreads();
+    v = (tid < nwarp) ? sh[lane] : -3.4e38f;
+    if (wid == 0u) v = attention_warp_max_oldhip_w32(v);
+    if (tid == 0u) sh[0] = v;
+    __syncthreads();
+    return sh[0];
+}
+
+__device__ __forceinline__ static float attention_dot_f32_vec4_oldhip(const float *a, const float *b, uint32_t n) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    const uint32_t n4 = n >> 2u;
+    const float4 *a4 = (const float4 *)a;
+    const float4 *b4 = (const float4 *)b;
+    for (uint32_t i = 0; i < n4; i++) {
+        const float4 av = a4[i];
+        const float4 bv = b4[i];
+        s0 += av.x * bv.x;
+        s1 += av.y * bv.y;
+        s2 += av.z * bv.z;
+        s3 += av.w * bv.w;
+    }
+    float s = (s0 + s1) + (s2 + s3);
+    for (uint32_t i = n4 << 2u; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+/* Old-hip fast decode kernel: stores all scores in dynamic shared memory,
+ * uses float4 vectorized dot products, scalar V accumulation. */
+__global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
+        float *heads,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *comp_mask,
+        const float *sinks,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t use_mask,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t use_vec4) {
+    const uint32_t h = (uint32_t)blockIdx.x;
+    if (h >= n_head) return;
+    extern __shared__ float scores[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_rows = n_raw + n_comp;
+    const float *qh = q + (uint64_t)h * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+
+    float local_max = sinks[h];
+    for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
+        const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+        const float *kv = raw_kv + (uint64_t)row * head_dim;
+        float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+        if (!use_vec4) {
+            for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
+        }
+        s *= scale;
+        scores[r] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (uint32_t c = tid; c < n_comp; c += blockDim.x) {
+        float s = -3.4e38f;
+        if (!(use_mask && comp_mask && comp_mask[c] <= -5.0e29f)) {
+            const float *kv = comp_kv + (uint64_t)c * head_dim;
+            float dot = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
+            if (!use_vec4) {
+                for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+            }
+            s = dot * scale;
+            if (use_mask && comp_mask) s += comp_mask[c];
+        }
+        scores[n_raw + c] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    const float max_score = attention_block_max_oldhip_w32(local_max);
+
+    float local_sum = 0.0f;
+    for (uint32_t r = tid; r < n_rows; r += blockDim.x) {
+        const float w = expf(scores[r] - max_score);
+        scores[r] = w;
+        local_sum += w;
+    }
+    if (tid == 0u) local_sum += expf(sinks[h] - max_score);
+    const float denom = attention_block_sum_oldhip_w32(local_sum);
+    const float inv_denom = 1.0f / denom;
+
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+            acc += scores[r] * raw_kv[(uint64_t)row * head_dim + d];
+        }
+        for (uint32_t c = 0; c < n_comp; c++) {
+            acc += scores[n_raw + c] * comp_kv[(uint64_t)c * head_dim + d];
+        }
+        heads[(uint64_t)h * head_dim + d] = acc * inv_denom;
+    }
+}
+
 __global__ static void matmul_f16_f32_sharedx_warp_rows_w32_kernel(
         float *out,
         const __half *w,
@@ -9062,6 +9202,30 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    /* Use oldhip-style fast decode kernel with float4 vectorized dot products
+     * and dynamic shared memory.  No fixed score-buffer limit, no window/ratio
+     * logic — just fast Q·K scores, softmax, weighted sum. */
+    if (!getenv("DS4_CUDA_NO_OLDHIP_ATTENTION")) {
+        const uint32_t rows = n_raw + n_comp;
+        const size_t shmem = (size_t)(rows ? rows : 1u) * sizeof(float);
+        const uint32_t use_vec4 = (head_dim & 3u) == 0u;
+        attention_decode_mixed_one_fast_oldhip_kernel<<<(unsigned)n_head, 256, shmem>>>(
+                (float *)heads->ptr,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : NULL,
+                use_mask ? (const float *)comp_mask->ptr : NULL,
+                sinks,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                use_mask,
+                n_head,
+                head_dim,
+                use_vec4);
+        return cuda_ok(cudaGetLastError(), "attention decode oldhip fast launch");
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
